@@ -10,6 +10,7 @@ import { Errors } from "../lib/errors.js";
 import { param } from "../lib/params.js";
 import { privy } from "../services/privy/client.js";
 import { getAccountByEvmAddress } from "../services/hedera/mirror.js";
+import { derivePublicKeyHex } from "../services/privy/signing.js";
 import { env } from "../config/env.js";
 
 const agentRouter = Router({ caseSensitive: true, strict: true });
@@ -32,6 +33,10 @@ agentRouter.post(
     if (!game) throw Errors.notFound("Game");
 
     const wallet = await privy.wallets().create({ chain_type: "ethereum" });
+    // Privy's own wallet objects don't actually carry a usable public key
+    // (verified — both create() and get() return it empty) — derive it from
+    // a real signature instead. See services/privy/signing.ts.
+    const publicKeyHex = await derivePublicKeyHex(wallet.id);
 
     const [agent] = await db
       .insert(wishlistAgents)
@@ -39,10 +44,16 @@ agentRouter.post(
         buyerUserId: req.auth!.id,
         agentWalletId: wallet.id,
         agentEvmAddress: wallet.address,
+        agentPublicKeyHex: publicKeyHex,
         targetGameId,
         triggerPriceUnits,
       })
       .returning();
+
+    // Identity anchoring waits for the wallet to actually resolve on Hedera
+    // (see the watcher) — the "nativeId" a real identity anchor names should
+    // be a real 0.0.x account, and this agent doesn't have one until it's
+    // been funded. Nothing to wait on here; the watcher does it on its own.
 
     res.status(201).json({ ...agent, fundAddress: wallet.address });
   }),

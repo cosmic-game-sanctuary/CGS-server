@@ -11,6 +11,8 @@ export type Auth = {
   privyDid: string;
   email: string;
   evmAddress: string;
+  privyWalletId: string;
+  publicKeyHex: string;
 };
 
 declare global {
@@ -30,7 +32,14 @@ async function resolveAuth(req: Request): Promise<Auth | undefined> {
   const identity = await fetchIdentity(privyDid);
   const user = await upsertUser(identity);
 
-  return { id: user.id, privyDid: user.privyDid, email: user.email, evmAddress: user.evmAddress };
+  return {
+    id: user.id,
+    privyDid: user.privyDid,
+    email: user.email,
+    evmAddress: user.evmAddress,
+    privyWalletId: user.privyWalletId,
+    publicKeyHex: user.publicKeyHex,
+  };
 }
 
 // browsing never requires a wallet — this only attaches req.auth when a

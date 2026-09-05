@@ -57,9 +57,15 @@ export type MirrorTopicMessage = {
 
 // pass the last sequence number you've already processed; returns only what
 // came after it, oldest first. this is the agent watcher's whole read path.
+//
+// Uses gte:(n+1) rather than gt:n — the mirror node rejects `sequencenumber=gt:0`
+// outright with a 400 ("Invalid parameter"), since sequence numbers start at 1
+// and 0 apparently isn't a valid comparison value. gte:(n+1) means the same
+// thing as gt:n for every n >= 0 and never hits that edge case, since it's
+// always requesting sequence 1 or higher.
 export async function getTopicMessages(topicId: string, afterSequenceNumber = 0) {
   const data = await getJson<{ messages: MirrorTopicMessage[] }>(
-    `/api/v1/topics/${topicId}/messages?sequencenumber=gt:${afterSequenceNumber}&order=asc&limit=100`,
+    `/api/v1/topics/${topicId}/messages?sequencenumber=gte:${afterSequenceNumber + 1}&order=asc&limit=100`,
   );
   return data?.messages ?? [];
 }

@@ -38,6 +38,7 @@ export const reportActionEnum = pgEnum("report_action", [
   "delisted",
   "removed_from_storage",
 ]);
+export const splitStatusEnum = pgEnum("split_status", ["pending", "distributed", "failed"]);
 export const notificationTypeEnum = pgEnum("notification_type", [
   "sale",
   "invite",
@@ -50,6 +51,11 @@ export const users = pgTable("users", {
   privyDid: text("privy_did").notNull().unique(),
   email: text("email").notNull(),
   evmAddress: text("evm_address").notNull(),
+  // Privy's internal wallet id + compressed public key — both needed to sign
+  // a payment on this user's behalf via secp256k1_sign. Neither is secret;
+  // Privy still holds the private key.
+  privyWalletId: text("privy_wallet_id").notNull(),
+  publicKeyHex: text("public_key_hex").notNull(),
   // null until the address completes its own first outgoing transaction and
   // the account resolves on the mirror node. see services/hedera/mirror.ts.
   hederaAccountId: text("hedera_account_id"),
@@ -149,6 +155,10 @@ export const wishlistAgents = pgTable("wishlist_agents", {
   // the same one. its balance is the spending cap, nothing else.
   agentWalletId: text("agent_wallet_id").notNull(),
   agentEvmAddress: text("agent_evm_address").notNull(),
+  // captured at wallet creation — needed to sign a payment with this
+  // wallet later. Fetching it after the fact would hit the same
+  // null-until-first-outgoing-tx gotcha the account id already has.
+  agentPublicKeyHex: text("agent_public_key_hex").notNull(),
   agentAccountId: text("agent_account_id"),
   targetGameId: uuid("target_game_id").notNull().references(() => games.id),
   triggerPriceUnits: bigint("trigger_price_units", { mode: "number" }).notNull(),
@@ -188,4 +198,21 @@ export const notifications = pgTable("notifications", {
   payload: jsonb("payload").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   readAt: timestamp("read_at", { withTimezone: true }),
+});
+
+// the audit trail Stage 4 asked for: one row per settled purchase, independent
+// of whether the split that pays the dev team actually went out. Without this
+// table a failed split had nowhere to be recorded or retried from — it just
+// logged an error and moved on.
+export const sales = pgTable("sales", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  gameId: uuid("game_id").notNull().references(() => games.id),
+  buyerAccountId: text("buyer_account_id").notNull(),
+  priceUnits: bigint("price_units", { mode: "number" }).notNull(),
+  priceAsset: text("price_asset").notNull(),
+  settlementTxId: text("settlement_tx_id").notNull(),
+  hcsSaleTxId: text("hcs_sale_tx_id"),
+  splitStatus: splitStatusEnum("split_status").notNull().default("pending"),
+  splitError: text("split_error"),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });

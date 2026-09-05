@@ -22,6 +22,7 @@ import {
 } from "../services/x402/server.js";
 import { fulfilPurchase } from "../services/games/fulfil.js";
 import { getAccountByEvmAddress } from "../services/hedera/mirror.js";
+import { payForGame } from "../services/x402/pay.js";
 import { checkImages } from "../services/moderation/csam.js";
 import { createGameToken } from "../services/hedera/hts.js";
 import { submitTopicMessage } from "../services/hedera/hcs.js";
@@ -458,6 +459,29 @@ gameRouter.get(
     const game = await db.query.games.findFirst({ where: eq(games.id, param(req, "id")) });
     if (!game) throw Errors.notFound("Game");
     const result = await ownsGame(req.auth!.evmAddress, game.htsTokenId);
+    res.json(result);
+  }),
+);
+
+// The browser can't hold a signing key, so a logged-in buyer's purchase is
+// signed here instead — with their own Privy wallet, not ours. This is the
+// "helper" INTEGRATION.md tells the frontend to call rather than building a
+// Hedera transaction client-side. Same response shape as GET /:id/download.
+gameRouter.post(
+  "/:id/pay",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const game = await db.query.games.findFirst({ where: eq(games.id, param(req, "id")) });
+    if (!game) throw Errors.notFound("Game");
+
+    const account = await getAccountByEvmAddress(req.auth!.evmAddress);
+    if (!account) throw Errors.walletNotFunded();
+
+    const result = await payForGame(game.id, {
+      walletId: req.auth!.privyWalletId,
+      accountId: account.account,
+      publicKeyHex: req.auth!.publicKeyHex,
+    });
     res.json(result);
   }),
 );

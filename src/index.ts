@@ -17,6 +17,8 @@ import notificationRouter from "./routes/notification.routes.js";
 import reviewRouter from "./routes/review.routes.js";
 import agentRouter from "./routes/agent.routes.js";
 import reportRouter from "./routes/report.routes.js";
+import { runWatcherTick } from "./agent/watcher.js";
+import logger from "./utils/logger.utils.js";
 
 const app: Express = express();
 
@@ -44,4 +46,12 @@ app.use(errorHandler);
 
 app.listen(env.PORT, () => {
   console.log(`cgs-server listening on :${env.PORT} (${env.HEDERA_NETWORK})`);
+
+  // the wishlist agent's whole loop: poll the public listings topic through
+  // the Mirror Node, fire the same purchase path a person would. One tick at
+  // a time, never overlapping — a slow tick delays the next one rather than
+  // stacking concurrent ticks against the same agents.
+  setInterval(() => {
+    runWatcherTick().catch((err) => logger.error({ err }, "watcher tick crashed"));
+  }, env.AGENT_POLL_INTERVAL_MS);
 });

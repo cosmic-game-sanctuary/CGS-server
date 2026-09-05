@@ -11,7 +11,8 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:studio": "drizzle-kit studio",
-    "topics:create": "tsx scripts/create-hcs-topics.ts"
+    "topics:create": "tsx scripts/create-hcs-topics.ts",
+    "splits:retry": "tsx scripts/retry-failed-splits.ts"
   },
   "repository": {
     "type": "git",

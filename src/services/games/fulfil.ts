@@ -7,7 +7,7 @@ import {
   AccountId,
 } from "@hiero-ledger/sdk";
 import { db } from "../../db/client.js";
-import { games, splits, gameKeys, notifications, studios, studioMembers } from "../../db/schema.js";
+import { games, splits, gameKeys, notifications, studios, studioMembers, sales } from "../../db/schema.js";
 import client from "../hedera/client.js";
 import { submitTopicMessage } from "../hedera/hcs.js";
 import { getAccountByEvmAddress } from "../hedera/mirror.js";
@@ -23,6 +23,17 @@ type Game = typeof games.$inferSelect;
 // payment is already final and provable on-chain, and `game_keys.mint_status`
 // records what still needs retrying.
 export async function fulfilPurchase(game: Game, buyerAccountId: string, settlementTxId: string) {
+  const [sale] = await db
+    .insert(sales)
+    .values({
+      gameId: game.id,
+      buyerAccountId,
+      priceUnits: game.priceUnits,
+      priceAsset: game.priceAsset,
+      settlementTxId,
+    })
+    .returning();
+
   const [key] = await db
     .insert(gameKeys)
     .values({
@@ -45,10 +56,11 @@ export async function fulfilPurchase(game: Game, buyerAccountId: string, settlem
   }
 
   // the split and the sale log are independent of the mint — a failed mint
-  // shouldn't stop the devs getting paid, and vice versa.
-  await distributeSplits(game).catch((err) =>
-    logger.error({ err, gameId: game.id }, "split distribution failed"),
-  );
+  // shouldn't stop the devs getting paid, and vice versa. A failed split is
+  // recorded on the sale row rather than just logged — scripts/retry-failed-splits.ts
+  // is what actually retries it. There was no way to retry this before Stage 4;
+  // it just logged an error and moved on.
+  await runSplitDistribution(sale!.id, game);
 
   await submitTopicMessage(env.HCS_SALES_TOPIC!, {
     gameId: game.id,
@@ -58,9 +70,28 @@ export async function fulfilPurchase(game: Game, buyerAccountId: string, settlem
     asset: game.priceAsset,
     settlementTxId,
     at: new Date().toISOString(),
-  }).catch((err) => logger.error({ err, gameId: game.id }, "HCS sale log failed"));
+  })
+    .then((hcsTxId) => db.update(sales).set({ hcsSaleTxId: hcsTxId }).where(eq(sales.id, sale!.id)))
+    .catch((err) => logger.error({ err, gameId: game.id }, "HCS sale log failed"));
 
   await notifyStudio(game).catch(() => {});
+}
+
+async function runSplitDistribution(saleId: string, game: Game) {
+  if (game.priceUnits <= 0) {
+    // nothing owed on a free game — there's nothing to retry, so it's not
+    // "pending" forever, it's just done.
+    await db.update(sales).set({ splitStatus: "distributed" }).where(eq(sales.id, saleId));
+    return;
+  }
+  try {
+    await distributeSplits(game);
+    await db.update(sales).set({ splitStatus: "distributed" }).where(eq(sales.id, saleId));
+  } catch (err) {
+    logger.error({ err, gameId: game.id, saleId }, "split distribution failed");
+    const message = err instanceof Error ? err.message : String(err);
+    await db.update(sales).set({ splitStatus: "failed", splitError: message }).where(eq(sales.id, saleId));
+  }
 }
 
 async function mintAndTransferKey(game: Game, buyerAccountId: string): Promise<number> {
@@ -151,4 +182,4 @@ async function notifyStudio(game: Game) {
   );
 }
 
-export { resolveAccountId };
+export { resolveAccountId, distributeSplits };

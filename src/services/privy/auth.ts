@@ -7,6 +7,7 @@ export type PrivyIdentity = {
   privyDid: string;
   email: string;
   evmAddress: string;
+  privyWalletId: string;
 };
 
 // throws if the token is missing, expired, or doesn't verify — callers decide
@@ -28,16 +29,17 @@ export async function fetchIdentity(userId: string): Promise<PrivyIdentity> {
   const email = findLinkedAccount(user.linked_accounts, "email")?.address;
   const wallet = findLinkedAccount(user.linked_accounts, "ethereum");
 
-  if (!email || !wallet) {
+  if (!email || !wallet?.id) {
     throw new Error(`Privy user ${userId} is missing an email or an embedded wallet.`);
   }
 
-  return { privyDid: user.id, email, evmAddress: wallet.address };
+  return { privyDid: user.id, email, evmAddress: wallet.address, privyWalletId: wallet.id };
 }
 
-function findLinkedAccount(accounts: LinkedAccount[], type: "email"): { address: string } | undefined;
-function findLinkedAccount(accounts: LinkedAccount[], type: "ethereum"): { address: string } | undefined;
-function findLinkedAccount(accounts: LinkedAccount[], type: "email" | "ethereum") {
+function findLinkedAccount(
+  accounts: LinkedAccount[],
+  type: "email" | "ethereum",
+): { address: string; id?: string | null } | undefined {
   if (type === "email") {
     return accounts.find((a): a is Extract<LinkedAccount, { type: "email" }> => a.type === "email");
   }
