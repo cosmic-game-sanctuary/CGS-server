@@ -4,7 +4,14 @@
   "description": "INIT",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:studio": "drizzle-kit studio",
+    "topics:create": "tsx scripts/create-hcs-topics.ts"
   },
   "repository": {
     "type": "git",
@@ -15,5 +22,33 @@
   "bugs": {
     "url": "https://github.com/cosmic-game-sanctuary/CGS-server/issues"
   },
-  "homepage": "https://github.com/cosmic-game-sanctuary/CGS-server#readme"
+  "homepage": "https://github.com/cosmic-game-sanctuary/CGS-server#readme",
+  "dependencies": {
+    "@hiero-ledger/sdk": "^2.87.0",
+    "@privy-io/node": "^0.34.0",
+    "@x402/core": "^2.25.0",
+    "@x402/express": "^2.25.0",
+    "@x402/hedera": "^2.25.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "drizzle-orm": "^0.45.2",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.7.0",
+    "helmet": "^8.3.0",
+    "multer": "^2.3.0",
+    "pg": "^8.23.0",
+    "pino": "^10.3.1",
+    "pino-http": "^11.0.0",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/multer": "^2.2.0",
+    "@types/node": "^26.4.1",
+    "@types/pg": "^8.23.1",
+    "drizzle-kit": "^0.31.10",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2"
+  }
 }

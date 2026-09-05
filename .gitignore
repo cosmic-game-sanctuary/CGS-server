@@ -1,0 +1,36 @@
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+logs/
+
+# Runtime / local state
+.DS_Store
+coverage/
+.cache/
+tmp/
+uploads/
+
+# Editor
+.vscode/
+.idea/
+
+# Internal working rules — kept local, not published.
+CLAUDE.md
+
+# Drizzle local artifacts (migrations ARE committed; meta journal is too)
+drizzle/.snapshot-tmp/
