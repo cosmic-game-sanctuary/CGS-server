@@ -13,7 +13,15 @@ import { ownsGame } from "../services/games/ownership.js";
 import { env } from "../config/env.js";
 import { param } from "../lib/params.js";
 import { unpackBuild } from "../services/ipfs/unpack.js";
-import { pinDirectory, pinFile } from "../services/ipfs/pinata.js";
+import { pinDirectory, pinFile, gatewayUrl } from "../services/ipfs/pinata.js";
+import {
+  resourceServer,
+  ensureInitialized,
+  readPaymentHeader,
+  decodePaymentPayload,
+} from "../services/x402/server.js";
+import { fulfilPurchase } from "../services/games/fulfil.js";
+import { getAccountByEvmAddress } from "../services/hedera/mirror.js";
 import { checkImages } from "../services/moderation/csam.js";
 import { createGameToken } from "../services/hedera/hts.js";
 import { submitTopicMessage } from "../services/hedera/hcs.js";
@@ -329,15 +337,119 @@ gameRouter.post(
   }),
 );
 
+// The x402-gated route — the one endpoint here that isn't ordinary REST.
+//
+// Three branches, in this order:
+//   1. free game            -> serve, still mint a GameKey
+//   2. caller already owns  -> serve, no second charge (checked against the
+//                              Mirror Node, not our cache). Without this a
+//                              buyer pays again on every page refresh.
+//   3. otherwise            -> 402 + PaymentRequirements, then verify + settle
+//                              through Blocky402 on the retry.
+//
+// A delisted game still serves to branch 2 — delisting removes a game from the
+// catalog, it does not revoke anyone's copy. Only `removed` (illegal content,
+// unpinned from storage) actually ends access.
 gameRouter.get(
   "/:id/download",
   optionalAuth,
-  asyncHandler(async (req) => {
+  asyncHandler(async (req, res) => {
     const game = await db.query.games.findFirst({ where: eq(games.id, param(req, "id")) });
     if (!game) throw Errors.notFound("Game");
-    throw Errors.notImplemented("Stage 3 — the x402 payment gate isn't wired yet");
+    if (game.status === "removed") throw Errors.notFound("Game");
+    if (game.status === "draft") throw Errors.gameNotPublished();
+    if (!game.buildCid) throw Errors.gameNotPublished("This game has no build pinned.");
+
+    const playUrl = gatewayUrl(game.buildCid, "index.html");
+
+    if (game.priceUnits === 0) {
+      if (req.auth) await grantFreeKey(game, req.auth.evmAddress);
+      res.json({ playUrl, tokenId: game.htsTokenId, keyStatus: "free" });
+      return;
+    }
+
+    if (req.auth) {
+      const { owned, serial } = await ownsGame(req.auth.evmAddress, game.htsTokenId);
+      if (owned) {
+        res.json({ playUrl, tokenId: game.htsTokenId, serial, keyStatus: "owned" });
+        return;
+      }
+    }
+
+    await ensureInitialized();
+
+    const requirements = await resourceServer.buildPaymentRequirements({
+      scheme: "exact",
+      network: env.X402_NETWORK,
+      payTo: env.X402_PAY_TO,
+      price: { asset: game.priceAsset, amount: String(game.priceUnits) },
+      maxTimeoutSeconds: 180,
+    });
+
+    const resourceInfo = {
+      url: `${req.protocol}://${req.get("host")}${req.originalUrl}`,
+      description: `${game.title} — game build`,
+      mimeType: "application/json",
+    };
+
+    const header = readPaymentHeader(req.headers as Record<string, unknown>);
+    if (!header) {
+      const paymentRequired = await resourceServer.createPaymentRequiredResponse(
+        requirements,
+        resourceInfo,
+      );
+      res.status(402).json(paymentRequired);
+      return;
+    }
+
+    const payload = decodePaymentPayload(header);
+    const matched = resourceServer.findMatchingRequirements(requirements, payload);
+    if (!matched) {
+      throw new AppError(402, "PAYMENT_REQUIRED", "The payment doesn't match this game's price.");
+    }
+
+    const verification = await resourceServer.verifyPayment(payload, matched);
+    if (!verification.isValid) {
+      throw new AppError(402, "PAYMENT_REQUIRED", "Payment could not be verified.", {
+        reason: verification.invalidReason,
+      });
+    }
+
+    const settlement = await resourceServer.settlePayment(payload, matched);
+    if (!settlement.success) {
+      throw new AppError(402, "PAYMENT_REQUIRED", "Payment could not be settled.", {
+        reason: settlement.errorReason,
+      });
+    }
+
+    // Settlement is the moment the buyer is entitled to the game, so respond
+    // now and do the minting, the split and the sale log in the background.
+    // Blocking here would put ~6s of chain round-trips in front of the single
+    // most important moment in the product.
+    const buyerAccountId = settlement.payer ?? payload.accepted?.payTo;
+    if (buyerAccountId) {
+      void fulfilPurchase(game, buyerAccountId, settlement.transaction);
+    }
+
+    res.setHeader("payment-verified", "true");
+    res.json({
+      playUrl,
+      tokenId: game.htsTokenId,
+      keyStatus: "pending",
+      settlementTxId: settlement.transaction,
+    });
   }),
 );
+
+// A free game still mints a real GameKey — `price = 0` is a real purchase
+// with real ownership, not a bypass.
+async function grantFreeKey(game: typeof games.$inferSelect, buyerEvmAddress: string) {
+  const { owned } = await ownsGame(buyerEvmAddress, game.htsTokenId);
+  if (owned) return;
+  const account = await getAccountByEvmAddress(buyerEvmAddress);
+  if (!account) return; // wallet never funded — nothing to mint to yet
+  void fulfilPurchase(game, account.account, "free");
+}
 
 gameRouter.get(
   "/:id/owned",

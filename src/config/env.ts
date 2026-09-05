@@ -1,6 +1,11 @@
 import "dotenv/config";
 import { z } from "zod";
 
+// a real 0.0.x account id, not .env.example's `0.0.xxxxx` placeholder
+const hederaAccountId = z
+  .string()
+  .regex(/^\d+\.\d+\.\d+$/, "must be a real Hedera account id like 0.0.12345");
+
 // fails loudly at boot if something's missing, instead of an obscure crash
 // three requests in.
 const envSchema = z.object({
@@ -11,16 +16,26 @@ const envSchema = z.object({
   DATABASE_URL: z.string(),
   DATABASE_URL_POOLED: z.string(),
 
-  HEDERA_OPERATOR_ID: z.string(),
+  // `0.0.xxxxx` is what .env.example ships — catching it here turns a
+  // confusing facilitator rejection into an obvious boot-time failure.
+  HEDERA_OPERATOR_ID: hederaAccountId,
   HEDERA_OPERATOR_KEY: z.string(),
   HEDERA_NETWORK: z.enum(["testnet", "mainnet"]).default("testnet"),
   HEDERA_MIRROR_URL: z.string(),
 
   X402_FACILITATOR_URL: z.string(),
-  X402_NETWORK: z.string().default("hedera:testnet"),
+  // x402 types network as the CAIP-2 template literal `${string}:${string}`,
+  // so a plain string doesn't satisfy it — validate the shape, then say so.
+  X402_NETWORK: z
+    .string()
+    .regex(/^[^:]+:[^:]+$/, "must be CAIP-2, e.g. hedera:testnet")
+    .default("hedera:testnet")
+    .transform((v) => v as `${string}:${string}`),
   X402_ASSET: z.string(),
   X402_ASSET_DECIMALS: z.coerce.number(),
-  X402_PAY_TO: z.string(),
+  // where buyers pay. A real 0.0.x, never an EVM address — facilitators
+  // default to rejecting the alias auto-creation an address would trigger.
+  X402_PAY_TO: hederaAccountId,
 
   HCS_LISTINGS_TOPIC: z.string().optional(),
   HCS_SALES_TOPIC: z.string().optional(),
