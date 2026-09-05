@@ -7,5 +7,5 @@ export default defineConfig({
   dialect: "postgresql",
   // Direct (unpooled) connection — PgBouncer's transaction mode, which the
   // pooled string goes through, doesn't support the SET statements migrations need.
-  dbCredentials: { url: process.env.DATABASE_URL_DIRECT! },
+  dbCredentials: { url: process.env.DATABASE_URL! },
 });
