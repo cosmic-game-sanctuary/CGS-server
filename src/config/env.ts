@@ -70,6 +70,10 @@ const envSchema = z.object({
   // chosen once, at first registration — see docs/stage-7.md for why this
   // specific label.
   ENS_PARENT_NAME: z.string().min(1),
+  // the subregistry we deployed and own, and the parent name registered
+  // under it — both one-time setup, done by `scripts/setup-ens.ts` and
+  // never redone. Every studio subname mints against this address.
+  ENS_SUBREGISTRY_ADDRESS: evmAddress,
 });
 
 const parsed = envSchema.safeParse(process.env);

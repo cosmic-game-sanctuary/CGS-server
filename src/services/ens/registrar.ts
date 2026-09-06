@@ -127,6 +127,26 @@ export async function registerParentName(subregistryAddress: Hex): Promise<{ tok
   return { tokenId: 0n, txHash: registerHash }; // tokenId parsed from logs by the caller if needed
 }
 
+// Real availability, not a guess at a view function that may not exist: a
+// subname registration is simulated (eth_call, no tx, no gas spent) exactly
+// as it would actually be sent. If the simulation reverts — most likely
+// because the label is already registered — the label isn't available.
+export async function isSubnameAvailable(subregistryAddress: Hex, label: string): Promise<boolean> {
+  const expiry = BigInt(Math.floor(Date.now() / 1000)) + ONE_YEAR;
+  try {
+    await publicClient.simulateContract({
+      address: subregistryAddress,
+      abi: permissionedRegistryAbi,
+      functionName: "register",
+      args: [label, ensAccount.address, "0x0000000000000000000000000000000000000000", env.ENS_RESOLVER as Hex, STUDIO_BITMAP, expiry],
+      account: ensAccount,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Per studio: mint "studio.cgs-sanctuary.eth" under the subregistry the
 // platform owns. Grants a limited role set (STUDIO_BITMAP) — enough for the
 // studio to point its own name somewhere, not enough to unregister or

@@ -9,6 +9,8 @@ import { asyncHandler } from "../lib/asyncHandler.js";
 import { Errors } from "../lib/errors.js";
 import { slugify, withSuffix } from "../lib/slug.js";
 import { param } from "../lib/params.js";
+import { isSubnameAvailable, registerStudioSubname } from "../services/ens/registrar.js";
+import { env } from "../config/env.js";
 
 const studioRouter = Router({ caseSensitive: true, strict: true });
 
@@ -25,9 +27,28 @@ studioRouter.post(
   asyncHandler(async (req, res) => {
     const { name, bio, ensSubname } = req.body;
 
+    // checked live against the subregistry, not just our own table — a
+    // label could be taken on-chain without ever passing through this route
+    // (e.g. minted directly against the subregistry by hand).
+    if (ensSubname && !(await isSubnameAvailable(env.ENS_SUBREGISTRY_ADDRESS as `0x${string}`, ensSubname))) {
+      throw Errors.validationFailed({ ensSubname: `"${ensSubname}" is not available.` });
+    }
+
     let slug = slugify(name);
     if (await db.query.studios.findFirst({ where: eq(studios.slug, slug) })) {
       slug = withSuffix(slug);
+    }
+
+    // real subname mint — one transaction, no commit-reveal (that's only
+    // for the one-time parent name registration). Runs before the insert so
+    // a chain failure never leaves a studio row claiming a subname it
+    // doesn't actually hold.
+    if (ensSubname) {
+      await registerStudioSubname(
+        env.ENS_SUBREGISTRY_ADDRESS as `0x${string}`,
+        ensSubname,
+        req.auth!.evmAddress as `0x${string}`,
+      );
     }
 
     const [studio] = await db
@@ -39,16 +60,19 @@ studioRouter.post(
   }),
 );
 
-// stub for the real check: Stage 7 replaces this with a live Sepolia read
-// against the ENS registry. For now it only rules out a name we've already
-// stored, which is honest about what it does and doesn't guarantee.
+// Checked twice, deliberately: our own table first (cheap, catches almost
+// every real collision) and then live against the subregistry (source of
+// truth — a label minted by hand, outside this route, would only show up
+// here). See services/ens/registrar.ts#isSubnameAvailable for how the live
+// check works with no dedicated view function to call.
 studioRouter.get(
   "/ens-availability",
   validate(z.object({ name: z.string().min(1).max(63) }), "query"),
   asyncHandler(async (req, res) => {
     const { name } = req.query as unknown as { name: string };
-    const taken = await db.query.studios.findFirst({ where: eq(studios.ensSubname, name) });
-    res.json({ name, available: !taken, checkedOnChain: false });
+    const takenLocally = await db.query.studios.findFirst({ where: eq(studios.ensSubname, name) });
+    const available = !takenLocally && (await isSubnameAvailable(env.ENS_SUBREGISTRY_ADDRESS as `0x${string}`, name));
+    res.json({ name, available, checkedOnChain: true });
   }),
 );
 
