@@ -3,7 +3,19 @@ import { and, desc, asc, eq, or, ilike, inArray, isNotNull, lt, sql } from "driz
 import { z } from "zod";
 import multer from "multer";
 import { db } from "../db/client.js";
-import { games, studios, studioMembers, splits, reviews, gameMedia, notifications, users } from "../db/schema.js";
+import {
+  games,
+  studios,
+  studioMembers,
+  splits,
+  reviews,
+  gameMedia,
+  notifications,
+  users,
+  playSessions,
+  likes,
+  comments,
+} from "../db/schema.js";
 import { truncateAddress } from "../lib/address.js";
 import { requireAuth, optionalAuth } from "../middleware/auth.middleware.js";
 import { validate } from "../middleware/validate.middleware.js";
@@ -50,6 +62,31 @@ async function ratingsFor(gameIds: string[]) {
       reviewCount: ratings.length,
     });
   }
+  return out;
+}
+
+// Same shape and same reasoning as ratingsFor above: a JS count over a
+// batched fetch, not a SQL aggregate, because this catalog is a few dozen
+// rows and a handful of sessions/likes each, not a scale where that matters.
+async function playsFor(gameIds: string[]) {
+  if (gameIds.length === 0) return new Map<string, number>();
+  const rows = await db.query.playSessions.findMany({
+    where: inArray(playSessions.gameId, gameIds),
+    columns: { gameId: true },
+  });
+  const out = new Map<string, number>();
+  for (const r of rows) out.set(r.gameId, (out.get(r.gameId) ?? 0) + 1);
+  return out;
+}
+
+async function likeCountsFor(gameIds: string[]) {
+  if (gameIds.length === 0) return new Map<string, number>();
+  const rows = await db.query.likes.findMany({
+    where: inArray(likes.gameId, gameIds),
+    columns: { gameId: true },
+  });
+  const out = new Map<string, number>();
+  for (const r of rows) out.set(r.gameId, (out.get(r.gameId) ?? 0) + 1);
   return out;
 }
 
@@ -100,15 +137,19 @@ gameRouter.get(
     const page = hasMore ? rows.slice(0, limit) : rows;
     const ids = page.map((g) => g.id);
 
-    const [ratings, splitRows] = await Promise.all([
+    const [ratings, splitRows, plays, likeCounts] = await Promise.all([
       ratingsFor(ids),
       db.query.splits.findMany({ where: inArray(splits.gameId, ids) }),
+      playsFor(ids),
+      likeCountsFor(ids),
     ]);
     const splitsByGame = new Map<string, typeof splitRows>();
     for (const s of splitRows) splitsByGame.set(s.gameId, [...(splitsByGame.get(s.gameId) ?? []), s]);
 
     res.json({
-      games: page.map((g) => serializeGame(g, splitsByGame.get(g.id) ?? [], ratings.get(g.id))),
+      games: page.map((g) =>
+        serializeGame(g, splitsByGame.get(g.id) ?? [], ratings.get(g.id), plays.get(g.id), likeCounts.get(g.id)),
+      ),
       nextCursor: hasMore ? String(cursor + limit) : null,
     });
   }),
@@ -125,18 +166,29 @@ gameRouter.get(
     });
     if (!game) throw Errors.notFound("Game");
 
-    const [gameSplits, media, ratings] = await Promise.all([
+    const [gameSplits, media, ratings, plays, likeCounts] = await Promise.all([
       db.query.splits.findMany({ where: eq(splits.gameId, game.id) }),
       db.query.gameMedia.findMany({ where: eq(gameMedia.gameId, game.id), orderBy: asc(gameMedia.position) }),
       ratingsFor([game.id]),
+      playsFor([game.id]),
+      likeCountsFor([game.id]),
     ]);
 
     let owned: boolean | undefined;
+    let liked: boolean | undefined;
     if (req.auth) {
       owned = (await ownsGame(req.auth.evmAddress, game.htsTokenId)).owned;
+      liked = !!(await db.query.likes.findFirst({
+        where: and(eq(likes.gameId, game.id), eq(likes.userId, req.auth.id)),
+      }));
     }
 
-    res.json({ ...serializeGame(game, gameSplits, ratings.get(game.id)), media, owned });
+    res.json({
+      ...serializeGame(game, gameSplits, ratings.get(game.id), plays.get(game.id), likeCounts.get(game.id)),
+      media,
+      owned,
+      liked,
+    });
   }),
 );
 
@@ -144,6 +196,8 @@ function serializeGame(
   game: typeof games.$inferSelect & { studio: typeof studios.$inferSelect },
   gameSplits: (typeof splits.$inferSelect)[],
   rating?: { rating: number; reviewCount: number },
+  plays?: number,
+  likeCount?: number,
 ) {
   return {
     id: game.id,
@@ -161,6 +215,11 @@ function serializeGame(
     splits: gameSplits.map((s) => ({ handle: s.handle, role: s.role, pct: s.pct })),
     rating: rating?.rating ?? 0,
     reviewCount: rating?.reviewCount ?? 0,
+    // a real count at last, batched the same way rating is above — the
+    // contract has promised this field since Stage 1 and nothing ever
+    // incremented it. See playSessions in db/schema.ts.
+    plays: plays ?? 0,
+    likeCount: likeCount ?? 0,
     buildKb: game.buildSizeKb,
   };
 }
@@ -552,6 +611,158 @@ gameRouter.post(
       .returning();
 
     res.status(201).json(review);
+  }),
+);
+
+// --- likes ---------------------------------------------------------------
+// A toggle, not a growing log: liking twice unlikes. No ownership gate on
+// purpose — favoriting a game you haven't bought yet is normal (Steam
+// wishlists, itch.io favorites), unlike a review, which is a
+// verified-purchase signal.
+
+gameRouter.post(
+  "/:id/like",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const game = await db.query.games.findFirst({ where: eq(games.id, param(req, "id")) });
+    if (!game) throw Errors.notFound("Game");
+
+    const existing = await db.query.likes.findFirst({
+      where: and(eq(likes.gameId, game.id), eq(likes.userId, req.auth!.id)),
+    });
+
+    if (existing) {
+      await db.delete(likes).where(eq(likes.id, existing.id));
+    } else {
+      await db.insert(likes).values({ gameId: game.id, userId: req.auth!.id });
+    }
+
+    const rows = await db.query.likes.findMany({ where: eq(likes.gameId, game.id), columns: { id: true } });
+    res.json({ liked: !existing, likeCount: rows.length });
+  }),
+);
+
+// --- play sessions ---------------------------------------------------------
+// Timed the honest way: started when the client actually boots the game
+// (after /download or /pay hands back a playUrl), ended by an explicit call.
+// A tab that just closes leaves a session with no endedAt — it still counts
+// once toward `plays` (see playsFor above), it just never earns a duration.
+
+const MAX_SESSION_SECONDS = 12 * 60 * 60; // a session left open past this is an abandoned tab, not real playtime
+
+gameRouter.post(
+  "/:id/sessions",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const game = await db.query.games.findFirst({ where: eq(games.id, param(req, "id")) });
+    if (!game) throw Errors.notFound("Game");
+    if (game.status === "removed") throw Errors.notFound("Game");
+
+    if (game.priceUnits > 0) {
+      const { owned } = await ownsGame(req.auth!.evmAddress, game.htsTokenId);
+      if (!owned) throw Errors.notOwner("You need to own this game to play it.");
+    }
+
+    const [session] = await db
+      .insert(playSessions)
+      .values({ gameId: game.id, userId: req.auth!.id })
+      .returning();
+
+    res.status(201).json({ sessionId: session!.id, startedAt: session!.startedAt });
+  }),
+);
+
+gameRouter.patch(
+  "/:id/sessions/:sessionId",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const session = await db.query.playSessions.findFirst({
+      where: eq(playSessions.id, param(req, "sessionId")),
+    });
+    if (!session || session.gameId !== param(req, "id")) throw Errors.notFound("Play session");
+    if (session.userId !== req.auth!.id) throw Errors.notOwner();
+
+    // idempotent — a duplicate "end" call (a beforeunload handler racing a
+    // manual close, say) isn't an error, it's the same session reported twice.
+    if (session.endedAt) {
+      res.json(session);
+      return;
+    }
+
+    const endedAt = new Date();
+    const rawSeconds = Math.round((endedAt.getTime() - session.startedAt.getTime()) / 1000);
+    const durationSeconds = Math.max(0, Math.min(rawSeconds, MAX_SESSION_SECONDS));
+
+    const [updated] = await db
+      .update(playSessions)
+      .set({ endedAt, durationSeconds })
+      .where(eq(playSessions.id, session.id))
+      .returning();
+
+    res.json(updated);
+  }),
+);
+
+// --- comments --------------------------------------------------------------
+// Unrestricted discussion, unlike reviews: no ownership gate, no rating.
+// Same cursor pagination and same batched-author-lookup pattern as reviews
+// above, deliberately, so the two read the same way.
+
+const listCommentsSchema = z.object({
+  cursor: z.string().datetime().optional(),
+  limit: z.coerce.number().min(1).max(50).default(20),
+});
+
+gameRouter.get(
+  "/:id/comments",
+  validate(listCommentsSchema, "query"),
+  asyncHandler(async (req, res) => {
+    const { cursor, limit } = req.query as unknown as z.infer<typeof listCommentsSchema>;
+    const rows = await db.query.comments.findMany({
+      where: and(
+        eq(comments.gameId, param(req, "id")),
+        cursor ? lt(comments.createdAt, new Date(cursor)) : undefined,
+      ),
+      orderBy: desc(comments.createdAt),
+      limit: limit + 1,
+    });
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+
+    const authorIds = [...new Set(page.map((c) => c.userId))];
+    const authors =
+      authorIds.length > 0
+        ? await db.query.users.findMany({ where: inArray(users.id, authorIds), columns: { id: true, evmAddress: true } })
+        : [];
+    const authorById = new Map(authors.map((a) => [a.id, a.evmAddress]));
+
+    res.json({
+      comments: page.map((c) => ({
+        ...c,
+        author: truncateAddress(authorById.get(c.userId) ?? "0x0"),
+        authorIsEns: false,
+      })),
+      nextCursor: hasMore ? page[page.length - 1]!.createdAt.toISOString() : null,
+    });
+  }),
+);
+
+const postCommentSchema = z.object({ body: z.string().min(1).max(2000) });
+
+gameRouter.post(
+  "/:id/comments",
+  requireAuth,
+  validate(postCommentSchema),
+  asyncHandler(async (req, res) => {
+    const game = await db.query.games.findFirst({ where: eq(games.id, param(req, "id")) });
+    if (!game) throw Errors.notFound("Game");
+
+    const [comment] = await db
+      .insert(comments)
+      .values({ gameId: game.id, userId: req.auth!.id, body: req.body.body })
+      .returning();
+
+    res.status(201).json(comment);
   }),
 );
 

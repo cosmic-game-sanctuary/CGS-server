@@ -13,6 +13,10 @@ export type Auth = {
   evmAddress: string;
   privyWalletId: string;
   publicKeyHex: string;
+  // null until this address completes its own first outgoing transaction —
+  // see services/users/repo.ts#resolveHederaAccount, which is what actually
+  // resolves and caches this going forward.
+  hederaAccountId: string | null;
 };
 
 declare global {
@@ -39,6 +43,7 @@ async function resolveAuth(req: Request): Promise<Auth | undefined> {
     evmAddress: user.evmAddress,
     privyWalletId: user.privyWalletId,
     publicKeyHex: user.publicKeyHex,
+    hederaAccountId: user.hederaAccountId,
   };
 }
 

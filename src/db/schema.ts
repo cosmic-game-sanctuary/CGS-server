@@ -7,6 +7,7 @@ import {
   bigint,
   timestamp,
   jsonb,
+  uniqueIndex,
 } from "drizzle-orm/pg-core";
 import { relations } from "drizzle-orm";
 
@@ -198,6 +199,47 @@ export const notifications = pgTable("notifications", {
   payload: jsonb("payload").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   readAt: timestamp("read_at", { withTimezone: true }),
+});
+
+// Stage 9: a real play, timed. Started when the player actually boots (after
+// /download or /pay hands back a playUrl, never before), ended by an explicit
+// call from the client. A session that never gets an end call — a closed tab,
+// a crash — still counts once toward `plays` (see game.routes.ts#playsFor),
+// it just never gets a duration, which is more honest than guessing one.
+export const playSessions = pgTable("play_sessions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  gameId: uuid("game_id").notNull().references(() => games.id),
+  userId: uuid("user_id").notNull().references(() => users.id),
+  startedAt: timestamp("started_at", { withTimezone: true }).defaultNow().notNull(),
+  endedAt: timestamp("ended_at", { withTimezone: true }),
+  // only set alongside endedAt, and capped — see game.routes.ts#MAX_SESSION_SECONDS.
+  durationSeconds: integer("duration_seconds"),
+});
+
+// A per-person toggle, not a count with history — liking again just unlikes.
+// Deliberately no ownership gate: favoriting a game you haven't bought yet is
+// normal in every real storefront (Steam wishlists, itch.io favorites).
+export const likes = pgTable(
+  "likes",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    gameId: uuid("game_id").notNull().references(() => games.id),
+    userId: uuid("user_id").notNull().references(() => users.id),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [uniqueIndex("likes_game_user_idx").on(table.gameId, table.userId)],
+);
+
+// Unrestricted discussion — the deliberate difference from `reviews`, which
+// stay gated to verified owners and carry a rating. A comment carries neither;
+// it's a normal storefront comment thread, not a verified-purchase signal.
+export const comments = pgTable("comments", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  gameId: uuid("game_id").notNull().references(() => games.id),
+  userId: uuid("user_id").notNull().references(() => users.id),
+  body: text("body").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  editedAt: timestamp("edited_at", { withTimezone: true }),
 });
 
 // the audit trail Stage 4 asked for: one row per settled purchase, independent

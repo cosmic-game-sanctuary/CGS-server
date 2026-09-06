@@ -1,7 +1,7 @@
 {
   "name": "cgs-server",
   "version": "1.0.0",
-  "description": "INIT",
+  "description": "Backend for Cosmic Game Sanctuary — API, Hedera/ENS chain integration, and the wishlist agent.",
   "main": "index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",

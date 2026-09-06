@@ -91,3 +91,24 @@ export async function getNftsForAccount(accountId: string, tokenId: string) {
   );
   return data?.nfts ?? [];
 }
+
+// Every NFT this account holds, across every token — the library needs "what
+// does this wallet hold", not "does it hold this one game", so there's no
+// token.id filter here. `links.next` is a full relative path (confirmed
+// against the mirror node's own docs, not assumed), so each page is fetched
+// by handing it straight back to getJson rather than building a new query
+// string. Real accounts can hold more than one page's worth over time, so
+// this follows every page rather than reading only the first.
+export async function getAllNftsForAccount(accountId: string): Promise<MirrorNft[]> {
+  const out: MirrorNft[] = [];
+  let path: string | null = `/api/v1/accounts/${accountId}/nfts?limit=100`;
+
+  while (path) {
+    const data: { nfts: MirrorNft[]; links: { next: string | null } } | null = await getJson(path);
+    if (!data) break;
+    out.push(...data.nfts);
+    path = data.links.next;
+  }
+
+  return out;
+}

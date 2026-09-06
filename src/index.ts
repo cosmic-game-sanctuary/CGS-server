@@ -15,8 +15,10 @@ import studioRouter from "./routes/studio.routes.js";
 import inviteRouter from "./routes/invite.routes.js";
 import notificationRouter from "./routes/notification.routes.js";
 import reviewRouter from "./routes/review.routes.js";
+import commentRouter from "./routes/comment.routes.js";
 import agentRouter from "./routes/agent.routes.js";
 import reportRouter from "./routes/report.routes.js";
+import meRouter from "./routes/me.routes.js";
 import { runWatcherTick } from "./agent/watcher.js";
 import logger from "./utils/logger.utils.js";
 
@@ -38,8 +40,10 @@ app.use("/api/studios", studioRouter);
 app.use("/api/invites", inviteRouter);
 app.use("/api/notifications", notificationRouter);
 app.use("/api/reviews", reviewRouter);
+app.use("/api/comments", commentRouter);
 app.use("/api/agents", agentRouter);
 app.use("/api/reports", reportRouter);
+app.use("/api/me", meRouter);
 
 app.use(notFoundHandler);
 app.use(errorHandler);
