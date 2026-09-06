@@ -55,7 +55,12 @@ inviteRouter.post(
     await db.insert(notifications).values({
       userId: studio!.ownerUserId,
       type: "invite",
-      payload: { studioId: studio!.id, handle: member.handle },
+      payload: {
+        studioId: studio!.id,
+        studioSlug: studio!.slug,
+        studioName: studio!.name,
+        handle: member.handle,
+      },
     });
 
     res.json(updated);

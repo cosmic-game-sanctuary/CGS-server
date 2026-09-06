@@ -1,6 +1,6 @@
 import { eq, inArray } from "drizzle-orm";
 import { db } from "../db/client.js";
-import { wishlistAgents, notifications } from "../db/schema.js";
+import { wishlistAgents, notifications, games } from "../db/schema.js";
 import { getAccountByEvmAddress, getTopicMessages } from "../services/hedera/mirror.js";
 import { anchorAgentIdentity } from "../services/agent/identity.js";
 import { payForGame } from "../services/x402/pay.js";
@@ -86,10 +86,23 @@ async function fire(agent: Agent) {
       publicKeyHex: agent.agentPublicKeyHex,
     });
     await db.update(wishlistAgents).set({ status: "fired" }).where(eq(wishlistAgents.id, agent.id));
+
+    // The one notification whose row has to name a game the buyer never
+    // opened — they set a trigger and walked away. A bare gameId would make
+    // the client fetch the game just to write the sentence.
+    const game = await db.query.games.findFirst({ where: eq(games.id, agent.targetGameId) });
     await db.insert(notifications).values({
       userId: agent.buyerUserId,
       type: "agent_fired",
-      payload: { agentId: agent.id, gameId: agent.targetGameId },
+      payload: {
+        agentId: agent.id,
+        gameId: agent.targetGameId,
+        slug: game?.slug ?? null,
+        title: game?.title ?? null,
+        priceUnits: game?.priceUnits ?? null,
+        priceAsset: game?.priceAsset ?? null,
+        triggerPriceUnits: agent.triggerPriceUnits,
+      },
     });
   } catch (err) {
     logger.error({ err, agentId: agent.id }, "agent purchase failed");
