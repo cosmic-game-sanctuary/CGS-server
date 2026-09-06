@@ -6,6 +6,8 @@ const hederaAccountId = z
   .string()
   .regex(/^\d+\.\d+\.\d+$/, "must be a real Hedera account id like 0.0.12345");
 
+const evmAddress = z.string().regex(/^0x[a-fA-F0-9]{40}$/, "must be a real 0x address");
+
 // fails loudly at boot if something's missing, instead of an obscure crash
 // three requests in.
 const envSchema = z.object({
@@ -53,6 +55,21 @@ const envSchema = z.object({
   CSAM_MODE: z.enum(["block", "skip"]).default("block"),
 
   AGENT_POLL_INTERVAL_MS: z.coerce.number().default(5000),
+
+  // ENSv2 beta, Sepolia-only. Every address here was checked against a
+  // Sepolia RPC directly (real bytecode, sensible eth_call results) — the
+  // canonical docs page and a pinned repo commit disagreed with each other,
+  // so neither was trusted on its own. See docs/stage-7.md.
+  SEPOLIA_RPC_URL: z.string(),
+  SEPOLIA_OPERATOR_KEY: z.string().regex(/^0x[a-fA-F0-9]{64}$/, "must be a raw 32-byte private key"),
+  ENS_ETH_REGISTRAR: evmAddress,
+  ENS_VERIFIABLE_FACTORY: evmAddress,
+  ENS_USER_REGISTRY_IMPL: evmAddress,
+  ENS_RESOLVER: evmAddress,
+  ENS_MOCK_USDC: evmAddress,
+  // chosen once, at first registration — see docs/stage-7.md for why this
+  // specific label.
+  ENS_PARENT_NAME: z.string().min(1),
 });
 
 const parsed = envSchema.safeParse(process.env);
