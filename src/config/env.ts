@@ -98,6 +98,14 @@ const envSchema = z.object({
   PRIVY_VERIFICATION_KEY: privyVerificationKey,
 
   PINATA_JWT: z.string(),
+  // The account's dedicated gateway subdomain, e.g. "coral-imperial-alpaca-44
+  // .mypinata.cloud". Find it under Gateways in the Pinata dashboard, or with
+  // GET https://api.pinata.cloud/v3/ipfs/gateways.
+  //
+  // Strongly recommended, effectively required: without it everything falls
+  // back to ipfs.io, which times out on freshly pinned content. That shows up
+  // as broken cover art and a game that never boots — see services/ipfs/pinata.ts.
+  PINATA_GATEWAY: z.string().optional(),
 
   // no CSAM-scanning provider is wired yet (see docs/api-contract.md §6). This
   // fails closed on purpose — "skip" is a deliberate local escape hatch, not
