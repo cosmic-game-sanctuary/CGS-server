@@ -112,6 +112,13 @@ export const games = pgTable("games", {
   coverCid: text("cover_cid"),
   coverSeed: integer("cover_seed").notNull(),
   buildCid: text("build_cid"),
+  // The same build pinned a second way, as the original zip rather than the
+  // unpacked directory. `build_cid` is the provenance answer and what a person
+  // verifies; this is the delivery answer. Pinata's public gateway refuses to
+  // serve HTML, so a directory CID (which resolves to index.html) is a 403,
+  // while application/zip is served normally — checked, not assumed. Without
+  // this a build only exists on the disk of whichever machine pinned it.
+  buildZipCid: text("build_zip_cid"),
   buildSizeKb: integer("build_size_kb"),
   priceUnits: bigint("price_units", { mode: "number" }).notNull().default(0),
   priceAsset: text("price_asset").notNull(),

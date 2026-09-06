@@ -516,7 +516,16 @@ gameRouter.post(
     let slug = slugify(body.title);
     if (await db.query.games.findFirst({ where: eq(games.slug, slug) })) slug = withSuffix(slug);
 
-    const buildCid = await pinDirectory(buildFiles);
+    // Pinned twice, on purpose, and they answer different questions. The
+    // directory is what the build *is* — that CID goes on the listing and into
+    // the HCS message, and it is what someone else can verify against. The zip
+    // is how it gets delivered: Pinata's public gateway refuses HTML, so the
+    // directory 403s in a browser while application/zip serves normally.
+    // Without the second one a build only exists on the disk that made it.
+    const [buildCid, buildZipCid] = await Promise.all([
+      pinDirectory(buildFiles),
+      pinFile(files.build[0]!.buffer, `${slug}-build.zip`, "application/zip"),
+    ]);
     const buildSizeKb = Math.round(buildFiles.reduce((sum, f) => sum + f.buffer.length, 0) / 1024);
     const buildZip = files.build[0]!.buffer;
 
@@ -537,6 +546,7 @@ gameRouter.post(
         coverCid,
         coverSeed: Math.floor(Math.random() * 1_000_000),
         buildCid,
+        buildZipCid,
         buildSizeKb,
         priceUnits: body.priceUnits,
         priceAsset: body.priceAsset,
@@ -770,14 +780,14 @@ gameRouter.get(
       if (!owned) throw Errors.notOwner("You need to own this game to download it.");
     }
 
-    const file = await findBuild(game.id);
+    const file = await findBuild(game.id, game.buildZipCid);
     if (!file) {
       // Errors.notFound() appends " not found.", so this takes the subject only.
       // The explanation goes in details, where it doesn't corrupt the sentence.
       throw new AppError(404, "NOT_FOUND", "This game's build file isn't on this server.", {
         reason:
-          "Builds are kept on the filesystem of whichever server pinned them. This one was " +
-          "published elsewhere, or before builds were stored for serving, so it needs uploading again.",
+          "This game was published before builds were pinned as a retrievable zip, so the only " +
+          "copy is on the machine that uploaded it. Republishing fixes it permanently.",
       });
     }
 

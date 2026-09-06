@@ -43,6 +43,13 @@
       "when": 1788708408344,
       "tag": "0005_spicy_changeling",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1788724571607,
+      "tag": "0006_mature_veda",
+      "breakpoints": true
     }
   ]
 }

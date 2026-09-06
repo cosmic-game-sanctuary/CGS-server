@@ -1,0 +1,1 @@
+ALTER TABLE "games" ADD COLUMN "build_zip_cid" text;

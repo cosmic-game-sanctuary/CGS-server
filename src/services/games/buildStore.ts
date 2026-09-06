@@ -1,6 +1,7 @@
 import { mkdir, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import logger from "../../utils/logger.utils.js";
+import { gatewayUrl } from "../ipfs/pinata.js";
 
 /**
  * The uploaded build, kept where we can actually serve it.
@@ -25,6 +26,13 @@ import logger from "../../utils/logger.utils.js";
  * to unpack one and run it — that is what the publish preview does, on an
  * isolated origin, and a downloaded build should go through exactly that path
  * rather than a second one written to be nearly the same.
+ *
+ * Disk is a cache, not the record. The zip is pinned too (`games.build_zip_cid`),
+ * so a build missing locally is fetched back and re-cached rather than lost.
+ * That is what makes a game publishable on one machine and playable on another,
+ * and what lets a deploy survive an ephemeral filesystem. The reason it works
+ * at all is that Pinata's refusal is about HTML specifically: a directory CID
+ * resolves to index.html and 403s, while application/zip is served normally.
  */
 
 const ROOT = path.resolve(process.cwd(), "storage", "builds");
@@ -43,13 +51,45 @@ export async function saveBuild(gameId: string, zip: Buffer): Promise<void> {
   logger.info({ gameId, bytes: zip.length }, "build stored for serving");
 }
 
-/** The file to send, or null if this game has no stored build. */
-export async function findBuild(gameId: string): Promise<string | null> {
+/** The file to send, or null if it isn't on this disk. */
+async function findLocal(gameId: string): Promise<string | null> {
   const file = zipPath(gameId);
   try {
     const info = await stat(file);
     return info.isFile() ? file : null;
   } catch {
+    return null;
+  }
+}
+
+/**
+ * The file to send, fetching it back from IPFS first if this machine doesn't
+ * have it. `zipCid` is null for anything published before builds were pinned
+ * as a zip; those really are only on the machine that made them.
+ */
+export async function findBuild(gameId: string, zipCid?: string | null): Promise<string | null> {
+  const local = await findLocal(gameId);
+  if (local) return local;
+  if (!zipCid) return null;
+
+  try {
+    const response = await fetch(gatewayUrl(zipCid), { signal: AbortSignal.timeout(60_000) });
+    if (!response.ok) {
+      logger.warn({ gameId, zipCid, status: response.status }, "build not retrievable from IPFS");
+      return null;
+    }
+    const body = Buffer.from(await response.arrayBuffer());
+    // A gateway that answers 200 with an error page would otherwise be cached
+    // as if it were the build. Every zip starts "PK".
+    if (body.subarray(0, 2).toString() !== "PK") {
+      logger.warn({ gameId, zipCid }, "IPFS returned something that isn't a zip");
+      return null;
+    }
+    await saveBuild(gameId, body);
+    logger.info({ gameId, zipCid, bytes: body.length }, "build re-cached from IPFS");
+    return zipPath(gameId);
+  } catch (err) {
+    logger.error({ err, gameId, zipCid }, "fetching the build from IPFS failed");
     return null;
   }
 }
