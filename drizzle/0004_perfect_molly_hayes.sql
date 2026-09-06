@@ -1,0 +1,1 @@
+ALTER TABLE "users" ALTER COLUMN "public_key_hex" DROP NOT NULL;

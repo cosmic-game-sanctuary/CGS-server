@@ -8,6 +8,7 @@ import { env } from "../config/env.js";
 import { resolveHederaAccount } from "../services/users/repo.js";
 import { getAccountByEvmAddress, getAllNftsForAccount } from "../services/hedera/mirror.js";
 import { assetDecimals, ensFullName, toDisplayAmount } from "../lib/display.js";
+import { fallbackHandle } from "../lib/handle.js";
 import { gatewayUrl } from "../services/ipfs/pinata.js";
 
 const meRouter = Router({ caseSensitive: true, strict: true });
@@ -34,18 +35,46 @@ meRouter.get(
 
     const ownedStudio = await db.query.studios.findFirst({ where: eq(studios.ownerUserId, auth.id) });
 
-    let studio: { id: string; name: string; slug: string; role: "owner" | "member" } | null = null;
+    // `handle` is what appears on a split and in the studio credits, so the
+    // publish flow needs it before it can put you on your own game's splits.
+    // It lives on the membership row, which every studio owner now gets at
+    // creation — `fallbackHandle` covers studios made before that was true.
+    let studio: {
+      id: string;
+      name: string;
+      slug: string;
+      role: "owner" | "member";
+      handle: string;
+    } | null = null;
+
+    const membership = await db.query.studioMembers.findFirst({
+      where: and(eq(studioMembers.userId, auth.id), isNotNull(studioMembers.acceptedAt)),
+    });
+
     if (ownedStudio) {
-      studio = { id: ownedStudio.id, name: ownedStudio.name, slug: ownedStudio.slug, role: "owner" };
-    } else {
-      const membership = await db.query.studioMembers.findFirst({
-        where: and(eq(studioMembers.userId, auth.id), isNotNull(studioMembers.acceptedAt)),
-      });
-      if (membership) {
-        const memberStudio = await db.query.studios.findFirst({ where: eq(studios.id, membership.studioId) });
-        if (memberStudio) {
-          studio = { id: memberStudio.id, name: memberStudio.name, slug: memberStudio.slug, role: "member" };
-        }
+      const ownRow =
+        membership?.studioId === ownedStudio.id
+          ? membership
+          : await db.query.studioMembers.findFirst({
+              where: and(eq(studioMembers.studioId, ownedStudio.id), eq(studioMembers.userId, auth.id)),
+            });
+      studio = {
+        id: ownedStudio.id,
+        name: ownedStudio.name,
+        slug: ownedStudio.slug,
+        role: "owner",
+        handle: ownRow?.handle ?? fallbackHandle(auth.email),
+      };
+    } else if (membership) {
+      const memberStudio = await db.query.studios.findFirst({ where: eq(studios.id, membership.studioId) });
+      if (memberStudio) {
+        studio = {
+          id: memberStudio.id,
+          name: memberStudio.name,
+          slug: memberStudio.slug,
+          role: "member",
+          handle: membership.handle,
+        };
       }
     }
 

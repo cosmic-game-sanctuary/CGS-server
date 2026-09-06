@@ -56,7 +56,13 @@ export const users = pgTable("users", {
   // a payment on this user's behalf via secp256k1_sign. Neither is secret;
   // Privy still holds the private key.
   privyWalletId: text("privy_wallet_id").notNull(),
-  publicKeyHex: text("public_key_hex").notNull(),
+  // Null until this wallet has actually signed something. Deriving it costs a
+  // real signing call, and the server can only sign with a user's embedded
+  // wallet once that user has delegated it — so doing it at sign-in made
+  // logging in depend on an authority login doesn't need, and broke every
+  // authenticated request for anyone who hadn't delegated.
+  // See services/users/repo.ts#ensureUserPublicKey.
+  publicKeyHex: text("public_key_hex"),
   // null until the address completes its own first outgoing transaction and
   // the account resolves on the mirror node. see services/hedera/mirror.ts.
   hederaAccountId: text("hedera_account_id"),

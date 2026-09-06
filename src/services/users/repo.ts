@@ -24,24 +24,21 @@ export async function upsertUser(identity: PrivyIdentity) {
 
     if (!walletChanged && !identityChanged) return existing;
 
-    const publicKeyHex = walletChanged
-      ? await derivePublicKeyHex(identity.privyWalletId)
-      : existing.publicKeyHex;
-
     const [updated] = await db
       .update(users)
       .set({
         email: identity.email,
         evmAddress: identity.evmAddress,
         privyWalletId: identity.privyWalletId,
-        publicKeyHex,
+        // a different wallet has a different key, and the old one is now
+        // wrong rather than merely stale — drop it and re-derive on demand.
+        ...(walletChanged ? { publicKeyHex: null } : {}),
       })
       .where(eq(users.id, existing.id))
       .returning();
     return updated!;
   }
 
-  const publicKeyHex = await derivePublicKeyHex(identity.privyWalletId);
   const [created] = await db
     .insert(users)
     .values({
@@ -49,10 +46,33 @@ export async function upsertUser(identity: PrivyIdentity) {
       email: identity.email,
       evmAddress: identity.evmAddress,
       privyWalletId: identity.privyWalletId,
-      publicKeyHex,
     })
     .returning();
   return created!;
+}
+
+// The public key, derived once and cached.
+//
+// This used to happen inside upsertUser, which meant every sign-in made a real
+// signing call against the user's wallet. Two things wrong with that. It put a
+// chain-adjacent round trip in front of every first login; and the server can
+// only sign with a *user's* embedded wallet after that user has delegated it,
+// so an account that hadn't would fail `requireAuth` outright — unable to
+// browse signed in, let alone reach the screen where delegation is offered.
+//
+// Only the payment path actually needs this, so only the payment path pays for
+// it. Wallets the server created itself (an agent's) can always sign, which is
+// why that path never hit this.
+export async function ensureUserPublicKey(user: {
+  id: string;
+  privyWalletId: string;
+  publicKeyHex: string | null;
+}): Promise<string> {
+  if (user.publicKeyHex) return user.publicKeyHex;
+
+  const publicKeyHex = await derivePublicKeyHex(user.privyWalletId);
+  await db.update(users).set({ publicKeyHex }).where(eq(users.id, user.id));
+  return publicKeyHex;
 }
 
 // The exact behaviour docs/api-contract.md §2 has described since Stage 1 and
