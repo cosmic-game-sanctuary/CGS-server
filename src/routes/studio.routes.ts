@@ -2,13 +2,14 @@ import { Router } from "express";
 import { eq, or } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "../db/client.js";
-import { studios, studioMembers, games } from "../db/schema.js";
+import { studios, studioMembers, games, users } from "../db/schema.js";
 import { requireAuth, optionalAuth } from "../middleware/auth.middleware.js";
 import { validate } from "../middleware/validate.middleware.js";
 import { asyncHandler } from "../lib/asyncHandler.js";
 import { Errors } from "../lib/errors.js";
 import { slugify, withSuffix } from "../lib/slug.js";
-import { param } from "../lib/params.js";
+import { param, isUuid } from "../lib/params.js";
+import { ensFullName } from "../lib/display.js";
 import { isSubnameAvailable, registerStudioSubname } from "../services/ens/registrar.js";
 import { env } from "../config/env.js";
 
@@ -82,22 +83,46 @@ studioRouter.get(
   asyncHandler(async (req, res) => {
     const idOrSlug = param(req, "idOrSlug");
     const studio = await db.query.studios.findFirst({
-      where: or(eq(studios.id, idOrSlug), eq(studios.slug, idOrSlug)),
+      where: isUuid(idOrSlug) ? or(eq(studios.id, idOrSlug), eq(studios.slug, idOrSlug)) : eq(studios.slug, idOrSlug),
     });
     if (!studio) throw Errors.notFound("Studio");
 
-    const [members, studioGames] = await Promise.all([
+    const [members, studioGames, owner] = await Promise.all([
       db.query.studioMembers.findMany({
         where: eq(studioMembers.studioId, studio.id),
-        columns: { handle: true, role: true, acceptedAt: true },
+        columns: { id: true, handle: true, role: true, acceptedAt: true, email: true },
       }),
       db.query.games.findMany({
         where: eq(games.studioId, studio.id),
         columns: { id: true, slug: true, title: true, coverCid: true, coverSeed: true, status: true },
       }),
+      db.query.users.findFirst({
+        where: eq(users.id, studio.ownerUserId),
+        columns: { evmAddress: true },
+      }),
     ]);
 
-    res.json({ ...studio, members, games: studioGames });
+    // This page is public, so a member's email can't be. The id is safe and
+    // the splits editor needs it to name someone who has no wallet yet; the
+    // address is the studio's own, which every listing already shows.
+    const isOwner = req.auth?.id === studio.ownerUserId;
+
+    res.json({
+      ...studio,
+      // resolved the same way the embedded studio on a game is, so no client
+      // has to know the parent name to render one of them.
+      ens: ensFullName(studio.ensSubname),
+      ownerAddress: owner?.evmAddress ?? null,
+      memberCount: members.length,
+      members: members.map((m) => ({
+        id: m.id,
+        handle: m.handle,
+        role: m.role,
+        acceptedAt: m.acceptedAt,
+        ...(isOwner ? { email: m.email } : {}),
+      })),
+      games: studioGames,
+    });
   }),
 );
 

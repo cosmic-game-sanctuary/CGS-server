@@ -24,7 +24,8 @@ import { AppError, Errors } from "../lib/errors.js";
 import { slugify, withSuffix } from "../lib/slug.js";
 import { ownsGame } from "../services/games/ownership.js";
 import { env } from "../config/env.js";
-import { param } from "../lib/params.js";
+import { param, isUuid } from "../lib/params.js";
+import { assetDecimals, ensFullName, toDisplayAmount } from "../lib/display.js";
 import { unpackBuild } from "../services/ipfs/unpack.js";
 import { pinDirectory, pinFile, gatewayUrl } from "../services/ipfs/pinata.js";
 import {
@@ -79,6 +80,54 @@ async function playsFor(gameIds: string[]) {
   return out;
 }
 
+// Highest rated first, unrated last — an unreviewed game sorting above a 4.8
+// because both "score" zero would make the chip useless. Ties break on recency,
+// matching the default sort.
+async function sortByRating<T extends { id: string; publishedAt: Date | null }>(rows: T[]): Promise<T[]> {
+  const ratings = await ratingsFor(rows.map((r) => r.id));
+  return [...rows].sort((a, b) => {
+    const ra = ratings.get(a.id)?.rating ?? -1;
+    const rb = ratings.get(b.id)?.rating ?? -1;
+    if (rb !== ra) return rb - ra;
+    return (b.publishedAt?.getTime() ?? 0) - (a.publishedAt?.getTime() ?? 0);
+  });
+}
+
+// Member count and owner address for a set of studios, in two queries rather
+// than two per game. Same batching reasoning as ratingsFor.
+async function studioExtrasFor(studioIds: string[]) {
+  const out = new Map<string, { memberCount: number; ownerAddress: string | null }>();
+  if (studioIds.length === 0) return out;
+
+  const rows = await db.query.studios.findMany({
+    where: inArray(studios.id, studioIds),
+    columns: { id: true, ownerUserId: true },
+  });
+
+  const [members, owners] = await Promise.all([
+    db.query.studioMembers.findMany({
+      where: inArray(studioMembers.studioId, studioIds),
+      columns: { studioId: true },
+    }),
+    db.query.users.findMany({
+      where: inArray(users.id, [...new Set(rows.map((r) => r.ownerUserId))]),
+      columns: { id: true, evmAddress: true },
+    }),
+  ]);
+
+  const addressByUser = new Map(owners.map((o) => [o.id, o.evmAddress]));
+  const counts = new Map<string, number>();
+  for (const m of members) counts.set(m.studioId, (counts.get(m.studioId) ?? 0) + 1);
+
+  for (const r of rows) {
+    out.set(r.id, {
+      memberCount: counts.get(r.id) ?? 0,
+      ownerAddress: addressByUser.get(r.ownerUserId) ?? null,
+    });
+  }
+  return out;
+}
+
 async function likeCountsFor(gameIds: string[]) {
   if (gameIds.length === 0) return new Map<string, number>();
   const rows = await db.query.likes.findMany({
@@ -93,6 +142,10 @@ async function likeCountsFor(gameIds: string[]) {
 const catalogQuerySchema = z.object({
   search: z.string().max(200).optional(),
   tag: z.string().max(40).optional(),
+  // the studio page shows full cards, and the studio route returns only
+  // enough of each game to identify one. Filtering here is cheaper than a
+  // detail read per game, and it excludes drafts for free.
+  studioId: z.string().uuid().optional(),
   sort: z.enum(["newest", "price-low", "price-high", "rating"]).default("newest"),
   freeOnly: z.coerce.boolean().optional(),
   cursor: z.coerce.number().int().nonnegative().default(0),
@@ -104,13 +157,25 @@ gameRouter.get(
   optionalAuth,
   validate(catalogQuerySchema, "query"),
   asyncHandler(async (req, res) => {
-    const { search, tag, sort, freeOnly, cursor, limit } =
+    const { search, tag, studioId, sort, freeOnly, cursor, limit } =
       req.query as unknown as z.infer<typeof catalogQuerySchema>;
 
+    // Searching only `title` missed the obvious cases — a genre typed into the
+    // box, or a studio's name. Tagline and tags are what people actually
+    // remember a small game by.
+    const needle = search?.trim();
     const where = and(
       eq(games.status, "published"),
-      search ? ilike(games.title, `%${search}%`) : undefined,
+      needle
+        ? or(
+            ilike(games.title, `%${needle}%`),
+            ilike(games.tagline, `%${needle}%`),
+            sql`EXISTS (SELECT 1 FROM unnest(${games.tags}) AS t WHERE t ILIKE ${`%${needle}%`})`,
+            sql`EXISTS (SELECT 1 FROM studios s WHERE s.id = ${games.studioId} AND (s.name ILIKE ${`%${needle}%`} OR s.ens_subname ILIKE ${`%${needle}%`}))`,
+          )
+        : undefined,
       tag ? sql`${games.tags} @> ARRAY[${tag}]::text[]` : undefined,
+      studioId ? eq(games.studioId, studioId) : undefined,
       freeOnly ? eq(games.priceUnits, 0) : undefined,
     );
 
@@ -119,36 +184,49 @@ gameRouter.get(
         ? asc(games.priceUnits)
         : sort === "price-high"
           ? desc(games.priceUnits)
-          : desc(games.publishedAt); // "rating" falls back to newest — see note below
+          : desc(games.publishedAt);
 
-    // rating sort needs the join-computed average, which we compute after
-    // the page is fetched (see ratingsFor). Sorting a page-then-fetched
-    // aggregate is wrong in general, but at this catalog's size it's the
-    // pragmatic call over pulling in a real aggregate query today.
+    // "rating" is the one sort whose key isn't a column — it's an average over
+    // the reviews table. Rather than leave it silently sorting by date (which
+    // it did, and which reads on screen as a filter that does nothing), fetch
+    // the matching set, order it by the rating we already compute, then page.
+    // Honest at this catalog's size and it stops the chip being a lie; revisit
+    // with a real aggregate query if the catalog ever gets large.
+    const byRating = sort === "rating";
     const rows = await db.query.games.findMany({
       where,
       orderBy,
-      limit: limit + 1,
-      offset: cursor,
+      ...(byRating ? {} : { limit: limit + 1, offset: cursor }),
       with: { studio: true },
     });
 
-    const hasMore = rows.length > limit;
-    const page = hasMore ? rows.slice(0, limit) : rows;
+    const ranked = byRating ? await sortByRating(rows) : rows;
+    const window = byRating ? ranked.slice(cursor, cursor + limit + 1) : ranked;
+
+    const hasMore = window.length > limit;
+    const page = hasMore ? window.slice(0, limit) : window;
     const ids = page.map((g) => g.id);
 
-    const [ratings, splitRows, plays, likeCounts] = await Promise.all([
+    const [ratings, splitRows, plays, likeCounts, studioExtras] = await Promise.all([
       ratingsFor(ids),
       db.query.splits.findMany({ where: inArray(splits.gameId, ids) }),
       playsFor(ids),
       likeCountsFor(ids),
+      studioExtrasFor([...new Set(page.map((g) => g.studioId))]),
     ]);
     const splitsByGame = new Map<string, typeof splitRows>();
     for (const s of splitRows) splitsByGame.set(s.gameId, [...(splitsByGame.get(s.gameId) ?? []), s]);
 
     res.json({
       games: page.map((g) =>
-        serializeGame(g, splitsByGame.get(g.id) ?? [], ratings.get(g.id), plays.get(g.id), likeCounts.get(g.id)),
+        serializeGame(
+          g,
+          splitsByGame.get(g.id) ?? [],
+          ratings.get(g.id),
+          plays.get(g.id),
+          likeCounts.get(g.id),
+          studioExtras.get(g.studioId),
+        ),
       ),
       nextCursor: hasMore ? String(cursor + limit) : null,
     });
@@ -161,17 +239,18 @@ gameRouter.get(
   asyncHandler(async (req, res) => {
     const idOrSlug = param(req, "idOrSlug");
     const game = await db.query.games.findFirst({
-      where: or(eq(games.id, idOrSlug), eq(games.slug, idOrSlug)),
+      where: isUuid(idOrSlug) ? or(eq(games.id, idOrSlug), eq(games.slug, idOrSlug)) : eq(games.slug, idOrSlug),
       with: { studio: true },
     });
     if (!game) throw Errors.notFound("Game");
 
-    const [gameSplits, media, ratings, plays, likeCounts] = await Promise.all([
+    const [gameSplits, media, ratings, plays, likeCounts, studioExtras] = await Promise.all([
       db.query.splits.findMany({ where: eq(splits.gameId, game.id) }),
       db.query.gameMedia.findMany({ where: eq(gameMedia.gameId, game.id), orderBy: asc(gameMedia.position) }),
       ratingsFor([game.id]),
       playsFor([game.id]),
       likeCountsFor([game.id]),
+      studioExtrasFor([game.studioId]),
     ]);
 
     let owned: boolean | undefined;
@@ -184,13 +263,25 @@ gameRouter.get(
     }
 
     res.json({
-      ...serializeGame(game, gameSplits, ratings.get(game.id), plays.get(game.id), likeCounts.get(game.id)),
-      media,
+      ...serializeGame(
+        game,
+        gameSplits,
+        ratings.get(game.id),
+        plays.get(game.id),
+        likeCounts.get(game.id),
+        studioExtras.get(game.studioId),
+      ),
+      // the client shows screenshots from a gateway URL, so send the CID it
+      // needs rather than making it know how we address IPFS.
+      media: media.map((m) => ({ id: m.id, kind: m.kind, cid: m.cid, position: m.position, url: gatewayUrl(m.cid) })),
       owned,
       liked,
     });
   }),
 );
+
+/** Extra facts about a studio the listing shows but the row doesn't carry. */
+type StudioExtras = { memberCount?: number; ownerAddress?: string | null };
 
 function serializeGame(
   game: typeof games.$inferSelect & { studio: typeof studios.$inferSelect },
@@ -198,6 +289,7 @@ function serializeGame(
   rating?: { rating: number; reviewCount: number },
   plays?: number,
   likeCount?: number,
+  studioExtras?: StudioExtras,
 ) {
   return {
     id: game.id,
@@ -205,11 +297,24 @@ function serializeGame(
     title: game.title,
     tagline: game.tagline,
     description: game.description,
-    studio: { id: game.studio.id, name: game.studio.name, ens: game.studio.ensSubname, slug: game.studio.slug },
+    studio: {
+      id: game.studio.id,
+      name: game.studio.name,
+      ens: ensFullName(game.studio.ensSubname),
+      slug: game.studio.slug,
+      bio: game.studio.bio,
+      // "3 people" under the studio link, and the truncated address beside
+      // it — both shown on every listing, neither on the studios row itself.
+      memberCount: studioExtras?.memberCount ?? 0,
+      ownerAddress: studioExtras?.ownerAddress ?? null,
+    },
     priceUnits: game.priceUnits,
     priceAsset: game.priceAsset,
+    priceUsd: toDisplayAmount(game.priceUnits, game.priceAsset),
+    priceAssetDecimals: assetDecimals(game.priceAsset),
     tags: game.tags,
     coverCid: game.coverCid,
+    coverUrl: game.coverCid ? gatewayUrl(game.coverCid) : null,
     coverSeed: game.coverSeed,
     publishedAt: game.publishedAt,
     splits: gameSplits.map((s) => ({ handle: s.handle, role: s.role, pct: s.pct })),
