@@ -495,7 +495,10 @@ gameRouter.post(
         members.map((m) => ({
           userId: m.userId!,
           type: "published" as const,
-          payload: { gameId: game.id, title: game.title },
+          // slug included so a row can link at the listing. Every payload
+          // carries what its row needs to render and where it points; the
+          // wording itself belongs to the client.
+          payload: { gameId: game.id, slug: game.slug, title: game.title },
         })),
       );
     }

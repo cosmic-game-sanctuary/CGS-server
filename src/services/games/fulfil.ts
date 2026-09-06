@@ -173,12 +173,35 @@ async function notifyStudio(game: Game) {
   const userIds = new Set(members.map((m) => m.userId).filter((id): id is string => id !== null));
   userIds.add(studio!.ownerUserId);
 
+  // Each person is told what *they* earned, not what the game sold for. The
+  // payload used to carry the full price to everyone, so a row reading "your
+  // share is in your wallet" next to it was wrong for every collaborator on a
+  // split — and quietly flattering to whoever read it.
+  const gameSplits = await db.query.splits.findMany({ where: eq(splits.gameId, game.id) });
+  const handleByUser = new Map(
+    members.filter((m) => m.userId).map((m) => [m.userId!, m.handle] as const),
+  );
+  const pctByHandle = new Map(gameSplits.map((s) => [s.handle, s.pct] as const));
+
   await db.insert(notifications).values(
-    [...userIds].map((userId) => ({
-      userId,
-      type: "sale" as const,
-      payload: { gameId: game.id, title: game.title, amountUnits: game.priceUnits },
-    })),
+    [...userIds].map((userId) => {
+      const pct = pctByHandle.get(handleByUser.get(userId) ?? "") ?? null;
+      return {
+        userId,
+        type: "sale" as const,
+        payload: {
+          gameId: game.id,
+          slug: game.slug,
+          title: game.title,
+          priceUnits: game.priceUnits,
+          priceAsset: game.priceAsset,
+          // null when this person isn't on the splits — a studio owner who
+          // credited the work to other people still wants to know it sold.
+          sharePct: pct,
+          shareUnits: pct === null ? null : Math.floor((game.priceUnits * pct) / 100),
+        },
+      };
+    }),
   );
 }
 
