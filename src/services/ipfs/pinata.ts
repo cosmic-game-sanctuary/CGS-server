@@ -39,8 +39,18 @@ export async function pinFile(buffer: Buffer, filename: string, mimeType?: strin
 // that never boots.
 const GATEWAY_HOST = env.PINATA_GATEWAY?.replace(/^https?:\/\//, "").replace(/\/+$/, "");
 
+// `ipfs.io` was the documented fallback and it does not work for this account's
+// content: it times out on both a fresh cover image and a build directory,
+// because Pinata does not announce freshly pinned content to the DHT quickly.
+// Pinata's own public gateway does serve it, and serves images correctly
+// (checked: 200 image/png on a real cover). It refuses HTML specifically —
+// "HTML content cannot be served through the pinata public gateway",
+// ERR_ID:00023 — which is why builds are served from disk instead and only
+// covers and media come through here. A dedicated gateway on a custom domain
+// lifts that, and `PINATA_GATEWAY` is where it goes when there is one.
 export function gatewayUrl(cid: string, path?: string): string {
-  const base = GATEWAY_HOST ? `https://${GATEWAY_HOST}/ipfs/${cid}` : `https://ipfs.io/ipfs/${cid}`;
+  const host = GATEWAY_HOST ?? "gateway.pinata.cloud";
+  const base = `https://${host}/ipfs/${cid}`;
   return path ? `${base}/${path}` : base;
 }
 

@@ -772,7 +772,13 @@ gameRouter.get(
 
     const file = await findBuild(game.id);
     if (!file) {
-      throw Errors.notFound("This game's build file. It was published before builds were kept for serving, so it needs uploading again");
+      // Errors.notFound() appends " not found.", so this takes the subject only.
+      // The explanation goes in details, where it doesn't corrupt the sentence.
+      throw new AppError(404, "NOT_FOUND", "This game's build file isn't on this server.", {
+        reason:
+          "Builds are kept on the filesystem of whichever server pinned them. This one was " +
+          "published elsewhere, or before builds were stored for serving, so it needs uploading again.",
+      });
     }
 
     res.type("application/zip");
