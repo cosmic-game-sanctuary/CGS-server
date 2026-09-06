@@ -32,6 +32,22 @@ type Game = typeof games.$inferSelect;
 // payment is already final and provable on-chain, and `game_keys.mint_status`
 // records what still needs retrying.
 export async function fulfilPurchase(game: Game, buyerAccountId: string, settlementTxId: string) {
+  // Two rows, and the caller waits for them. They are what says this person
+  // bought this game — everything below is chain work that can be retried, but
+  // until these exist the buyer looks to the rest of the system like someone
+  // who hasn't paid. The download route hands back a build the instant it
+  // responds, and the request for that build arrives in milliseconds, so
+  // leaving this in the background raced the buyer against their own purchase.
+  const { sale, key } = await recordPurchase(game, buyerAccountId, settlementTxId);
+  // Nothing awaits this, so nothing would catch it either. Every step inside
+  // handles its own failure; this is the backstop that keeps an unexpected one
+  // from taking the process down with it.
+  void settleOnChain(game, sale, key, buyerAccountId, settlementTxId).catch((err) =>
+    logger.error({ err, gameId: game.id, buyerAccountId }, "fulfilment failed after settlement"),
+  );
+}
+
+async function recordPurchase(game: Game, buyerAccountId: string, settlementTxId: string) {
   const [sale] = await db
     .insert(sales)
     .values({
@@ -53,15 +69,31 @@ export async function fulfilPurchase(game: Game, buyerAccountId: string, settlem
     })
     .returning();
 
+  return { sale: sale!, key: key! };
+}
+
+/**
+ * The mint, the split and the sale log. Minutes of chain round trips in the
+ * worst case, none of which the buyer should wait for: settlement already
+ * happened and is already provable, so a failure here is ours to retry and
+ * never costs anyone their purchase.
+ */
+async function settleOnChain(
+  game: Game,
+  sale: typeof sales.$inferSelect,
+  key: typeof gameKeys.$inferSelect,
+  buyerAccountId: string,
+  settlementTxId: string,
+) {
   try {
     const serial = await mintAndTransferKey(game, buyerAccountId);
     await db
       .update(gameKeys)
       .set({ serial, mintStatus: "confirmed", mintedAt: new Date(), txId: settlementTxId })
-      .where(eq(gameKeys.id, key!.id));
+      .where(eq(gameKeys.id, key.id));
   } catch (err) {
     logger.error({ err, gameId: game.id, buyerAccountId }, "GameKey mint failed");
-    await db.update(gameKeys).set({ mintStatus: "failed" }).where(eq(gameKeys.id, key!.id));
+    await db.update(gameKeys).set({ mintStatus: "failed" }).where(eq(gameKeys.id, key.id));
   }
 
   // the split and the sale log are independent of the mint — a failed mint
@@ -69,7 +101,7 @@ export async function fulfilPurchase(game: Game, buyerAccountId: string, settlem
   // recorded on the sale row rather than just logged — scripts/retry-failed-splits.ts
   // is what actually retries it. There was no way to retry this before Stage 4;
   // it just logged an error and moved on.
-  await runSplitDistribution(sale!.id, game);
+  await runSplitDistribution(sale.id, game);
 
   await submitTopicMessage(env.HCS_SALES_TOPIC!, {
     gameId: game.id,
@@ -80,7 +112,7 @@ export async function fulfilPurchase(game: Game, buyerAccountId: string, settlem
     settlementTxId,
     at: new Date().toISOString(),
   })
-    .then((hcsTxId) => db.update(sales).set({ hcsSaleTxId: hcsTxId }).where(eq(sales.id, sale!.id)))
+    .then((hcsTxId) => db.update(sales).set({ hcsSaleTxId: hcsTxId }).where(eq(sales.id, sale.id)))
     .catch((err) => logger.error({ err, gameId: game.id }, "HCS sale log failed"));
 
   await notifyStudio(game).catch(() => {});

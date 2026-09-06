@@ -36,7 +36,9 @@ agentRouter.post(
     // Privy's own wallet objects don't actually carry a usable public key
     // (verified — both create() and get() return it empty) — derive it from
     // a real signature instead. See services/privy/signing.ts.
-    const publicKeyHex = await derivePublicKeyHex(wallet.id);
+    // The address is passed so the recovered key can be checked against it,
+    // which is what makes the recovery trustworthy rather than merely plausible.
+    const publicKeyHex = await derivePublicKeyHex(wallet.id, wallet.address);
 
     const [agent] = await db
       .insert(wishlistAgents)

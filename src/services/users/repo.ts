@@ -2,7 +2,6 @@ import { eq } from "drizzle-orm";
 import { db } from "../../db/client.js";
 import { users } from "../../db/schema.js";
 import type { PrivyIdentity } from "../privy/auth.js";
-import { derivePublicKeyHex } from "../privy/signing.js";
 import { getAccountByEvmAddress } from "../hedera/mirror.js";
 
 // every route needs our own users.id for foreign keys, not Privy's DID
@@ -51,29 +50,15 @@ export async function upsertUser(identity: PrivyIdentity) {
   return created!;
 }
 
-// The public key, derived once and cached.
+// `users.public_key_hex` is nullable and, for a person, never written any more.
 //
-// This used to happen inside upsertUser, which meant every sign-in made a real
-// signing call against the user's wallet. Two things wrong with that. It put a
-// chain-adjacent round trip in front of every first login; and the server can
-// only sign with a *user's* embedded wallet after that user has delegated it,
-// so an account that hadn't would fail `requireAuth` outright — unable to
-// browse signed in, let alone reach the screen where delegation is offered.
-//
-// Only the payment path actually needs this, so only the payment path pays for
-// it. Wallets the server created itself (an agent's) can always sign, which is
-// why that path never hit this.
-export async function ensureUserPublicKey(user: {
-  id: string;
-  privyWalletId: string;
-  publicKeyHex: string | null;
-}): Promise<string> {
-  if (user.publicKeyHex) return user.publicKeyHex;
-
-  const publicKeyHex = await derivePublicKeyHex(user.privyWalletId);
-  await db.update(users).set({ publicKeyHex }).where(eq(users.id, user.id));
-  return publicKeyHex;
-}
+// It was cached here because paying needed it, and getting it meant asking the
+// wallet to sign something — which needs authority over that wallet that this
+// server does not have and should not ask for. The buyer's key is recovered
+// from the payment signature now (services/privy/signing.ts#publicKeyForAddress),
+// which costs nothing, needs no permission, and works for the hollow accounts
+// that most buyers actually have. The column stays for the agent's wallets,
+// which we create and can sign with.
 
 // The exact behaviour docs/api-contract.md §2 has described since Stage 1 and
 // nothing ever actually implemented: return the cached hedera_account_id with

@@ -8,6 +8,7 @@ import { eq, isNull } from "drizzle-orm";
 import { db } from "../../db/client.js";
 import { games, gameMedia, moderationReports } from "../../db/schema.js";
 import { unpinByCid } from "../ipfs/pinata.js";
+import { deleteBuild } from "../games/buildStore.js";
 
 export type ReportAction = "none" | "delisted" | "removed_from_storage";
 
@@ -40,6 +41,9 @@ export async function resolveReport(reportId: string, action: ReportAction) {
       (c): c is string => typeof c === "string",
     );
     for (const cid of cids) await unpinByCid(cid);
+    // And our own copy, which is the one that actually gets served. Unpinning
+    // without this would leave the content one authenticated request away.
+    await deleteBuild(game.id);
     await db.update(games).set({ status: "removed" }).where(eq(games.id, game.id));
   }
   // action === "delisted": confirms the report's own immediate delist stands.
