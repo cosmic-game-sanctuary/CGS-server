@@ -30,18 +30,61 @@ export function hederaPublicKeyFromHex(compressedHex: string): PublicKey {
   return PublicKey.fromStringECDSA(compressedHex);
 }
 
+/**
+ * Which key made this signature, given the address it should belong to.
+ *
+ * An ECDSA signature carries its own public key: with the message hash, two
+ * candidate keys can be recovered from it, and the recovery id says which. This
+ * tries both and keeps whichever derives the expected address, so it does not
+ * matter how the signer encoded its v byte — Ethereum tooling uses 27/28, plain
+ * secp256k1 libraries use 0/1, and Privy is not documented either way.
+ *
+ * Checking against the address is not a convenience. It is what makes this
+ * safe: a signature from any other key recovers to some other address and is
+ * refused, so this doubles as proof that the signer holds the wallet it claims.
+ *
+ * Why it is needed at all: an account that has only ever *received* value has
+ * no public key on Hedera. It is a hollow account (HIP-583) whose alias is the
+ * 20-byte EVM address, and the Mirror Node reports `key: null` until it signs
+ * something. That is every new buyer, so the key has to come from the payment
+ * signature itself. Signing the payment is also what completes the account.
+ */
+export function publicKeyForAddress(
+  hash: Uint8Array,
+  signatureHex: string,
+  expectedEvmAddress: string,
+): string | null {
+  const raw = Buffer.from(signatureHex.replace(/^0x/, ""), "hex");
+  if (raw.length !== 64 && raw.length !== 65) return null;
+
+  const rs = raw.subarray(0, 64);
+  const want = expectedEvmAddress.replace(/^0x/, "").toLowerCase();
+
+  for (const recid of [0, 1]) {
+    try {
+      const compressed = secp256k1.recoverPublicKey(
+        new Uint8Array(Buffer.concat([Buffer.from([recid]), rs])),
+        hash,
+        { prehash: false },
+      );
+      const hex = Buffer.from(compressed).toString("hex");
+      if (PublicKey.fromStringECDSA(hex).toEvmAddress().toLowerCase() === want) return hex;
+    } catch {
+      // A recovery id that doesn't yield a point on the curve. Try the other.
+    }
+  }
+  return null;
+}
+
 // Privy's wallet objects carry a `public_key` field in the type definitions,
 // but it comes back empty in practice on both create() and get() — verified
 // against the real API, not assumed from the types. So the public key is
-// derived instead, once, from an actual signature: Privy's secp256k1_sign
-// response is 65 bytes (r, s, v) in Ethereum's convention, and an ECDSA
-// signature's v byte is exactly what makes the public key recoverable from
-// nothing but the signature and the message hash. recid = v - 27, confirmed
-// empirically across repeated trials by re-deriving the address from the
-// recovered key and diffing it against the wallet's real address — every
-// trial matched. Call this once per wallet and cache the result; it's a real
-// signing call, not a free lookup.
-export async function derivePublicKeyHex(walletId: string): Promise<string> {
+// derived instead, once, from an actual signature.
+//
+// Only for wallets this server created, which is the agent's. A person's
+// embedded wallet cannot be signed with from here; that key is recovered from
+// the payment signature by publicKeyForAddress above.
+export async function derivePublicKeyHex(walletId: string, evmAddress: string): Promise<string> {
   const message = new TextEncoder().encode(`cgs:derive-public-key:${walletId}`);
   const hash = keccak_256(message);
 
@@ -50,13 +93,9 @@ export async function derivePublicKeyHex(walletId: string): Promise<string> {
     params: { hash: `0x${Buffer.from(hash).toString("hex")}` },
   });
 
-  const raw = Buffer.from(response.data.signature.replace(/^0x/, ""), "hex");
-  if (raw.length !== 65) {
-    throw new Error(`expected a 65-byte recoverable signature, got ${raw.length} bytes`);
+  const publicKeyHex = publicKeyForAddress(hash, response.data.signature, evmAddress);
+  if (!publicKeyHex) {
+    throw new Error(`could not recover ${evmAddress}'s public key from its own signature`);
   }
-  const recid = raw[64]! - 27;
-  const recoverable = Buffer.concat([Buffer.from([recid]), raw.subarray(0, 64)]);
-
-  const compressed = secp256k1.recoverPublicKey(new Uint8Array(recoverable), hash, { prehash: false });
-  return Buffer.from(compressed).toString("hex");
+  return publicKeyHex;
 }

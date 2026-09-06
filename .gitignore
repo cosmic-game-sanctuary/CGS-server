@@ -24,6 +24,9 @@ coverage/
 .cache/
 tmp/
 uploads/
+# Uploaded builds, kept so they can be served. The CID on the game row is the
+# real record; this is a cache of it. See services/games/buildStore.ts.
+storage/
 
 # Editor
 .vscode/

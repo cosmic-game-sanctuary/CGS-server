@@ -35,6 +35,18 @@ export async function getTransaction(sdkTransactionId: string) {
 export type MirrorAccount = {
   account: string; // "0.0.x"
   evm_address: string;
+  // Null far more often than you would expect, and it is not a Mirror Node
+  // quirk. An account created by receiving value at an EVM address is *hollow*
+  // (HIP-583): it holds the money, its `alias` is the 20-byte address rather
+  // than a public key, and no key is published until the account signs
+  // something for the first time. Every new buyer looks like this.
+  //
+  // So nothing should require this to be set. The public key that Hedera's
+  // signWith() needs is recovered from the signature instead — see
+  // services/privy/signing.ts#publicKeyForAddress.
+  key: { _type: string; key: string } | null;
+  /** The 20-byte EVM address for a hollow account, base32. */
+  alias: string | null;
   balance: {
     balance: number; // tinybars if the account holds HBAR
     tokens: { token_id: string; balance: number }[];

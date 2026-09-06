@@ -23,7 +23,9 @@ import { asyncHandler } from "../lib/asyncHandler.js";
 import { AppError, Errors } from "../lib/errors.js";
 import { slugify, withSuffix } from "../lib/slug.js";
 import { ownsGame } from "../services/games/ownership.js";
-import { ensureUserPublicKey } from "../services/users/repo.js";
+import { hasEntitlement } from "../services/games/entitlement.js";
+import { grantAccess, buildPathFor } from "../services/games/download.js";
+import { findBuild, saveBuild } from "../services/games/buildStore.js";
 import { env } from "../config/env.js";
 import { param, isUuid } from "../lib/params.js";
 import { assetDecimals, ensFullName, toDisplayAmount } from "../lib/display.js";
@@ -37,7 +39,7 @@ import {
 } from "../services/x402/server.js";
 import { fulfilPurchase } from "../services/games/fulfil.js";
 import { getAccountByEvmAddress } from "../services/hedera/mirror.js";
-import { payForGame } from "../services/x402/pay.js";
+import { preparePayment, completePayment } from "../services/x402/pay.js";
 import { checkImages } from "../services/moderation/csam.js";
 import { createGameToken } from "../services/hedera/hts.js";
 import { submitTopicMessage } from "../services/hedera/hcs.js";
@@ -516,6 +518,7 @@ gameRouter.post(
 
     const buildCid = await pinDirectory(buildFiles);
     const buildSizeKb = Math.round(buildFiles.reduce((sum, f) => sum + f.buffer.length, 0) / 1024);
+    const buildZip = files.build[0]!.buffer;
 
     const mediaCids = await Promise.all(
       mediaFiles.map((f) => pinFile(f.buffer, f.originalname, f.mimetype)),
@@ -540,6 +543,10 @@ gameRouter.post(
         status: "draft",
       })
       .returning();
+
+    // Keep the zip. The CID above is what the build *is*; this is the only
+    // thing that can put it in front of a player. See services/games/buildStore.ts.
+    await saveBuild(game!.id, buildZip);
 
     // Resolve each share to whoever it belongs to, creating the studio
     // membership for anyone named only by email. That row *is* the invite —
@@ -653,25 +660,20 @@ gameRouter.get(
   asyncHandler(async (req, res) => {
     const game = await db.query.games.findFirst({ where: eq(games.id, param(req, "id")) });
     if (!game) throw Errors.notFound("Game");
-    if (game.status === "removed") throw Errors.notFound("Game");
-    if (game.status === "draft") throw Errors.gameNotPublished();
-    if (!game.buildCid) throw Errors.gameNotPublished("This game has no build pinned.");
 
-    const playUrl = gatewayUrl(game.buildCid, "index.html");
-
-    if (game.priceUnits === 0) {
-      if (req.auth) await grantFreeKey(game, req.auth.evmAddress);
-      res.json({ playUrl, tokenId: game.htsTokenId, keyStatus: "free" });
+    // Free, or already bought. Both answered in services/games/download.ts,
+    // because the payment path has to ask the same question before it starts
+    // building a transfer nobody owes.
+    const granted = await grantAccess(game, req.auth);
+    if (granted) {
+      res.json(granted);
       return;
     }
 
-    if (req.auth) {
-      const { owned, serial } = await ownsGame(req.auth.evmAddress, game.htsTokenId);
-      if (owned) {
-        res.json({ playUrl, tokenId: game.htsTokenId, serial, keyStatus: "owned" });
-        return;
-      }
-    }
+    // Nothing to charge for, so the only thing standing between this caller and
+    // the game is an account to mint the key to. Say that, rather than offering
+    // payment terms for zero.
+    if (game.priceUnits === 0) throw Errors.unauthenticated("Sign in to get this game.");
 
     await ensureInitialized();
 
@@ -723,14 +725,19 @@ gameRouter.get(
     // now and do the minting, the split and the sale log in the background.
     // Blocking here would put ~6s of chain round-trips in front of the single
     // most important moment in the product.
+    //
+    // Awaited, though, because fulfilPurchase records the purchase before it
+    // returns and only the chain work runs on. The client asks for the build
+    // the instant this responds, and that request checks the record.
     const buyerAccountId = settlement.payer ?? payload.accepted?.payTo;
     if (buyerAccountId) {
-      void fulfilPurchase(game, buyerAccountId, settlement.transaction);
+      await fulfilPurchase(game, buyerAccountId, settlement.transaction);
     }
 
     res.setHeader("payment-verified", "true");
     res.json({
-      playUrl,
+      buildPath: buildPathFor(game),
+      buildCid: game.buildCid,
       tokenId: game.htsTokenId,
       keyStatus: "pending",
       settlementTxId: settlement.transaction,
@@ -738,16 +745,44 @@ gameRouter.get(
   }),
 );
 
-// A free game still mints a real GameKey — `price = 0` is a real purchase
-// with real ownership, not a bypass.
-async function grantFreeKey(game: typeof games.$inferSelect, buyerEvmAddress: string) {
-  const { owned } = await ownsGame(buyerEvmAddress, game.htsTokenId);
-  if (owned) return;
-  const account = await getAccountByEvmAddress(buyerEvmAddress);
-  if (!account) return; // wallet never funded — nothing to mint to yet
-  void fulfilPurchase(game, account.account, "free");
-}
+/**
+ * The build itself.
+ *
+ * One request for the whole zip rather than a request per asset, which is what
+ * makes an ownership check affordable here: checking a wallet against the
+ * Mirror Node once per game is fine, once per file is not. The client unpacks
+ * it and serves it to itself from an isolated origin, which is the same thing
+ * the publish preview does with a dropped zip.
+ *
+ * A game published before builds were kept locally has a CID and no file. That
+ * answers 404 with a real reason rather than a broken player.
+ */
+gameRouter.get(
+  "/:id/build.zip",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const game = await db.query.games.findFirst({ where: eq(games.id, param(req, "id")) });
+    if (!game) throw Errors.notFound("Game");
+    if (game.status === "removed") throw Errors.notFound("Game");
 
+    if (game.priceUnits > 0) {
+      const { owned } = await hasEntitlement(req.auth!.evmAddress, game);
+      if (!owned) throw Errors.notOwner("You need to own this game to download it.");
+    }
+
+    const file = await findBuild(game.id);
+    if (!file) {
+      throw Errors.notFound("This game's build file. It was published before builds were kept for serving, so it needs uploading again");
+    }
+
+    res.type("application/zip");
+    res.sendFile(file);
+  }),
+);
+
+// Ownership as the chain reports it, which is what a buyer's own library and
+// the review gate rest on. Deliberately narrower than services/games/
+// entitlement.ts: this one is the claim that can be checked by anyone.
 gameRouter.get(
   "/:id/owned",
   requireAuth,
@@ -759,44 +794,98 @@ gameRouter.get(
   }),
 );
 
-// The browser can't hold a signing key, so a logged-in buyer's purchase is
-// signed here instead — with their own Privy wallet, not ours. This is the
-// "helper" INTEGRATION.md tells the frontend to call rather than building a
-// Hedera transaction client-side. Same response shape as GET /:id/download.
+// --- paying for a game --------------------------------------------------
+//
+// Two calls, because a purchase needs two different authorities and neither
+// side has both. This server has the 402 terms and a Hedera client; only the
+// browser can sign with the buyer's own embedded wallet. So the transfer is
+// built here, signed there, and settled here.
+//
+// The alternative was asking every buyer to delegate their wallet to us. That
+// is a much bigger permission than a purchase needs — it is standing authority
+// to move their money whenever we like — and it would have to be granted before
+// the first buy, on the checkout screen, in a modal about wallet delegation.
+// See services/x402/pay.ts#preparePayment.
+//
+// The agent does not come through here. Its wallet is one we created, so it can
+// still be signed for in one step (services/x402/pay.ts#payForGame).
+
+/**
+ * The Hedera account behind a wallet, or the reason there isn't one yet.
+ *
+ * No public key is looked up here, and that is the whole point. A wallet that
+ * has only ever received value has a *hollow* account (HIP-583): it holds the
+ * money, its alias is the 20-byte EVM address, and the Mirror Node reports
+ * `key: null` until it signs something. That describes every first-time buyer,
+ * so demanding a published key up front refused exactly the people we exist to
+ * serve. The key comes out of the payment signature instead, and signing the
+ * payment is also what completes the account.
+ */
+async function payerFor(evmAddress: string) {
+  const account = await getAccountByEvmAddress(evmAddress);
+  if (!account) throw Errors.walletNotFunded();
+  return { accountId: account.account };
+}
+
 gameRouter.post(
-  "/:id/pay",
+  "/:id/pay/prepare",
   requireAuth,
   asyncHandler(async (req, res) => {
     const game = await db.query.games.findFirst({ where: eq(games.id, param(req, "id")) });
     if (!game) throw Errors.notFound("Game");
 
-    const account = await getAccountByEvmAddress(req.auth!.evmAddress);
-    if (!account) throw Errors.walletNotFunded();
-
-    // The first thing here that needs signing authority over the buyer's own
-    // wallet, and the only thing that does. Privy refuses unless the user has
-    // delegated it, so say that plainly rather than letting a raw Privy error
-    // surface on the one screen where the money is about to move.
-    let publicKeyHex: string;
-    try {
-      publicKeyHex = await ensureUserPublicKey(req.auth!);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      if (/authorization keys|user signing keys/i.test(message)) {
-        throw new AppError(
-          403,
-          "WALLET_NOT_DELEGATED",
-          "This wallet hasn't authorised the store to pay on its behalf yet.",
-          { reason: message },
-        );
-      }
-      throw err;
+    // Free or already owned, so there is nothing to sign. Answered here rather
+    // than making the client guess from the price, and it means a double
+    // purchase costs nothing even if the client does ask.
+    const granted = await grantAccess(game, req.auth);
+    if (granted) {
+      res.json({ status: "granted", ...granted });
+      return;
     }
 
-    const result = await payForGame(game.id, {
-      walletId: req.auth!.privyWalletId,
-      accountId: account.account,
-      publicKeyHex,
+    const payer = await payerFor(req.auth!.evmAddress);
+    const result = await preparePayment({
+      userId: req.auth!.id,
+      gameId: game.id,
+      accountId: payer.accountId,
+      evmAddress: req.auth!.evmAddress,
+    });
+
+    if ("granted" in result) {
+      res.json({ status: "granted", ...(result.granted as object) });
+      return;
+    }
+    res.json({ status: "prepared", ...result.prepared });
+  }),
+);
+
+const completePaymentSchema = z.object({
+  intentId: z.string().uuid(),
+  signatures: z
+    .array(
+      z.object({
+        hash: z.string().regex(/^0x[0-9a-fA-F]{64}$/, "must be a 32-byte hex hash"),
+        signature: z.string().regex(/^0x[0-9a-fA-F]{128,130}$/, "must be a hex signature"),
+      }),
+    )
+    .min(1)
+    .max(16),
+});
+
+gameRouter.post(
+  "/:id/pay/complete",
+  requireAuth,
+  validate(completePaymentSchema),
+  asyncHandler(async (req, res) => {
+    const body = req.body as z.infer<typeof completePaymentSchema>;
+    const game = await db.query.games.findFirst({ where: eq(games.id, param(req, "id")) });
+    if (!game) throw Errors.notFound("Game");
+
+    const result = await completePayment({
+      userId: req.auth!.id,
+      gameId: game.id,
+      intentId: body.intentId,
+      signatures: body.signatures,
     });
     res.json(result);
   }),
@@ -914,8 +1003,12 @@ gameRouter.post(
     if (!game) throw Errors.notFound("Game");
     if (game.status === "removed") throw Errors.notFound("Game");
 
+    // hasEntitlement, not ownsGame. The first play of any purchase happens in
+    // the seconds between settlement and the GameKey landing, so gating this on
+    // the chain alone would drop the play count for exactly the play that
+    // matters most, and 403 the buyer as the game boots.
     if (game.priceUnits > 0) {
-      const { owned } = await ownsGame(req.auth!.evmAddress, game.htsTokenId);
+      const { owned } = await hasEntitlement(req.auth!.evmAddress, game);
       if (!owned) throw Errors.notOwner("You need to own this game to play it.");
     }
 
