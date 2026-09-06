@@ -6,7 +6,8 @@ import { studios, studioMembers, games, users } from "../db/schema.js";
 import { requireAuth, optionalAuth } from "../middleware/auth.middleware.js";
 import { validate } from "../middleware/validate.middleware.js";
 import { asyncHandler } from "../lib/asyncHandler.js";
-import { Errors } from "../lib/errors.js";
+import { AppError, Errors } from "../lib/errors.js";
+import logger from "../utils/logger.utils.js";
 import { slugify, withSuffix } from "../lib/slug.js";
 import { param, isUuid } from "../lib/params.js";
 import { ensFullName } from "../lib/display.js";
@@ -33,6 +34,18 @@ studioRouter.post(
   asyncHandler(async (req, res) => {
     const { name, bio, ensSubname, handle } = req.body;
 
+    // One studio per account, which is what everything downstream already
+    // assumes: /api/me returns a single `studio`, the profile menu links to
+    // "your studio", and publishing picks one without asking. Allowing a
+    // second would silently make all three pick an arbitrary one.
+    const already = await db.query.studios.findFirst({ where: eq(studios.ownerUserId, req.auth!.id) });
+    if (already) {
+      throw new AppError(409, "STUDIO_EXISTS", "You already have a studio.", {
+        studioId: already.id,
+        slug: already.slug,
+      });
+    }
+
     // checked live against the subregistry, not just our own table — a
     // label could be taken on-chain without ever passing through this route
     // (e.g. minted directly against the subregistry by hand).
@@ -49,12 +62,29 @@ studioRouter.post(
     // for the one-time parent name registration). Runs before the insert so
     // a chain failure never leaves a studio row claiming a subname it
     // doesn't actually hold.
+    //
+    // It is also the slowest thing this API does: a Sepolia write plus a
+    // receipt, so ten seconds or more. A caller waiting on it needs to know
+    // that a failure here is the chain rather than their input, because the
+    // answer is "try again", not "pick another name".
+    let ensTxHash: string | null = null;
     if (ensSubname) {
-      await registerStudioSubname(
-        env.ENS_SUBREGISTRY_ADDRESS as `0x${string}`,
-        ensSubname,
-        req.auth!.evmAddress as `0x${string}`,
-      );
+      try {
+        ensTxHash = await registerStudioSubname(
+          env.ENS_SUBREGISTRY_ADDRESS as `0x${string}`,
+          ensSubname,
+          req.auth!.evmAddress as `0x${string}`,
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        logger.error({ err, ensSubname }, "studio subname mint failed");
+        throw new AppError(
+          502,
+          "ENS_MINT_FAILED",
+          "The name could not be claimed on chain. Nothing was created, so you can try again.",
+          { reason: message },
+        );
+      }
     }
 
     const [studio] = await db
@@ -78,7 +108,16 @@ studioRouter.post(
       })
       .returning();
 
-    res.status(201).json({ ...studio, handle: ownerMember!.handle });
+    res.status(201).json({
+      ...studio,
+      ens: ensFullName(studio!.ensSubname),
+      handle: ownerMember!.handle,
+      memberCount: 1,
+      ownerAddress: req.auth!.evmAddress,
+      // So the UI can point at the transaction that claimed the name rather
+      // than asking anyone to take it on trust.
+      ensTxHash,
+    });
   }),
 );
 
@@ -94,7 +133,10 @@ studioRouter.get(
     const { name } = req.query as unknown as { name: string };
     const takenLocally = await db.query.studios.findFirst({ where: eq(studios.ensSubname, name) });
     const available = !takenLocally && (await isSubnameAvailable(env.ENS_SUBREGISTRY_ADDRESS as `0x${string}`, name));
-    res.json({ name, available, checkedOnChain: true });
+    // `fullName` so the screen showing this can print the name being claimed
+    // without being told the parent separately. It is the same value that
+    // comes back on a studio afterwards.
+    res.json({ name, fullName: ensFullName(name), available, checkedOnChain: true });
   }),
 );
 
