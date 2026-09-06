@@ -335,19 +335,43 @@ function serializeGame(
 // File pinning, the CSAM gate, and HTS token creation are Stage 2 and throw
 // NOT_IMPLEMENTED below rather than pretending to succeed.
 
-const splitSchema = z.object({
-  wallet: z.string().min(1),
-  handle: z.string().min(1).max(40),
-  role: z.string().min(1).max(40),
-  pct: z.number().int().min(1).max(100),
-});
+// A share names a person one of three ways, and only the first requires them
+// to have ever opened CGS:
+//
+//   wallet         — an address or 0.0.x. You, or anyone who has signed in.
+//   studioMemberId — someone already on the studio, picked from the roster.
+//   email          — someone new. The row is created here and the invite is
+//                    that row; their share is held until they claim it.
+//
+// Requiring a wallet was the single thing stopping the splits editor from
+// doing what it exists for. See services/games/fulfil.ts#distributeSplits.
+const splitSchema = z
+  .object({
+    wallet: z.string().min(1).optional(),
+    studioMemberId: z.string().uuid().optional(),
+    email: z.string().email().optional(),
+    handle: z.string().min(1).max(40),
+    role: z.string().min(1).max(40),
+    pct: z.number().int().min(1).max(100),
+  })
+  .refine((s) => s.wallet || s.studioMemberId || s.email, {
+    message: "each split needs a wallet, a studioMemberId, or an email",
+  });
 
 const publishGameSchema = z.object({
   studioId: z.string().uuid(),
   title: z.string().min(1).max(120),
   tagline: z.string().max(200).default(""),
   description: z.string().max(5000).default(""),
-  tags: z.array(z.string().max(40)).max(10).default([]),
+  // multipart has no array type: multer gives repeated fields as an array but
+  // a single one as a bare string, so a game with exactly one tag would fail
+  // validation while two passed. Normalise before parsing.
+  tags: z
+    .preprocess(
+      (value) => (value === undefined ? [] : Array.isArray(value) ? value : [value]),
+      z.array(z.string().max(40)).max(10),
+    )
+    .default([]),
   priceUnits: z.coerce.number().int().nonnegative(),
   priceAsset: z.string().default(env.X402_ASSET),
   coverMediaIndex: z.coerce.number().int().nonnegative().optional(),
@@ -364,6 +388,88 @@ const publishGameSchema = z.object({
 });
 
 const IMAGE_MIME = /^image\//;
+
+type SplitInput = z.infer<typeof splitSchema>;
+type ResolvedSplit = {
+  wallet: string | null;
+  studioMemberId: string | null;
+  userId: string | null;
+  handle: string;
+  role: string;
+  pct: number;
+  /** Set when this call created the membership, so the caller can show a link. */
+  invited?: { id: string; email: string; handle: string };
+};
+
+/**
+ * Turn what the splits editor sends into rows that can be paid.
+ *
+ * The wallet is looked up rather than trusted from the client wherever we can
+ * know it: a member who has accepted has a user, and that user has an address.
+ * A member who hasn't gets `wallet: null`, which is what makes their share
+ * held rather than unpublishable.
+ */
+async function resolveSplitRecipients(
+  studioId: string,
+  inputs: SplitInput[],
+): Promise<ResolvedSplit[]> {
+  const out: ResolvedSplit[] = [];
+
+  for (const input of inputs) {
+    const base = { handle: input.handle, role: input.role, pct: input.pct };
+
+    // An explicit wallet wins: it's you, or someone whose address is known.
+    if (input.wallet) {
+      out.push({ ...base, wallet: input.wallet, studioMemberId: null, userId: null });
+      continue;
+    }
+
+    const found = input.studioMemberId
+      ? await db.query.studioMembers.findFirst({
+          where: and(eq(studioMembers.id, input.studioMemberId), eq(studioMembers.studioId, studioId)),
+        })
+      : undefined;
+    const member = found
+      ? { ...found, createdHere: false }
+      : input.email
+        ? await findOrInviteMember(studioId, input.email, input.handle)
+        : undefined;
+
+    if (!member) {
+      throw Errors.validationFailed({ splits: `no such member on this studio: ${input.handle}` });
+    }
+
+    // Accepted already? Then their address is known and the share can pay out
+    // on the first sale like anyone else's.
+    const user = member.userId
+      ? await db.query.users.findFirst({ where: eq(users.id, member.userId) })
+      : null;
+
+    out.push({
+      ...base,
+      wallet: user?.evmAddress ?? null,
+      studioMemberId: member.id,
+      userId: member.userId,
+      invited: member.createdHere ? { id: member.id, email: member.email, handle: member.handle } : undefined,
+    });
+  }
+
+  return out;
+}
+
+/** Matching on email, so publishing twice with the same teammate reuses the invite. */
+async function findOrInviteMember(studioId: string, email: string, handle: string) {
+  const existing = await db.query.studioMembers.findFirst({
+    where: and(eq(studioMembers.studioId, studioId), eq(studioMembers.email, email)),
+  });
+  if (existing) return { ...existing, createdHere: false };
+
+  const [created] = await db
+    .insert(studioMembers)
+    .values({ studioId, email, handle, role: "member" })
+    .returning();
+  return { ...created!, createdHere: true };
+}
 
 gameRouter.post(
   "/",
@@ -435,7 +541,23 @@ gameRouter.post(
       })
       .returning();
 
-    await db.insert(splits).values(body.splits.map((s) => ({ gameId: game!.id, ...s })));
+    // Resolve each share to whoever it belongs to, creating the studio
+    // membership for anyone named only by email. That row *is* the invite —
+    // /invite/:id takes a studio_members id — so publishing with a teammate
+    // added by email is what sends them one, with no separate call.
+    const resolved = await resolveSplitRecipients(studio.id, body.splits);
+
+    await db.insert(splits).values(
+      resolved.map((s) => ({
+        gameId: game!.id,
+        wallet: s.wallet,
+        studioMemberId: s.studioMemberId,
+        userId: s.userId,
+        handle: s.handle,
+        role: s.role,
+        pct: s.pct,
+      })),
+    );
 
     if (mediaCids.length > 0) {
       await db.insert(gameMedia).values(
@@ -448,7 +570,12 @@ gameRouter.post(
       );
     }
 
-    res.status(201).json(game);
+    // The invites created by this upload come back with the draft, because
+    // there is no mail server here and the publish screen has to be able to
+    // show what each person would have received.
+    const invited = resolved.map((s) => s.invited).filter((i) => i !== undefined);
+
+    res.status(201).json({ ...game, invited });
   }),
 );
 

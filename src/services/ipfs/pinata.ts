@@ -22,10 +22,26 @@ export async function pinFile(buffer: Buffer, filename: string, mimeType?: strin
   return result.cid;
 }
 
-// never *.mypinata.cloud — it returns HTTP 200 with an error page in the
-// body, a status-code check misses it entirely.
+// Which gateway actually serves what we pinned.
+//
+// The earlier note here said never *.mypinata.cloud, and that is right about
+// the *shared* gateway — it answers 200 with an error page in the body, so a
+// status-code check misses it. It is wrong about a **dedicated** gateway: the
+// subdomain Pinata assigns an account serves the same CIDs in about a second,
+// with no token, and is a different origin from the app, which is what the
+// build iframe needs anyway.
+//
+// ipfs.io is the fallback and it is not a good one. Freshly pinned content is
+// not reliably reachable through it — every CID from this account timed out
+// with a 504 after nearly 30 seconds, because the public gateway has to find
+// the content on the DHT and Pinata does not announce it quickly. That is
+// invisible on the server and shows up as a broken image, or worse, a game
+// that never boots.
+const GATEWAY_HOST = env.PINATA_GATEWAY?.replace(/^https?:\/\//, "").replace(/\/+$/, "");
+
 export function gatewayUrl(cid: string, path?: string): string {
-  return path ? `https://ipfs.io/ipfs/${cid}/${path}` : `https://ipfs.io/ipfs/${cid}`;
+  const base = GATEWAY_HOST ? `https://${GATEWAY_HOST}/ipfs/${cid}` : `https://ipfs.io/ipfs/${cid}`;
+  return path ? `${base}/${path}` : base;
 }
 
 // For `removed_from_storage`: genuinely illegal content actually leaves

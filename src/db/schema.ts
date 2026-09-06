@@ -39,7 +39,16 @@ export const reportActionEnum = pgEnum("report_action", [
   "delisted",
   "removed_from_storage",
 ]);
-export const splitStatusEnum = pgEnum("split_status", ["pending", "distributed", "failed"]);
+// "partial" is the honest answer when some of a split paid out and some is
+// held for a collaborator who hasn't claimed their invite. It is not a
+// failure — the money that could move, moved.
+export const splitStatusEnum = pgEnum("split_status", [
+  "pending",
+  "distributed",
+  "partial",
+  "failed",
+]);
+export const payoutStatusEnum = pgEnum("payout_status", ["held", "settled", "failed"]);
 export const notificationTypeEnum = pgEnum("notification_type", [
   "sale",
   "invite",
@@ -126,10 +135,42 @@ export const splits = pgTable("splits", {
   id: uuid("id").primaryKey().defaultRandom(),
   gameId: uuid("game_id").notNull().references(() => games.id),
   userId: uuid("user_id").references(() => users.id),
-  wallet: text("wallet").notNull(),
+  // Null when this share belongs to someone who hasn't signed in yet. The
+  // splits editor's whole reason to exist is adding a collaborator by email,
+  // and a person who has never opened CGS has no address to name — so the
+  // share is held (see pendingPayouts) until they claim it, rather than the
+  // game being unpublishable. Backfilled when they accept their invite.
+  wallet: text("wallet"),
+  // Who the share is for when there's no wallet yet. This is also the invite:
+  // /invite/:id is a studio_members row id.
+  studioMemberId: uuid("studio_member_id").references(() => studioMembers.id),
   handle: text("handle").notNull(),
   role: text("role").notNull(),
   pct: integer("pct").notNull(),
+});
+
+// A share that was owed but couldn't be paid at settlement, because the person
+// it belongs to has no Hedera account yet.
+//
+// Before this, one unresolvable recipient threw and failed the entire
+// distribution — nobody on the split got paid, which is the opposite of the
+// promise the product makes out loud ("anyone invited by email is on the
+// splits from the first sale whether or not they've accepted"). Now everyone
+// resolvable is paid in one transaction and the rest land here, to be settled
+// the moment the person claims their invite.
+export const pendingPayouts = pgTable("pending_payouts", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  saleId: uuid("sale_id").notNull().references(() => sales.id),
+  gameId: uuid("game_id").notNull().references(() => games.id),
+  splitId: uuid("split_id").notNull().references(() => splits.id),
+  studioMemberId: uuid("studio_member_id").references(() => studioMembers.id),
+  amountUnits: bigint("amount_units", { mode: "number" }).notNull(),
+  asset: text("asset").notNull(),
+  status: payoutStatusEnum("status").notNull().default("held"),
+  reason: text("reason"),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  settledAt: timestamp("settled_at", { withTimezone: true }),
+  settlementTxId: text("settlement_tx_id"),
 });
 
 // a cache of on-chain truth, never the source of it. anything that gates
