@@ -19,6 +19,7 @@ import commentRouter from "./routes/comment.routes.js";
 import agentRouter from "./routes/agent.routes.js";
 import reportRouter from "./routes/report.routes.js";
 import meRouter from "./routes/me.routes.js";
+import devRouter from "./routes/dev.routes.js";
 import { runWatcherTick } from "./agent/watcher.js";
 import logger from "./utils/logger.utils.js";
 
@@ -44,6 +45,13 @@ app.use("/api/comments", commentRouter);
 app.use("/api/agents", agentRouter);
 app.use("/api/reports", reportRouter);
 app.use("/api/me", meRouter);
+
+// Not mounted at all unless asked for, so in any other configuration the path
+// 404s like anything else that doesn't exist. See routes/dev.routes.ts.
+if (env.DEV_FAUCET === "on") {
+  app.use("/api/dev", devRouter);
+  logger.warn("DEV_FAUCET is on — /api/dev/faucet will move funds out of the operator account");
+}
 
 app.use(notFoundHandler);
 app.use(errorHandler);

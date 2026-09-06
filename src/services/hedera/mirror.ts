@@ -48,6 +48,20 @@ export async function getAccountByEvmAddress(evmAddress: string) {
   return getJson<MirrorAccount>(`/api/v1/accounts/${evmAddress}`);
 }
 
+// Same endpoint, addressed by 0.0.x instead. Separate name because the two
+// callers mean different things by it: one is asking "does this wallet exist
+// yet", this one is asking about an account we know does.
+export async function getAccount(accountId: string) {
+  return getJson<MirrorAccount>(`/api/v1/accounts/${accountId}`);
+}
+
+/** Units of `asset` an account holds. `0.0.0` means HBAR, in tinybars. */
+export function balanceOf(account: MirrorAccount | null, asset: string): number {
+  if (!account?.balance) return 0;
+  if (asset === "0.0.0") return account.balance.balance;
+  return account.balance.tokens.find((t) => t.token_id === asset)?.balance ?? 0;
+}
+
 export type MirrorTopicMessage = {
   consensus_timestamp: string;
   message: string; // base64

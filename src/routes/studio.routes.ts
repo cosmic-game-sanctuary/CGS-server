@@ -10,6 +10,7 @@ import { Errors } from "../lib/errors.js";
 import { slugify, withSuffix } from "../lib/slug.js";
 import { param, isUuid } from "../lib/params.js";
 import { ensFullName } from "../lib/display.js";
+import { fallbackHandle } from "../lib/handle.js";
 import { isSubnameAvailable, registerStudioSubname } from "../services/ens/registrar.js";
 import { env } from "../config/env.js";
 
@@ -19,6 +20,10 @@ const createStudioSchema = z.object({
   name: z.string().min(1).max(80),
   bio: z.string().max(500).optional(),
   ensSubname: z.string().min(1).max(63).optional(),
+  // What the owner is called on a split line. Optional because most people
+  // won't be asked for one at creation; the part before the @ is a sane
+  // default and they can be credited under it from their first game.
+  handle: z.string().min(1).max(40).optional(),
 });
 
 studioRouter.post(
@@ -26,7 +31,7 @@ studioRouter.post(
   requireAuth,
   validate(createStudioSchema),
   asyncHandler(async (req, res) => {
-    const { name, bio, ensSubname } = req.body;
+    const { name, bio, ensSubname, handle } = req.body;
 
     // checked live against the subregistry, not just our own table — a
     // label could be taken on-chain without ever passing through this route
@@ -57,7 +62,23 @@ studioRouter.post(
       .values({ ownerUserId: req.auth!.id, name, slug, bio, ensSubname })
       .returning();
 
-    res.status(201).json(studio);
+    // The owner is a member of their own studio. Without this row a brand new
+    // studio reports zero people on every listing it publishes, and the owner
+    // has no handle to put on their own game's splits — they'd be the one
+    // person on the team the credits couldn't name.
+    const [ownerMember] = await db
+      .insert(studioMembers)
+      .values({
+        studioId: studio!.id,
+        userId: req.auth!.id,
+        email: req.auth!.email,
+        handle: handle ?? fallbackHandle(req.auth!.email),
+        role: "owner",
+        acceptedAt: new Date(),
+      })
+      .returning();
+
+    res.status(201).json({ ...studio, handle: ownerMember!.handle });
   }),
 );
 

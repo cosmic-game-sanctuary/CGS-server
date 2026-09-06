@@ -23,6 +23,7 @@ import { asyncHandler } from "../lib/asyncHandler.js";
 import { AppError, Errors } from "../lib/errors.js";
 import { slugify, withSuffix } from "../lib/slug.js";
 import { ownsGame } from "../services/games/ownership.js";
+import { ensureUserPublicKey } from "../services/users/repo.js";
 import { env } from "../config/env.js";
 import { param, isUuid } from "../lib/params.js";
 import { assetDecimals, ensFullName, toDisplayAmount } from "../lib/display.js";
@@ -642,10 +643,30 @@ gameRouter.post(
     const account = await getAccountByEvmAddress(req.auth!.evmAddress);
     if (!account) throw Errors.walletNotFunded();
 
+    // The first thing here that needs signing authority over the buyer's own
+    // wallet, and the only thing that does. Privy refuses unless the user has
+    // delegated it, so say that plainly rather than letting a raw Privy error
+    // surface on the one screen where the money is about to move.
+    let publicKeyHex: string;
+    try {
+      publicKeyHex = await ensureUserPublicKey(req.auth!);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (/authorization keys|user signing keys/i.test(message)) {
+        throw new AppError(
+          403,
+          "WALLET_NOT_DELEGATED",
+          "This wallet hasn't authorised the store to pay on its behalf yet.",
+          { reason: message },
+        );
+      }
+      throw err;
+    }
+
     const result = await payForGame(game.id, {
       walletId: req.auth!.privyWalletId,
       accountId: account.account,
-      publicKeyHex: req.auth!.publicKeyHex,
+      publicKeyHex,
     });
     res.json(result);
   }),

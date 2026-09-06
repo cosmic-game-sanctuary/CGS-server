@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { createPublicKey } from "node:crypto";
 import { z } from "zod";
 
 // a real 0.0.x account id, not .env.example's `0.0.xxxxx` placeholder
@@ -7,6 +8,55 @@ const hederaAccountId = z
   .regex(/^\d+\.\d+\.\d+$/, "must be a real Hedera account id like 0.0.12345");
 
 const evmAddress = z.string().regex(/^0x[a-fA-F0-9]{40}$/, "must be a real 0x address");
+
+// Privy verifies access tokens against a P-256 public key, which `jose` loads
+// with importSPKI — and that needs real PEM, armour and newlines included.
+// A key pasted into a .env almost never arrives that way, and the failure is
+// invisible until the first authenticated request, where it surfaces as
+// `"spki" must be SPKI formatted string` on what looks like a login problem.
+//
+// So accept the three shapes it actually turns up in and normalise them here:
+// proper PEM, PEM flattened onto one line with literal \n sequences (dotenv
+// only expands those inside double quotes), and the bare base64 body the
+// dashboard shows without any armour at all.
+const privyVerificationKey = z
+  .string()
+  .min(1)
+  .transform((raw, ctx) => {
+    const text = raw.trim().replace(/\\n/g, "\n");
+    if (text.includes("BEGIN PUBLIC KEY")) return text;
+
+    const body = text.replace(/\s+/g, "");
+    const pem = /^[A-Za-z0-9+/]+={0,2}$/.test(body)
+      ? `-----BEGIN PUBLIC KEY-----\n${(body.match(/.{1,64}/g) ?? []).join("\n")}\n-----END PUBLIC KEY-----`
+      : null;
+
+    if (!pem) {
+      ctx.addIssue({
+        code: "custom",
+        message:
+          "must be the public key from the Privy dashboard, either full PEM " +
+          "(-----BEGIN PUBLIC KEY-----…) or the bare base64 body.",
+      });
+      return z.NEVER;
+    }
+    return pem;
+  })
+  // Parsing it here turns a bad key into one clear line at boot instead of a
+  // 401 on every authenticated request with `"spki" must be SPKI formatted
+  // string` buried in it — which reads as a login bug rather than a config
+  // one. No new dependency: node's own crypto rejects exactly what jose does.
+  .refine(
+    (pem) => {
+      try {
+        createPublicKey(pem);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    { message: "is not a valid public key. Re-copy it from the Privy dashboard." },
+  );
 
 // fails loudly at boot if something's missing, instead of an obscure crash
 // three requests in.
@@ -45,7 +95,7 @@ const envSchema = z.object({
 
   PRIVY_APP_ID: z.string(),
   PRIVY_APP_SECRET: z.string(),
-  PRIVY_VERIFICATION_KEY: z.string(),
+  PRIVY_VERIFICATION_KEY: privyVerificationKey,
 
   PINATA_JWT: z.string(),
 
@@ -55,6 +105,19 @@ const envSchema = z.object({
   CSAM_MODE: z.enum(["block", "skip"]).default("block"),
 
   AGENT_POLL_INTERVAL_MS: z.coerce.number().default(5000),
+
+  // A dev-only route that funds a wallet from the operator account. It exists
+  // because a Privy embedded wallet has no Hedera account until it first
+  // receives value, and no public faucet hands out testnet USDC — so without
+  // it a new test buyer can never buy anything. Off unless asked for, and
+  // refused outright in production (see the refinement below).
+  DEV_FAUCET: z.enum(["on", "off"]).default("off"),
+  // Small on purpose. The operator's whole testnet USDC balance is what pays
+  // every buyer AND every split, and the Circle faucet is the only way to
+  // refill it — a generous default drains the treasury in four clicks. Games
+  // cost a few dollars, so this covers a purchase either way.
+  DEV_FAUCET_AMOUNT: z.coerce.number().positive().default(5),
+  DEV_FAUCET_HBAR: z.coerce.number().positive().default(2),
 
   // ENSv2 beta, Sepolia-only. Every address here was checked against a
   // Sepolia RPC directly (real bytecode, sensible eth_call results) — the
@@ -74,7 +137,15 @@ const envSchema = z.object({
   // under it — both one-time setup, done by `scripts/setup-ens.ts` and
   // never redone. Every studio subname mints against this address.
   ENS_SUBREGISTRY_ADDRESS: evmAddress,
-});
+})
+  // A route that moves real money out of the operator account on nothing but
+  // a valid login has no business existing in production. Making it a boot
+  // failure rather than a runtime check means it cannot be turned on by
+  // accident and noticed later.
+  .refine((e) => !(e.DEV_FAUCET === "on" && e.NODE_ENV === "production"), {
+    message: "DEV_FAUCET cannot be 'on' when NODE_ENV is 'production'",
+    path: ["DEV_FAUCET"],
+  });
 
 const parsed = envSchema.safeParse(process.env);
 
