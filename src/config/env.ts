@@ -107,6 +107,15 @@ const envSchema = z.object({
   // as broken cover art and a game that never boots — see services/ipfs/pinata.ts.
   PINATA_GATEWAY: z.string().optional(),
 
+  // Email. Optional on purpose: without a key nothing is sent and every send
+  // is logged instead, so a missing key degrades to silence rather than to a
+  // crash on a path that is never the point of the request that triggered it.
+  RESEND_API_KEY: z.string().optional(),
+  RESEND_FROM: z.string().default("CGS <onboarding@resend.dev>"),
+  // Where a link in an email should point. Not the API's own origin: every
+  // link we send is a page, and the person clicking it is in a browser.
+  APP_URL: z.string().default("http://localhost:5173"),
+
   // no CSAM-scanning provider is wired yet (see docs/api-contract.md §6). This
   // fails closed on purpose — "skip" is a deliberate local escape hatch, not
   // a default, and it stays "block" until a real provider is chosen.

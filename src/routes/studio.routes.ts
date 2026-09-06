@@ -14,6 +14,7 @@ import { ensFullName } from "../lib/display.js";
 import { fallbackHandle } from "../lib/handle.js";
 import { isSubnameAvailable, registerStudioSubname } from "../services/ens/registrar.js";
 import { env } from "../config/env.js";
+import { emailStudioInvite } from "../services/email/messages.js";
 
 const studioRouter = Router({ caseSensitive: true, strict: true });
 
@@ -209,6 +210,17 @@ studioRouter.post(
       .insert(studioMembers)
       .values({ studioId: studio.id, email, handle, role })
       .returning();
+
+    // The invitee has no account, so no notification row can reach them. Mail
+    // is the only channel, and without it the invite is a link nobody was
+    // handed. Not awaited into the response: the row is what grants the share,
+    // and a mail failure must not make the invite look like it failed.
+    void emailStudioInvite({
+      to: email,
+      handle,
+      studioName: studio.name,
+      inviteId: member!.id,
+    });
 
     res.status(201).json(member);
   }),

@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import {
   TokenMintTransaction,
   TransferTransaction,
@@ -16,12 +16,14 @@ import {
   studioMembers,
   sales,
   pendingPayouts,
+  users,
 } from "../../db/schema.js";
 import client from "../hedera/client.js";
 import { submitTopicMessage } from "../hedera/hcs.js";
 import { getAccountByEvmAddress } from "../hedera/mirror.js";
 import { env } from "../../config/env.js";
 import logger from "../../utils/logger.utils.js";
+import { emailSale } from "../email/messages.js";
 
 type Game = typeof games.$inferSelect;
 
@@ -336,9 +338,11 @@ async function notifyStudio(game: Game) {
   );
   const pctByHandle = new Map(gameSplits.map((s) => [s.handle, s.pct] as const));
 
+  const shareFor = (userId: string) => pctByHandle.get(handleByUser.get(userId) ?? "") ?? null;
+
   await db.insert(notifications).values(
     [...userIds].map((userId) => {
-      const pct = pctByHandle.get(handleByUser.get(userId) ?? "") ?? null;
+      const pct = shareFor(userId);
       return {
         userId,
         type: "sale" as const,
@@ -356,6 +360,24 @@ async function notifyStudio(game: Game) {
       };
     }),
   );
+
+  // A sale happens while the studio is asleep as often as not, so the row in
+  // the bell is only half of it. Sent after the rows are written, and never
+  // awaited into the caller: a sale is a sale whether the receipt arrives.
+  const recipients = await db.query.users.findMany({
+    where: inArray(users.id, [...userIds]),
+    columns: { id: true, email: true },
+  });
+  for (const person of recipients) {
+    const pct = shareFor(person.id);
+    void emailSale({
+      to: person.email,
+      gameTitle: game.title,
+      slug: game.slug,
+      shareUnits: pct === null ? null : Math.floor((game.priceUnits * pct) / 100),
+      asset: game.priceAsset,
+    });
+  }
 }
 
 export { resolveAccountId, distributeSplits };

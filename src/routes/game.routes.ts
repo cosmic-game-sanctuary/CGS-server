@@ -41,6 +41,7 @@ import { fulfilPurchase } from "../services/games/fulfil.js";
 import { getAccountByEvmAddress } from "../services/hedera/mirror.js";
 import { preparePayment, completePayment } from "../services/x402/pay.js";
 import { checkImages } from "../services/moderation/csam.js";
+import { emailStudioInvite } from "../services/email/messages.js";
 import { createGameToken } from "../services/hedera/hts.js";
 import { submitTopicMessage } from "../services/hedera/hcs.js";
 
@@ -563,6 +564,22 @@ gameRouter.post(
     // /invite/:id takes a studio_members id — so publishing with a teammate
     // added by email is what sends them one, with no separate call.
     const resolved = await resolveSplitRecipients(studio.id, body.splits);
+
+    // Someone named only by email now has a membership row, and that row is
+    // the invite. Telling them is the half that was missing: the share is
+    // theirs from the first sale whether or not they ever accept, so the
+    // message is a fact rather than a request.
+    for (const share of resolved) {
+      if (!share.invited) continue;
+      void emailStudioInvite({
+        to: share.invited.email,
+        handle: share.invited.handle,
+        studioName: studio.name,
+        inviteId: share.invited.id,
+        gameTitle: body.title,
+        pct: share.pct,
+      });
+    }
 
     await db.insert(splits).values(
       resolved.map((s) => ({
