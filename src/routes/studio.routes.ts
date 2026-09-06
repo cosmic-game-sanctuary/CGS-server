@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { eq, or } from "drizzle-orm";
+import { and, eq, or } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "../db/client.js";
 import { studios, studioMembers, games, users } from "../db/schema.js";
@@ -151,13 +151,23 @@ studioRouter.get(
     });
     if (!studio) throw Errors.notFound("Studio");
 
+    // Owning the studio is what decides whether this page shows unfinished
+    // work, so it has to be known before the games are queried.
+    const isOwner = req.auth?.id === studio.ownerUserId;
+
     const [members, studioGames, owner] = await Promise.all([
       db.query.studioMembers.findMany({
         where: eq(studioMembers.studioId, studio.id),
         columns: { id: true, handle: true, role: true, acceptedAt: true, email: true },
       }),
       db.query.games.findMany({
-        where: eq(games.studioId, studio.id),
+        // A draft is a game its studio hasn't announced — a title and cover
+        // they may still be changing — so this page showed strangers work that
+        // was never published. The owner still sees everything, which is what
+        // makes this the "manage my games" view as well as the public one.
+        where: isOwner
+          ? eq(games.studioId, studio.id)
+          : and(eq(games.studioId, studio.id), eq(games.status, "published")),
         columns: { id: true, slug: true, title: true, coverCid: true, coverSeed: true, status: true },
       }),
       db.query.users.findFirst({
@@ -169,7 +179,6 @@ studioRouter.get(
     // This page is public, so a member's email can't be. The id is safe and
     // the splits editor needs it to name someone who has no wallet yet; the
     // address is the studio's own, which every listing already shows.
-    const isOwner = req.auth?.id === studio.ownerUserId;
 
     res.json({
       ...studio,
