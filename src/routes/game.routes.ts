@@ -3,7 +3,8 @@ import { and, desc, asc, eq, or, ilike, inArray, isNotNull, lt, sql } from "driz
 import { z } from "zod";
 import multer from "multer";
 import { db } from "../db/client.js";
-import { games, studios, studioMembers, splits, reviews, gameMedia, notifications } from "../db/schema.js";
+import { games, studios, studioMembers, splits, reviews, gameMedia, notifications, users } from "../db/schema.js";
+import { truncateAddress } from "../lib/address.js";
 import { requireAuth, optionalAuth } from "../middleware/auth.middleware.js";
 import { validate } from "../middleware/validate.middleware.js";
 import { asyncHandler } from "../lib/asyncHandler.js";
@@ -505,7 +506,27 @@ gameRouter.get(
     });
     const hasMore = rows.length > limit;
     const page = hasMore ? rows.slice(0, limit) : rows;
-    res.json({ reviews: page, nextCursor: hasMore ? page[page.length - 1]!.createdAt.toISOString() : null });
+
+    // batched, not a relation — this is the only place reviews need the
+    // author's address, and it's read-only display, same pattern as the
+    // catalog's rating batching above.
+    const authorIds = [...new Set(page.map((r) => r.userId))];
+    const authors =
+      authorIds.length > 0
+        ? await db.query.users.findMany({ where: inArray(users.id, authorIds), columns: { id: true, evmAddress: true } })
+        : [];
+    const authorById = new Map(authors.map((a) => [a.id, a.evmAddress]));
+
+    res.json({
+      reviews: page.map((r) => ({
+        ...r,
+        // no ENS lookup exists yet (Stage 7) — a truncated address is the
+        // only identity there is to show right now, for anyone.
+        author: truncateAddress(authorById.get(r.userId) ?? "0x0"),
+        authorIsEns: false,
+      })),
+      nextCursor: hasMore ? page[page.length - 1]!.createdAt.toISOString() : null,
+    });
   }),
 );
 
