@@ -7,6 +7,8 @@ import { asyncHandler } from "../lib/asyncHandler.js";
 import { env } from "../config/env.js";
 import { resolveHederaAccount } from "../services/users/repo.js";
 import { getAccountByEvmAddress, getAllNftsForAccount } from "../services/hedera/mirror.js";
+import { assetDecimals, ensFullName, toDisplayAmount } from "../lib/display.js";
+import { gatewayUrl } from "../services/ipfs/pinata.js";
 
 const meRouter = Router({ caseSensitive: true, strict: true });
 
@@ -54,6 +56,11 @@ meRouter.get(
       hederaAccountId,
       balanceUnits,
       balanceAsset: env.X402_ASSET,
+      // same reasoning as priceUsd on a game: the header renders this and
+      // never computes with it, and the decimals it would need to derive one
+      // are config that only lives here. See game.routes.ts#toDisplayAmount.
+      balanceUsd: balanceUnits === null ? 0 : toDisplayAmount(Number(balanceUnits), env.X402_ASSET),
+      balanceAssetDecimals: assetDecimals(env.X402_ASSET),
       studio,
     });
   }),
@@ -116,8 +123,9 @@ meRouter.get(
         slug: g.slug,
         title: g.title,
         tagline: g.tagline,
-        studio: { id: g.studio.id, name: g.studio.name, ens: g.studio.ensSubname, slug: g.studio.slug },
+        studio: { id: g.studio.id, name: g.studio.name, ens: ensFullName(g.studio.ensSubname), slug: g.studio.slug },
         coverCid: g.coverCid,
+        coverUrl: g.coverCid ? gatewayUrl(g.coverCid) : null,
         coverSeed: g.coverSeed,
         status: g.status,
         serial: g.htsTokenId ? (serialByToken.get(g.htsTokenId) ?? null) : null,

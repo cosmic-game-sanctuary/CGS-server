@@ -12,7 +12,9 @@
     "db:migrate": "drizzle-kit migrate",
     "db:studio": "drizzle-kit studio",
     "topics:create": "tsx scripts/create-hcs-topics.ts",
-    "splits:retry": "tsx scripts/retry-failed-splits.ts"
+    "splits:retry": "tsx scripts/retry-failed-splits.ts",
+    "seed:dev": "tsx scripts/seed-dev.ts",
+    "seed:wipe": "tsx scripts/seed-dev.ts --wipe"
   },
   "repository": {
     "type": "git",
