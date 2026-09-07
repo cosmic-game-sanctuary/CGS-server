@@ -2,6 +2,7 @@ import { eq } from "drizzle-orm";
 import { db } from "../../db/client.js";
 import { games, gamePriceChanges } from "../../db/schema.js";
 import { env } from "../../config/env.js";
+import { assetDecimals, toDisplayAmount } from "../../lib/display.js";
 import { submitTopicMessage } from "../hedera/hcs.js";
 import logger from "../../utils/logger.utils.js";
 
@@ -138,7 +139,15 @@ export async function priceHistory(game: Game) {
     .map((r) => ({
       fromUnits: r.fromUnits,
       toUnits: r.toUnits,
+      // The display pair belongs here rather than in the route. It used to be
+      // added by GET /:id/price-history and *not* by GET /:id/manage, so the
+      // same row arrived in two different shapes depending on which endpoint
+      // you asked — which cost the frontend an hour of debugging a blank
+      // screen. One shape for one thing, produced in one place.
+      fromUsd: toDisplayAmount(r.fromUnits, r.asset),
+      toUsd: toDisplayAmount(r.toUnits, r.asset),
       asset: r.asset,
+      assetDecimals: assetDecimals(r.asset),
       at: r.createdAt,
       hcsTxId: r.hcsTxId,
       topicId: env.HCS_LISTINGS_TOPIC ?? null,

@@ -274,11 +274,8 @@ gameManageRouter.get(
       // whether to wait actually wants. Includes the current price, so a game
       // that has never changed still answers honestly.
       lowestEverUnits: history.reduce((low, h) => Math.min(low, h.toUnits), game.priceUnits),
-      history: history.map((h) => ({
-        ...h,
-        fromUsd: toDisplayAmount(h.fromUnits, h.asset),
-        toUsd: toDisplayAmount(h.toUnits, h.asset),
-      })),
+      // Already carries its display pair — see services/games/listing.ts.
+      history,
     });
   }),
 );
