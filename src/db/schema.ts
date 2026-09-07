@@ -82,6 +82,8 @@ export const notificationTypeEnum = pgEnum("notification_type", [
   "build_updated",
   // The reason to keep a wishlist at all: something on it got cheaper.
   "price_drop",
+  // A studio replied to your review.
+  "review_reply",
 ]);
 
 export const users = pgTable("users", {
@@ -324,6 +326,16 @@ export const reviews = pgTable("reviews", {
   body: text("body").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   editedAt: timestamp("edited_at", { withTimezone: true }),
+  // The developer's own voice on their own page. One reply per review, from
+  // the studio rather than from a specific person — whoever on the team wrote
+  // it, it speaks for the studio the way the game's own listing does. Posting
+  // again overwrites it; there is no thread.
+  developerReply: text("developer_reply"),
+  developerReplyAt: timestamp("developer_reply_at", { withTimezone: true }),
+  // Who actually wrote it, kept for accountability even though it displays as
+  // the studio. Not a foreign key the UI needs to resolve — see
+  // authorSummaries if it ever does.
+  developerReplyByUserId: uuid("developer_reply_by_user_id").references(() => users.id),
 });
 
 export const wishlistAgents = pgTable("wishlist_agents", {
