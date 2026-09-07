@@ -168,3 +168,40 @@ export function emailPayoutSettled(input: {
     ].join("\n"),
   });
 }
+
+/**
+ * The one message a wishlist exists to send.
+ *
+ * A wishlist that never tells you anything is a list of bookmarks. This is the
+ * whole return path: the thing you saved is cheaper now, here is how much, here
+ * is the link. It says the old price too, because "20% off" without a number is
+ * a marketing sentence and this is meant to be a fact.
+ */
+export function emailPriceDrop(input: {
+  to: string;
+  gameTitle: string;
+  slug: string;
+  fromUnits: number;
+  toUnits: number;
+  asset: string;
+  savedAtUnits?: number | null;
+}): Promise<boolean> {
+  const percent = input.fromUnits > 0
+    ? Math.round(((input.fromUnits - input.toUnits) / input.fromUnits) * 100)
+    : 0;
+  const sinceYouSaved =
+    input.savedAtUnits && input.savedAtUnits > input.toUnits
+      ? `You saved it at ${money(input.savedAtUnits, input.asset)}.`
+      : null;
+
+  return sendMail({
+    to: input.to,
+    subject: `${input.gameTitle} is ${percent}% off`,
+    text: [
+      `${input.gameTitle} dropped from ${money(input.fromUnits, input.asset)} to ${money(input.toUnits, input.asset)}.`,
+      ...(sinceYouSaved ? [``, sinceYouSaved] : []),
+      ``,
+      appUrl(`/game/${input.slug}`),
+    ].join("\n"),
+  });
+}

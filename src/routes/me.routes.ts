@@ -15,6 +15,7 @@ import { Errors } from "../lib/errors.js";
 import { consumeWithdrawIntent, prepareWithdraw, submitWithdraw } from "../services/wallet/withdraw.js";
 import { settleHeldPayoutsForUser } from "../services/games/fulfil.js";
 import { personalEarnings } from "../services/earnings/report.js";
+import { wishlistFor } from "../services/games/wishlist.js";
 import logger from "../utils/logger.utils.js";
 import { fallbackHandle, isReservedHandle, normaliseHandle } from "../lib/handle.js";
 import { gatewayUrl, pinFile, unpinByCid } from "../services/ipfs/pinata.js";
@@ -224,6 +225,23 @@ meRouter.get(
         myPlayCount: statsByGame.get(g.id)?.playCount ?? 0,
         myPlaytimeSeconds: statsByGame.get(g.id)?.playtimeSeconds ?? 0,
       })),
+    });
+  }),
+);
+
+// The list a wishlist exists to produce: what you saved, what it costs now, and
+// what has changed since. Ordered newest first.
+meRouter.get(
+  "/wishlist",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const items = await wishlistFor(req.auth!.id);
+    res.json({
+      items,
+      // Surfaced separately because it is the number a "3 games on your list
+      // are cheaper" banner needs, and counting client-side means every client
+      // reimplements the same comparison.
+      onSale: items.filter((i) => i.percentOff > 0).length,
     });
   }),
 );

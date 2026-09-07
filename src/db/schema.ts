@@ -80,6 +80,8 @@ export const notificationTypeEnum = pgEnum("notification_type", [
   // a download is that the key keeps being worth something; this is the moment
   // that becomes visible.
   "build_updated",
+  // The reason to keep a wishlist at all: something on it got cheaper.
+  "price_drop",
 ]);
 
 export const users = pgTable("users", {
@@ -178,6 +180,9 @@ export const games = pgTable("games", {
   // `gameBuilds`; the columns above always mirror whichever one is current, so
   // nothing that serves a build had to learn about versions.
   buildVersion: integer("build_version").notNull().default(1),
+  // The highest wishlist milestone already announced on the public topic, so a
+  // game crossing 25 says so once rather than on every save afterwards.
+  demandMilestone: integer("demand_milestone").notNull().default(0),
   publishedAt: timestamp("published_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   // Distinct from createdAt and from publishedAt: the last time anything about
@@ -409,19 +414,44 @@ export const playSessions = pgTable("play_sessions", {
   durationSeconds: integer("duration_seconds"),
 });
 
-// A per-person toggle, not a count with history — liking again just unlikes.
-// Deliberately no ownership gate: favoriting a game you haven't bought yet is
-// normal in every real storefront (Steam wishlists, itch.io favorites).
-export const likes = pgTable(
+// The wishlist. One row per person per game, and adding a game twice is the
+// same as adding it once.
+//
+// This started life as `likes` and the physical table still has that name — a
+// rename would gain nothing at the cost of a migration drizzle-kit can only
+// resolve through an interactive prompt. The concept is the one that changed:
+// a "like" was approval with nothing downstream of it, and what the product
+// was missing was *intent* — the thing Steam built its entire retention
+// mechanic on and the thing that tells a developer demand exists before they
+// discount. Same rows, given a purpose.
+//
+// No ownership gate, on purpose: saving a game you have not bought is the
+// entire point, unlike a review, which is a verified-purchase signal.
+export const wishlistItems = pgTable(
   "likes",
   {
     id: uuid("id").primaryKey().defaultRandom(),
     gameId: uuid("game_id").notNull().references(() => games.id),
     userId: uuid("user_id").notNull().references(() => users.id),
+    // What it cost when they added it. This is what makes "down 40% since you
+    // saved it" possible, and it has to be captured at the moment of adding —
+    // there is no way to recover it afterwards for a game whose price has
+    // since moved. Null for rows that predate this.
+    priceUnitsWhenAdded: bigint("price_units_when_added", { mode: "number" }),
+    priceAsset: text("price_asset"),
+    // Per-row rather than per-person: someone may want telling about one game
+    // and not about the eleven others they saved on a whim.
+    notifyOnDrop: boolean("notify_on_drop").notNull().default(true),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [uniqueIndex("likes_game_user_idx").on(table.gameId, table.userId)],
 );
+
+/**
+ * The old name, kept as an alias so nothing that already reads `likes` had to
+ * change in the same commit that gave the table a purpose.
+ */
+export const likes = wishlistItems;
 
 // Unrestricted discussion — the deliberate difference from `reviews`, which
 // stay gated to verified owners and carry a rating. A comment carries neither;

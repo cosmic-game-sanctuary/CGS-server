@@ -7,6 +7,7 @@ import { requireAuth } from "../middleware/auth.middleware.js";
 import { validate } from "../middleware/validate.middleware.js";
 import { asyncHandler } from "../lib/asyncHandler.js";
 import { Errors } from "../lib/errors.js";
+import { addToWishlist, announceDemandIfMilestone } from "../services/games/wishlist.js";
 import { param } from "../lib/params.js";
 import { privy } from "../services/privy/client.js";
 import { getAccountByEvmAddress } from "../services/hedera/mirror.js";
@@ -51,6 +52,13 @@ agentRouter.post(
         triggerPriceUnits,
       })
       .returning();
+
+    // An agent is the paid upgrade of a wishlist entry, so the game belongs on
+    // the list either way. Without this, setting an agent would quietly *not*
+    // show the game in the one place a person goes to see what they are
+    // waiting for.
+    await addToWishlist(game, req.auth!.id);
+    void announceDemandIfMilestone(game).catch(() => {});
 
     // Identity anchoring waits for the wallet to actually resolve on Hedera
     // (see the watcher) — the "nativeId" a real identity anchor names should

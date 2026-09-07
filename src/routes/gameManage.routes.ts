@@ -29,6 +29,7 @@ import { loadManageableGame } from "../services/studios/access.js";
 import { findGameByRef } from "../services/games/lookup.js";
 import { ingestBuild, commitBuild, listBuilds } from "../services/games/builds.js";
 import { announce, changePrice, priceHistory } from "../services/games/listing.js";
+import { notifyPriceDrop, wishlistCount } from "../services/games/wishlist.js";
 import { deleteBuild } from "../services/games/buildStore.js";
 import { gatewayUrl, pinFile, unpinByCid } from "../services/ipfs/pinata.js";
 import { checkImages } from "../services/moderation/csam.js";
@@ -132,6 +133,17 @@ gameManageRouter.patch(
     if (body.priceUnits !== undefined && body.priceUnits !== game.priceUnits) {
       priceChanged = await changePrice(updated, body.priceUnits, req.auth!.id);
       updated = priceChanged.game;
+
+      // The whole return path of a wishlist. Called here rather than inside
+      // changePrice so that listing.ts and wishlist.ts don't import each other;
+      // this route is the only thing that changes a price. Not awaited — it
+      // sends email, and a slow mail server must not hold up a price change
+      // that has already happened.
+      if (updated.status === "published" && body.priceUnits < game.priceUnits) {
+        void notifyPriceDrop(updated, game.priceUnits, body.priceUnits).catch((err) =>
+          logger.error({ err, gameId: game.id }, "notifying a price drop failed"),
+        );
+      }
     } else if (Object.keys(fields).length > 0 && updated.status === "published") {
       // Anything else that changed still belongs on the topic: the listing is
       // the message, so a listing that only changed here is a listing that
@@ -534,6 +546,9 @@ gameManageRouter.get(
         playtimeSeconds: sessions.reduce((sum, s) => sum + (s.durationSeconds ?? 0), 0),
         reviewCount: ratings.length,
         rating: ratings.length ? ratings.reduce((a, b) => a + b, 0) / ratings.length : 0,
+        // How many people are waiting for it. The number a developer wants
+        // before deciding whether a discount is worth running.
+        wishlisted: await wishlistCount(game.id),
         // Sales that never reached the collaborators. A team that cannot see
         // this finds out when someone asks where their money is.
         unsettledSplits: gameSales.filter((s) => s.splitStatus !== "distributed").length,

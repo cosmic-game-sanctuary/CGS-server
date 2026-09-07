@@ -78,6 +78,13 @@
       "when": 1788785488518,
       "tag": "0010_user_profiles",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1788786275087,
+      "tag": "0011_wishlist",
+      "breakpoints": true
     }
   ]
 }

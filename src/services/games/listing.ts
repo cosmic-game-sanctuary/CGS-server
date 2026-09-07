@@ -28,7 +28,10 @@ export type ListingEvent =
   | "price_changed"
   | "build_updated"
   | "delisted"
-  | "relisted";
+  | "relisted"
+  // How many people are waiting for this game. Public everywhere else it is
+  // private — see services/games/wishlist.ts#announceDemandIfMilestone.
+  | "demand";
 
 /** Events that state a price someone could act on. A delisting is not one. */
 const PRICE_BEARING: ListingEvent[] = ["listed", "price_changed", "build_updated", "relisted"];

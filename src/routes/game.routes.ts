@@ -13,7 +13,7 @@ import {
   notifications,
   users,
   playSessions,
-  likes,
+  wishlistItems,
   comments,
   gameBuilds,
 } from "../db/schema.js";
@@ -32,6 +32,13 @@ import { param, isUuid } from "../lib/params.js";
 import { assetDecimals, ensFullName, toDisplayAmount } from "../lib/display.js";
 import { authorSummaries, type AuthorSummary } from "../services/users/profile.js";
 import { findGameByRef } from "../services/games/lookup.js";
+import {
+  addToWishlist,
+  removeFromWishlist,
+  wishlistCount,
+  announceDemandIfMilestone,
+} from "../services/games/wishlist.js";
+import logger from "../utils/logger.utils.js";
 import { pinFile, gatewayUrl } from "../services/ipfs/pinata.js";
 import { ingestBuild, commitBuild } from "../services/games/builds.js";
 import { announce } from "../services/games/listing.js";
@@ -201,8 +208,8 @@ async function creditProfilesFor(splitRows: (typeof splits.$inferSelect)[]) {
 
 async function likeCountsFor(gameIds: string[]) {
   if (gameIds.length === 0) return new Map<string, number>();
-  const rows = await db.query.likes.findMany({
-    where: inArray(likes.gameId, gameIds),
+  const rows = await db.query.wishlistItems.findMany({
+    where: inArray(wishlistItems.gameId, gameIds),
     columns: { gameId: true },
   });
   const out = new Map<string, number>();
@@ -330,8 +337,8 @@ gameRouter.get(
     let liked: boolean | undefined;
     if (req.auth) {
       owned = (await ownsGame(req.auth.evmAddress, game.htsTokenId)).owned;
-      liked = !!(await db.query.likes.findFirst({
-        where: and(eq(likes.gameId, game.id), eq(likes.userId, req.auth.id)),
+      liked = !!(await db.query.wishlistItems.findFirst({
+        where: and(eq(wishlistItems.gameId, game.id), eq(wishlistItems.userId, req.auth.id)),
       }));
     }
 
@@ -350,6 +357,8 @@ gameRouter.get(
       media: media.map((m) => ({ id: m.id, kind: m.kind, cid: m.cid, position: m.position, url: gatewayUrl(m.cid) })),
       owned,
       liked,
+      // The same value under the name the list actually has now.
+      wishlisted: liked,
     });
   }),
 );
@@ -418,6 +427,7 @@ function serializeGame(
     // incremented it. See playSessions in db/schema.ts.
     plays: plays ?? 0,
     likeCount: likeCount ?? 0,
+    wishlistCount: likeCount ?? 0,
     buildKb: game.buildSizeKb,
   };
 }
@@ -1066,11 +1076,24 @@ gameRouter.post(
   }),
 );
 
-// --- likes ---------------------------------------------------------------
-// A toggle, not a growing log: liking twice unlikes. No ownership gate on
-// purpose — favoriting a game you haven't bought yet is normal (Steam
-// wishlists, itch.io favorites), unlike a review, which is a
-// verified-purchase signal.
+// --- the wishlist --------------------------------------------------------
+//
+// Three routes over one list. `POST /like` is the toggle the client already
+// calls and still works exactly as it did; the explicit add and remove exist
+// because a toggle is the wrong shape for a button that says "on your
+// wishlist" — pressing it twice by accident should not silently undo itself.
+//
+// No ownership gate anywhere here: saving a game you have not bought is the
+// entire point, unlike a review.
+
+/** The same body for all three, so the client updates state identically. */
+async function wishlistState(gameId: string, userId: string, onList: boolean) {
+  const count = await wishlistCount(gameId);
+  // `liked` and `likeCount` are the old names for exactly these two numbers.
+  // Kept so nothing already rendering them has to change on the same day the
+  // list gained a purpose.
+  return { wishlisted: onList, wishlistCount: count, liked: onList, likeCount: count };
+}
 
 gameRouter.post(
   "/:id/like",
@@ -1079,18 +1102,71 @@ gameRouter.post(
     const game = await findGameByRef(param(req, "id"));
     if (!game) throw Errors.notFound("Game");
 
-    const existing = await db.query.likes.findFirst({
-      where: and(eq(likes.gameId, game.id), eq(likes.userId, req.auth!.id)),
+    const existing = await db.query.wishlistItems.findFirst({
+      where: and(eq(wishlistItems.gameId, game.id), eq(wishlistItems.userId, req.auth!.id)),
     });
 
     if (existing) {
-      await db.delete(likes).where(eq(likes.id, existing.id));
+      await removeFromWishlist(game.id, req.auth!.id);
     } else {
-      await db.insert(likes).values({ gameId: game.id, userId: req.auth!.id });
+      await addToWishlist(game, req.auth!.id);
+      void announceDemandIfMilestone(game).catch((err) =>
+        logger.error({ err, gameId: game.id }, "announcing demand failed"),
+      );
     }
 
-    const rows = await db.query.likes.findMany({ where: eq(likes.gameId, game.id), columns: { id: true } });
-    res.json({ liked: !existing, likeCount: rows.length });
+    res.json(await wishlistState(game.id, req.auth!.id, !existing));
+  }),
+);
+
+gameRouter.post(
+  "/:id/wishlist",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const game = await findGameByRef(param(req, "id"));
+    if (!game) throw Errors.notFound("Game");
+
+    const { added } = await addToWishlist(game, req.auth!.id);
+    if (added) {
+      // Not awaited: a topic write takes seconds and the person clicked a
+      // heart. Failing to announce a milestone must not fail the save.
+      void announceDemandIfMilestone(game).catch((err) =>
+        logger.error({ err, gameId: game.id }, "announcing demand failed"),
+      );
+    }
+
+    res.status(added ? 201 : 200).json(await wishlistState(game.id, req.auth!.id, true));
+  }),
+);
+
+gameRouter.delete(
+  "/:id/wishlist",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const game = await findGameByRef(param(req, "id"));
+    if (!game) throw Errors.notFound("Game");
+    await removeFromWishlist(game.id, req.auth!.id);
+    res.json(await wishlistState(game.id, req.auth!.id, false));
+  }),
+);
+
+// Public, because that is the whole point of it.
+//
+// Wishlist numbers everywhere else are private platform data — Steam will not
+// give them away, because knowing what people want before they buy is the moat.
+// Here the count is on a public topic at every milestone, so a developer can
+// act on real demand and anyone can check the number independently.
+gameRouter.get(
+  "/:id/demand",
+  asyncHandler(async (req, res) => {
+    const game = await findGameByRef(param(req, "id"));
+    if (!game || game.status === "removed") throw Errors.notFound("Game");
+    res.json({
+      gameId: game.id,
+      wishlistCount: await wishlistCount(game.id),
+      announcedMilestone: game.demandMilestone,
+      topicId: env.HCS_LISTINGS_TOPIC ?? null,
+    });
   }),
 );
 
