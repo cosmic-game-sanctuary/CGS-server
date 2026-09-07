@@ -29,7 +29,11 @@ const app: Express = express();
 
 app.use(helmet());
 app.use(cors({ origin: env.CORS_ORIGIN.split(",").map((o) => o.trim()) }));
-app.use(express.json({ limit: "1mb" })); // doesn't touch multipart — multer parses that per route
+// Raised from 1mb for cloud saves: a 512KB save plus JSON escaping does not fit
+// under 1mb, and the parser runs before any route so a per-route limit would
+// never be reached. Still nowhere near a build upload, which is multipart and
+// handled by multer per route rather than here.
+app.use(express.json({ limit: "2mb" }));
 app.use(httpLogger);
 app.use(generalLimiter);
 

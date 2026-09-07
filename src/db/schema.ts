@@ -465,6 +465,44 @@ export const comments = pgTable("comments", {
   editedAt: timestamp("edited_at", { withTimezone: true }),
 });
 
+// A browser game's progress, kept somewhere that isn't one browser.
+//
+// Builds run sandboxed on their own origin, so whatever a game writes to
+// localStorage or IndexedDB lives in *that browser on that machine*. Clear site
+// data, switch laptop, open it on a phone: the save is gone. Steam solved this
+// with Cloud Saves and it is table stakes for anything you expect people to
+// come back to — for browser games it matters more, not less, because the
+// storage is more fragile.
+//
+// The data is opaque to us. It is whatever the client dumped out of the game's
+// own storage, and it is never parsed here; `checksum` is what lets the client
+// prove it got back what it put in, and `version` is what lets two devices
+// notice they disagree instead of one silently overwriting the other.
+export const saveStates = pgTable(
+  "save_states",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    gameId: uuid("game_id").notNull().references(() => games.id),
+    userId: uuid("user_id").notNull().references(() => users.id),
+    // Several, because "one save per game" is a rule about our storage and not
+    // about how anyone actually plays.
+    slot: integer("slot").notNull().default(0),
+    label: text("label"),
+    data: text("data").notNull(),
+    sizeBytes: integer("size_bytes").notNull(),
+    checksum: text("checksum").notNull(),
+    // Which machine wrote it, as the person named it. Purely so a conflict can
+    // be described in words someone recognises rather than as two timestamps.
+    device: text("device"),
+    // Bumped on every write. A client that sends the version it started from
+    // gets a conflict instead of quietly clobbering a newer save.
+    version: integer("version").notNull().default(1),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [uniqueIndex("save_states_game_user_slot_idx").on(table.gameId, table.userId, table.slot)],
+);
+
 // the audit trail Stage 4 asked for: one row per settled purchase, independent
 // of whether the split that pays the dev team actually went out. Without this
 // table a failed split had nowhere to be recorded or retried from — it just

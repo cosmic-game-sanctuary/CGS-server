@@ -85,6 +85,13 @@
       "when": 1788786275087,
       "tag": "0011_wishlist",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1788786673893,
+      "tag": "0012_cloud_saves",
+      "breakpoints": true
     }
   ]
 }

@@ -18,6 +18,7 @@ import {
   notifications,
   users,
   wishlistAgents,
+  saveStates,
 } from "../db/schema.js";
 import { requireAuth } from "../middleware/auth.middleware.js";
 import { validate } from "../middleware/validate.middleware.js";
@@ -372,6 +373,7 @@ gameManageRouter.delete(
     // Rows first, in foreign-key order. Storage after, because a failed unpin
     // should not leave an undeletable draft behind — an orphaned pin costs
     // nothing, a row nobody can remove costs a permanent piece of clutter.
+    await db.delete(saveStates).where(eq(saveStates.gameId, game.id));
     await db.delete(playSessions).where(eq(playSessions.gameId, game.id));
     await db.delete(likes).where(eq(likes.gameId, game.id));
     await db.delete(comments).where(eq(comments.gameId, game.id));

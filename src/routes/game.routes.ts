@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Router, type Request } from "express";
 import { and, desc, asc, eq, or, ilike, inArray, isNotNull, lt, sql } from "drizzle-orm";
 import { z } from "zod";
 import multer from "multer";
@@ -32,6 +32,14 @@ import { param, isUuid } from "../lib/params.js";
 import { assetDecimals, ensFullName, toDisplayAmount } from "../lib/display.js";
 import { authorSummaries, type AuthorSummary } from "../services/users/profile.js";
 import { findGameByRef } from "../services/games/lookup.js";
+import {
+  listSaves,
+  readSave,
+  writeSave,
+  deleteSave,
+  MAX_SLOTS,
+  MAX_SAVE_BYTES,
+} from "../services/games/saves.js";
 import {
   addToWishlist,
   removeFromWishlist,
@@ -1232,6 +1240,86 @@ gameRouter.patch(
       .returning();
 
     res.json(updated);
+  }),
+);
+
+// --- cloud saves -----------------------------------------------------------
+//
+// A build runs sandboxed on its own origin, so anything it writes to
+// localStorage or IndexedDB belongs to that browser on that machine. Clearing
+// site data or opening the game on a phone loses it. These four routes are the
+// somewhere-else it can live.
+//
+// Gated the same way play sessions are, and for the same reason: a paid game
+// needs entitlement, a free one does not, and the check uses `hasEntitlement`
+// rather than the chain alone so the first save of a fresh purchase is not
+// refused in the seconds before the GameKey lands.
+
+async function saveGameFor(req: Request) {
+  const game = await findGameByRef(param(req, "id"));
+  if (!game) throw Errors.notFound("Game");
+  if (game.status === "removed") throw Errors.notFound("Game");
+  if (game.priceUnits > 0) {
+    const { owned } = await hasEntitlement(req.auth!.evmAddress, game);
+    if (!owned) throw Errors.notOwner("You need to own this game to sync its saves.");
+  }
+  return game;
+}
+
+gameRouter.get(
+  "/:id/saves",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const game = await saveGameFor(req);
+    res.json({
+      slots: await listSaves(game.id, req.auth!.id),
+      maxSlots: MAX_SLOTS,
+      maxBytes: MAX_SAVE_BYTES,
+    });
+  }),
+);
+
+gameRouter.get(
+  "/:id/saves/:slot",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const game = await saveGameFor(req);
+    const save = await readSave(game.id, req.auth!.id, Number(param(req, "slot")));
+    if (!save) throw Errors.notFound("Save");
+    res.json(save);
+  }),
+);
+
+const putSaveSchema = z.object({
+  // Opaque. Whatever the client dumped out of the game's own storage — we never
+  // parse it, which is what keeps this working for any engine.
+  data: z.string().min(1),
+  label: z.string().max(60).nullable().optional(),
+  device: z.string().max(60).nullable().optional(),
+  // The version the client last read. Sending it turns a blind overwrite into a
+  // detectable conflict — see services/games/saves.ts#writeSave.
+  baseVersion: z.number().int().nonnegative().optional(),
+});
+
+gameRouter.put(
+  "/:id/saves/:slot",
+  requireAuth,
+  validate(putSaveSchema),
+  asyncHandler(async (req, res) => {
+    const game = await saveGameFor(req);
+    const body = req.body as z.infer<typeof putSaveSchema>;
+    const result = await writeSave(game, req.auth!.id, Number(param(req, "slot")), body);
+    res.status(result.created ? 201 : 200).json(result);
+  }),
+);
+
+gameRouter.delete(
+  "/:id/saves/:slot",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const game = await saveGameFor(req);
+    const removed = await deleteSave(game.id, req.auth!.id, Number(param(req, "slot")));
+    res.json({ deleted: removed, slot: Number(param(req, "slot")) });
   }),
 );
 
