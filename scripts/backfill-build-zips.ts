@@ -6,7 +6,12 @@
  * `--file` form below pins it from wherever you are.
  *
  *   npm run builds:backfill                          list and pin what's local
- *   npm run builds:backfill -- --file ./x.zip --slug deadzone
+ *   npm run builds:backfill -- --file x.zip --slug deadzone
+ *
+ * A bare filename is looked up in `BUILD_INBOX` (default `storage/incoming`),
+ * which sits under the already-gitignored storage directory — a build is tens
+ * of megabytes and has no business anywhere near a commit. An absolute or
+ * relative path still works if you'd rather point at one directly.
  *
  * Uploads are retried, and one failure never stops the rest: a 20-odd MB
  * upload over a flaky link fails as a bare `TypeError: fetch failed` with no
@@ -18,6 +23,7 @@ import path from "node:path";
 import { db } from "../src/db/client.js";
 import { games } from "../src/db/schema.js";
 import { pinFile } from "../src/services/ipfs/pinata.js";
+import { env } from "../src/config/env.js";
 
 const ROOT = path.resolve(process.cwd(), "storage", "builds");
 
@@ -72,12 +78,20 @@ async function main() {
       console.error(`no game with slug "${slug}".`);
       process.exit(1);
     }
-    const zip = await readFile(path.resolve(file));
+    // A bare name comes from the inbox; anything with a separator is taken as
+    // given, so pointing at a file elsewhere still works.
+    const target = file.includes("/") || file.includes("\\") || path.isAbsolute(file)
+      ? path.resolve(file)
+      : path.resolve(process.cwd(), env.BUILD_INBOX, file);
+    const zip = await readFile(target).catch(() => {
+      console.error(`can't read ${target}`);
+      process.exit(1);
+    }) as Buffer;
     if (zip.subarray(0, 2).toString() !== "PK") {
       console.error(`${file} is not a zip.`);
       process.exit(1);
     }
-    console.log(`pinning ${file} for ${slug}...`);
+    console.log(`pinning ${target} for ${slug}...`);
     process.exit((await pinFor(game, zip)) ? 0 : 1);
   }
 
@@ -114,7 +128,7 @@ async function main() {
   if (missing.length > 0) {
     console.log(`\nNo copy here. Run this where they were published, or have someone send you the`);
     console.log(`zip and pin it directly:`);
-    for (const m of missing) console.log(`  npm run builds:backfill -- --file ./${m}.zip --slug ${m}`);
+    for (const m of missing) console.log(`  npm run builds:backfill -- --file <that>.zip --slug ${m}`);
   }
   if (failed.length > 0) {
     console.log(`\nUpload failed after retries (usually the connection, not the file). Just run`);

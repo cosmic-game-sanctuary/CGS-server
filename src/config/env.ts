@@ -107,6 +107,11 @@ const envSchema = z.object({
   // as broken cover art and a game that never boots — see services/ipfs/pinata.ts.
   PINATA_GATEWAY: z.string().optional(),
 
+  // Where to look for a build zip someone sent you, for `builds:backfill
+  // --file`. Under storage/ so it is already gitignored — a build is tens of
+  // megabytes and has no business near a commit.
+  BUILD_INBOX: z.string().default("storage/incoming"),
+
   // Email. Optional on purpose: without a key nothing is sent and every send
   // is logged instead, so a missing key degrades to silence rather than to a
   // crash on a path that is never the point of the request that triggered it.
