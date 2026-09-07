@@ -46,7 +46,12 @@ async function main() {
     }
 
     const sold = await db.query.sales.findMany({ where: eq(sales.gameId, game.id), columns: { id: true } });
-    await db.update(games).set({ status: "delisted" }).where(eq(games.id, game.id));
+    // Marked as a moderation delisting: this script is an operator tool, and
+    // POST /api/games/:id/relist deliberately refuses to undo one of those.
+    await db
+      .update(games)
+      .set({ status: "delisted", delistedBy: "moderation", updatedAt: new Date() })
+      .where(eq(games.id, game.id));
     console.log(
       `  ok    ${slug} delisted` +
         (sold.length > 0 ? ` — ${sold.length} buyer(s) keep their key and can still play it` : ""),

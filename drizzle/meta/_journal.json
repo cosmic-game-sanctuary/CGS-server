@@ -64,6 +64,13 @@
       "when": 1788761290461,
       "tag": "0008_faulty_vin_gonzales",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1788784550321,
+      "tag": "0009_game_versioning",
+      "breakpoints": true
     }
   ]
 }

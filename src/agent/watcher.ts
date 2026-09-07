@@ -60,10 +60,18 @@ async function tickOne(agent: Agent) {
   for (const msg of messages) {
     lastSeq = Math.max(lastSeq, msg.sequence_number);
     const listing = JSON.parse(Buffer.from(msg.message, "base64").toString("utf8")) as {
+      type?: string;
       gameId?: string;
-      priceUnits?: number;
+      priceUnits?: number | null;
     };
-    if (listing.gameId === agent.targetGameId && (listing.priceUnits ?? Infinity) <= agent.triggerPriceUnits) {
+    // A delisting carries `priceUnits: null` rather than a stale number, and a
+    // reader that treated every message as an offer would buy a game that
+    // stopped being for sale. Only a message actually stating a price counts —
+    // messages written before `type` existed have no type and a real price,
+    // and still read correctly here.
+    if (listing.gameId !== agent.targetGameId) continue;
+    if (typeof listing.priceUnits !== "number") continue;
+    if (listing.priceUnits <= agent.triggerPriceUnits) {
       triggered = true;
     }
   }

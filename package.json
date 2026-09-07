@@ -16,7 +16,9 @@
     "seed:dev": "tsx scripts/seed-dev.ts",
     "seed:wipe": "tsx scripts/seed-dev.ts --wipe",
     "builds:backfill": "tsx scripts/backfill-build-zips.ts",
-    "game:delist": "tsx scripts/delist-game.ts"
+    "game:delist": "tsx scripts/delist-game.ts",
+    "listings:retry": "tsx scripts/retry-announcements.ts",
+    "builds:backfill-versions": "tsx scripts/backfill-build-versions.ts"
   },
   "repository": {
     "type": "git",

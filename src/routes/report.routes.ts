@@ -32,8 +32,14 @@ reportRouter.post(
       .values({ gameId, reporterUserId: req.auth!.id, reason })
       .returning();
 
+    // `delistedBy` is what stops the developer relisting their way out of a
+    // report: POST /api/games/:id/relist only undoes a delisting the developer
+    // did themselves. Without it, "unlist" then "relist" is a one-click bypass.
     if (game.status === "published") {
-      await db.update(games).set({ status: "delisted" }).where(eq(games.id, gameId));
+      await db
+        .update(games)
+        .set({ status: "delisted", delistedBy: "moderation", updatedAt: new Date() })
+        .where(eq(games.id, gameId));
     }
 
     res.status(201).json(report);

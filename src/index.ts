@@ -11,6 +11,7 @@ import hederaClient from "./services/hedera/client.js";
 import { pingMirror } from "./services/hedera/mirror.js";
 
 import gameRouter from "./routes/game.routes.js";
+import gameManageRouter from "./routes/gameManage.routes.js";
 import studioRouter from "./routes/studio.routes.js";
 import inviteRouter from "./routes/invite.routes.js";
 import notificationRouter from "./routes/notification.routes.js";
@@ -36,6 +37,10 @@ app.get("/health", async (_req: Request, res: Response) => {
   res.json({ ok: dbReachable && mirrorReachable, network: env.HEDERA_NETWORK, operatorId: hederaClient.operatorAccountId?.toString() ?? null, mirrorReachable, dbReachable });
 });
 
+// Before gameRouter, so its PATCH/DELETE/:id and /:id/builds land before the
+// catalog's own "/:idOrSlug" gets a chance at them. Same prefix, different
+// audience — see routes/gameManage.routes.ts.
+app.use("/api/games", gameManageRouter);
 app.use("/api/games", gameRouter);
 app.use("/api/studios", studioRouter);
 app.use("/api/invites", inviteRouter);

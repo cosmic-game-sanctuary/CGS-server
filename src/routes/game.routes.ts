@@ -15,6 +15,7 @@ import {
   playSessions,
   likes,
   comments,
+  gameBuilds,
 } from "../db/schema.js";
 import { truncateAddress } from "../lib/address.js";
 import { requireAuth, optionalAuth } from "../middleware/auth.middleware.js";
@@ -25,12 +26,13 @@ import { slugify, withSuffix } from "../lib/slug.js";
 import { ownsGame } from "../services/games/ownership.js";
 import { hasEntitlement } from "../services/games/entitlement.js";
 import { grantAccess, buildPathFor } from "../services/games/download.js";
-import { findBuild, saveBuild } from "../services/games/buildStore.js";
+import { findBuild } from "../services/games/buildStore.js";
 import { env } from "../config/env.js";
 import { param, isUuid } from "../lib/params.js";
 import { assetDecimals, ensFullName, toDisplayAmount } from "../lib/display.js";
-import { unpackBuild } from "../services/ipfs/unpack.js";
-import { pinDirectory, pinFile, gatewayUrl } from "../services/ipfs/pinata.js";
+import { pinFile, gatewayUrl } from "../services/ipfs/pinata.js";
+import { ingestBuild, commitBuild } from "../services/games/builds.js";
+import { announce } from "../services/games/listing.js";
 import {
   resourceServer,
   ensureInitialized,
@@ -40,10 +42,8 @@ import {
 import { fulfilPurchase } from "../services/games/fulfil.js";
 import { getAccountByEvmAddress } from "../services/hedera/mirror.js";
 import { preparePayment, completePayment } from "../services/x402/pay.js";
-import { checkImages } from "../services/moderation/csam.js";
 import { emailStudioInvite } from "../services/email/messages.js";
 import { createGameToken } from "../services/hedera/hts.js";
-import { submitTopicMessage } from "../services/hedera/hcs.js";
 
 const gameRouter = Router({ caseSensitive: true, strict: true });
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
@@ -321,6 +321,14 @@ function serializeGame(
     coverUrl: game.coverCid ? gatewayUrl(game.coverCid) : null,
     coverSeed: game.coverSeed,
     publishedAt: game.publishedAt,
+    // The listing's own state, which nothing outside the studio page could see
+    // before. A client rendering a game it may be allowed to manage needs to
+    // know whether it is a draft, live, or unlisted — and `updatedAt` is what a
+    // "recently updated" shelf sorts on.
+    status: game.status,
+    updatedAt: game.updatedAt,
+    buildVersion: game.buildVersion,
+    delistedBy: game.delistedBy,
     splits: gameSplits.map((s) => ({ handle: s.handle, role: s.role, pct: s.pct })),
     rating: rating?.rating ?? 0,
     reviewCount: rating?.reviewCount ?? 0,
@@ -378,6 +386,9 @@ const publishGameSchema = z.object({
   priceUnits: z.coerce.number().int().nonnegative(),
   priceAsset: z.string().default(env.X402_ASSET),
   coverMediaIndex: z.coerce.number().int().nonnegative().optional(),
+  // What the developer calls this first build — "v18", "1.0". Optional, and
+  // free text: a version number we invented would not be the one in their notes.
+  buildLabel: z.string().max(40).optional(),
   splits: z
     .string()
     .transform((s, ctx) => {
@@ -389,8 +400,6 @@ const publishGameSchema = z.object({
       }
     }),
 });
-
-const IMAGE_MIME = /^image\//;
 
 type SplitInput = z.infer<typeof splitSchema>;
 type ResolvedSplit = {
@@ -499,36 +508,19 @@ gameRouter.post(
       throw Errors.validationFailed({ coverMediaIndex: "out of range for the uploaded media" });
     }
 
-    const buildFiles = await unpackBuild(files.build[0]!.buffer);
-
-    // fails closed: nothing below this point runs — nothing gets pinned,
-    // nothing gets inserted — until this passes. See services/moderation/csam.ts.
-    const imagesToCheck = [
-      ...mediaFiles.map((f) => f.buffer),
-      ...buildFiles.filter((f) => IMAGE_MIME.test(f.mimeType ?? "")).map((f) => f.buffer),
-    ];
-    const csam = await checkImages(imagesToCheck);
-    if (!csam.pass) {
-      throw new AppError(422, "MODERATION_BLOCKED", "This upload can't be accepted yet.", {
-        reason: csam.reason,
-      });
-    }
-
     let slug = slugify(body.title);
     if (await db.query.games.findFirst({ where: eq(games.slug, slug) })) slug = withSuffix(slug);
 
-    // Pinned twice, on purpose, and they answer different questions. The
-    // directory is what the build *is* — that CID goes on the listing and into
-    // the HCS message, and it is what someone else can verify against. The zip
-    // is how it gets delivered: Pinata's public gateway refuses HTML, so the
-    // directory 403s in a browser while application/zip serves normally.
-    // Without the second one a build only exists on the disk that made it.
-    const [buildCid, buildZipCid] = await Promise.all([
-      pinDirectory(buildFiles),
-      pinFile(files.build[0]!.buffer, `${slug}-build.zip`, "application/zip"),
-    ]);
-    const buildSizeKb = Math.round(buildFiles.reduce((sum, f) => sum + f.buffer.length, 0) / 1024);
-    const buildZip = files.build[0]!.buffer;
+    // Unpack, moderate, pin — one function, and the same one every later build
+    // version goes through (services/games/builds.ts). It fails closed: nothing
+    // is pinned and nothing is inserted until the check passes, and the
+    // screenshots go through that same single check, which is why they are
+    // handed in here rather than checked separately afterwards.
+    const artifacts = await ingestBuild(
+      files.build[0]!.buffer,
+      slug,
+      mediaFiles.map((f) => f.buffer),
+    );
 
     const mediaCids = await Promise.all(
       mediaFiles.map((f) => pinFile(f.buffer, f.originalname, f.mimetype)),
@@ -546,18 +538,19 @@ gameRouter.post(
         tags: body.tags,
         coverCid,
         coverSeed: Math.floor(Math.random() * 1_000_000),
-        buildCid,
-        buildZipCid,
-        buildSizeKb,
+        buildCid: artifacts.buildCid,
+        buildZipCid: artifacts.buildZipCid,
+        buildSizeKb: artifacts.buildSizeKb,
         priceUnits: body.priceUnits,
         priceAsset: body.priceAsset,
         status: "draft",
       })
       .returning();
 
-    // Keep the zip. The CID above is what the build *is*; this is the only
-    // thing that can put it in front of a player. See services/games/buildStore.ts.
-    await saveBuild(game!.id, buildZip);
+    // Version 1, recorded the same way version 2 will be: a row in the build
+    // history, the mirror of it on `games`, and the zip kept where it can
+    // actually be served. See services/games/builds.ts.
+    await commitBuild(game!.id, artifacts, { label: body.buildLabel });
 
     // Resolve each share to whoever it belongs to, creating the studio
     // membership for anyone named only by email. That row *is* the invite —
@@ -637,16 +630,16 @@ gameRouter.post(
       .where(eq(games.id, game.id))
       .returning();
 
-    await submitTopicMessage(env.HCS_LISTINGS_TOPIC!, {
-      gameId: game.id,
-      slug: game.slug,
-      title: game.title,
-      studioId: game.studioId,
-      priceUnits: game.priceUnits,
-      priceAsset: game.priceAsset,
-      tokenId,
-      publishedAt: published!.publishedAt,
-    });
+    // The listing *is* this message — see services/games/listing.ts. Sent
+    // through the same helper every later change uses, so a publish and a price
+    // change put the same shape on the topic.
+    const hcsTxId = await announce(published!, "listed");
+    if (hcsTxId) {
+      await db
+        .update(gameBuilds)
+        .set({ hcsTxId })
+        .where(and(eq(gameBuilds.gameId, game.id), eq(gameBuilds.version, published!.buildVersion)));
+    }
 
     const members = await db.query.studioMembers.findMany({
       where: and(eq(studioMembers.studioId, game.studioId), isNotNull(studioMembers.userId)),

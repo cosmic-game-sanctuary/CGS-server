@@ -75,6 +75,10 @@ export const notificationTypeEnum = pgEnum("notification_type", [
   // but we still don't close it — the buyer decides that, and their money is
   // sitting in it.
   "agent_target_gone",
+  // A game you own shipped a patch. The argument for owning a key rather than
+  // a download is that the key keeps being worth something; this is the moment
+  // that becomes visible.
+  "build_updated",
 ]);
 
 export const users = pgTable("users", {
@@ -144,9 +148,23 @@ export const games = pgTable("games", {
   priceUnits: bigint("price_units", { mode: "number" }).notNull().default(0),
   priceAsset: text("price_asset").notNull(),
   status: gameStatusEnum("status").notNull().default("draft"),
+  // Who took it out of the catalog, when something did. "developer" is a
+  // choice and can be undone by the person who made it; "moderation" is not
+  // theirs to undo. Both land in the same `delisted` status because the effect
+  // on a buyer is identical — their key still works either way — but a relist
+  // endpoint has to be able to tell them apart.
+  delistedBy: text("delisted_by"),
   htsTokenId: text("hts_token_id"),
+  // The build currently being served. Every version ever published is a row in
+  // `gameBuilds`; the columns above always mirror whichever one is current, so
+  // nothing that serves a build had to learn about versions.
+  buildVersion: integer("build_version").notNull().default(1),
   publishedAt: timestamp("published_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  // Distinct from createdAt and from publishedAt: the last time anything about
+  // this listing changed — a price, a description, a new build. It is what a
+  // "recently updated" shelf sorts on.
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
 export const gameMedia = pgTable("game_media", {
@@ -155,6 +173,58 @@ export const gameMedia = pgTable("game_media", {
   kind: mediaKindEnum("kind").notNull(),
   cid: text("cid").notNull(),
   position: integer("position").notNull().default(0),
+});
+
+// Every build ever published for a game, oldest first by `version`.
+//
+// A game used to have exactly one build, forever. Games get patched — the
+// build this was tested against was literally named "v18" — and with no
+// version concept the only way to ship a fix was to publish a second game,
+// which splits its reviews, its sales and its owners across two listings.
+// Buyers hold a key to a game rather than a copy of one file, so the patch is
+// theirs; that is the entire argument for a key over a download.
+//
+// The rows here are append-only and each carries its own CID, so the history
+// of what a game *was* stays verifiable even after it changes. `games` mirrors
+// whichever row is current, which is why nothing that serves a build had to
+// learn about this table.
+export const gameBuilds = pgTable(
+  "game_builds",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    gameId: uuid("game_id").notNull().references(() => games.id),
+    version: integer("version").notNull(),
+    // What the developer calls it — "v18", "1.0.2", "post-jam". Free text
+    // because a version number that we invent is not the one in their notes.
+    label: text("label"),
+    notes: text("notes"),
+    buildCid: text("build_cid").notNull(),
+    buildZipCid: text("build_zip_cid"),
+    buildSizeKb: integer("build_size_kb"),
+    // The HCS message announcing this version. Null for versions recorded
+    // before the game was published, which were never announced.
+    hcsTxId: text("hcs_tx_id"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [uniqueIndex("game_builds_game_version_idx").on(table.gameId, table.version)],
+);
+
+// One row per price change, each carrying the HCS message that announced it.
+//
+// Every storefront could show a price history and none of them can make it
+// credible, because they all own the database it lives in. Ours is a local
+// index of messages already on a public topic: `hcsTxId` is checkable on the
+// mirror node by someone who does not trust this table at all. That is the
+// only reason it is worth storing separately from `games.price_units`.
+export const gamePriceChanges = pgTable("game_price_changes", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  gameId: uuid("game_id").notNull().references(() => games.id),
+  fromUnits: bigint("from_units", { mode: "number" }).notNull(),
+  toUnits: bigint("to_units", { mode: "number" }).notNull(),
+  asset: text("asset").notNull(),
+  changedByUserId: uuid("changed_by_user_id").references(() => users.id),
+  hcsTxId: text("hcs_tx_id"),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
 // immutable once the game is published. no edit endpoint touches this table

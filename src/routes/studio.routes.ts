@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { and, eq, isNotNull, or } from "drizzle-orm";
+import { and, eq, or } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "../db/client.js";
 import { studios, studioMembers, games, users } from "../db/schema.js";
@@ -16,6 +16,7 @@ import { isSubnameAvailable, registerStudioSubname } from "../services/ens/regis
 import { env } from "../config/env.js";
 import { emailStudioInvite } from "../services/email/messages.js";
 import { studioEarnings } from "../services/earnings/report.js";
+import { isStudioMember } from "../services/studios/access.js";
 
 const studioRouter = Router({ caseSensitive: true, strict: true });
 
@@ -259,18 +260,5 @@ studioRouter.get(
     res.json(report);
   }),
 );
-
-/** Has this person accepted an invite to this studio? */
-async function isStudioMember(studioId: string, userId: string | undefined): Promise<boolean> {
-  if (!userId) return false;
-  const row = await db.query.studioMembers.findFirst({
-    where: and(
-      eq(studioMembers.studioId, studioId),
-      eq(studioMembers.userId, userId),
-      isNotNull(studioMembers.acceptedAt),
-    ),
-  });
-  return row !== undefined;
-}
 
 export default studioRouter;
