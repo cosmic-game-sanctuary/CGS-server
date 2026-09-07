@@ -18,7 +18,18 @@ const notificationRouter = Router({ caseSensitive: true, strict: true });
 // decimals to derive one live only here — same reasoning as `priceUsd` on a
 // game (lib/display.ts). Done on read rather than at write time so rows
 // already in the table get it too.
-const UNIT_FIELDS = ["shareUnits", "priceUnits", "triggerPriceUnits"] as const;
+const UNIT_FIELDS = [
+  "shareUnits",
+  "priceUnits",
+  "triggerPriceUnits",
+  // Money that could not be paid at settlement, and the moment it finally was.
+  "heldUnits",
+  "amountUnits",
+  // What a wishlisted game used to cost, and what it cost when it was saved.
+  // A price drop is only worth reading as the difference between them.
+  "fromUnits",
+  "savedAtUnits",
+] as const;
 
 function withDisplayAmounts(payload: unknown): unknown {
   if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return payload;
