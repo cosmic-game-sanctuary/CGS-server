@@ -39,6 +39,7 @@ export type WithdrawIntent = {
   toAccountId: string;
   asset: string;
   amountUnits: string;
+  memo: string | null;
   frozenTx: string;
   hashes: string[];
   expiresAt: number;
@@ -65,6 +66,7 @@ export async function prepareWithdraw(input: {
   toAccountId: string;
   asset: string;
   amountUnits: bigint;
+  memo?: string | null;
 }): Promise<WithdrawIntent> {
   const now = Date.now();
   for (const [id, held] of intents) if (held.expiresAt <= now) intents.delete(id);
@@ -81,6 +83,11 @@ export async function prepareWithdraw(input: {
     tx.addTokenTransfer(token, from, -input.amountUnits);
     tx.addTokenTransfer(token, to, input.amountUnits);
   }
+
+  // Exchanges run pooled deposit accounts and use the memo to work out whose
+  // deposit it is — the same mechanic as an XRP tag or a Stellar memo. Sending
+  // to one without it is how people lose money, so it has to be passable.
+  if (input.memo) tx.setTransactionMemo(input.memo);
 
   // The operator, so the person withdrawing needs no HBAR of their own.
   tx.setTransactionId(TransactionId.generate(AccountId.fromString(env.HEDERA_OPERATOR_ID)));
@@ -101,6 +108,7 @@ export async function prepareWithdraw(input: {
     toAccountId: input.toAccountId,
     asset: input.asset,
     amountUnits: input.amountUnits.toString(),
+    memo: input.memo ?? null,
     frozenTx: Buffer.from(frozen).toString("base64"),
     hashes: await signingHashes(frozen),
     expiresAt: now + TTL_MS,

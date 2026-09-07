@@ -57,6 +57,13 @@
       "when": 1788756728844,
       "tag": "0007_lumpy_spiral",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1788761290461,
+      "tag": "0008_faulty_vin_gonzales",
+      "breakpoints": true
     }
   ]
 }

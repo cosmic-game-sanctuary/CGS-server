@@ -31,8 +31,17 @@ export const agentStatusEnum = pgEnum("agent_status", [
   "draft",
   "funded",
   "watching",
+  // A momentary claim, not a resting state. Exactly one caller can move a row
+  // into it, which is what makes a double purchase impossible when a message
+  // is replayed or two processes both see the same price drop.
+  "buying",
+  // A waiting state, not a failure. The price was met and the wallet was
+  // short, so it keeps watching and keeps re-checking. An agent is never
+  // closed by us — only buying the game or the buyer cancelling ends one.
+  "underfunded",
   "fired",
   "failed",
+  "cancelled",
 ]);
 export const reportActionEnum = pgEnum("report_action", [
   "none",
@@ -59,6 +68,13 @@ export const notificationTypeEnum = pgEnum("notification_type", [
   // learned it existed, and the studio never learned a teammate was unpaid.
   "payout_held",
   "payout_settled",
+  "agent_underfunded",
+  "agent_cancelled",
+  "agent_failed",
+  // The game an agent is watching stopped being for sale. It cannot fire now,
+  // but we still don't close it — the buyer decides that, and their money is
+  // sitting in it.
+  "agent_target_gone",
 ]);
 
 export const users = pgTable("users", {
@@ -224,10 +240,39 @@ export const wishlistAgents = pgTable("wishlist_agents", {
   triggerPriceUnits: bigint("trigger_price_units", { mode: "number" }).notNull(),
   hcs14Aid: text("hcs14_aid"),
   status: agentStatusEnum("status").notNull().default("draft"),
-  // persisted cursor so the watcher can restart without re-reading the whole
-  // topic or missing a message.
+  // Dead since the listener replaced the poller: the cursor is shared now and
+  // lives in `listenerState`. Kept rather than dropped only because removing a
+  // column mid-migration needs an interactive rename/drop answer; nothing
+  // reads it.
   lastSeenSequence: integer("last_seen_sequence").notNull().default(0),
+  // The price it last saw and could not afford. Kept so a top-up can complete
+  // the purchase without waiting for another price message, which may never
+  // come.
+  pendingPriceUnits: bigint("pending_price_units", { mode: "number" }),
+  // Drives the sweep's backoff. Agents abandoned without funding stay
+  // underfunded forever by design, so checking every one of them every minute
+  // would grow without bound; the longer one has waited, the less often it is
+  // looked at.
+  underfundedSince: timestamp("underfunded_since", { withTimezone: true }),
+  lastBalanceCheckAt: timestamp("last_balance_check_at", { withTimezone: true }),
+  // So a stuck agent is mentioned once rather than on every price change.
+  notifiedShortfallUnits: bigint("notified_shortfall_units", { mode: "number" }),
+  underfundedNotifiedAt: timestamp("underfunded_notified_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+// Where the listener got to on the listings topic.
+//
+// One row. The cursor is shared rather than per agent because every agent
+// watches the same topic: reading it once per agent made cost grow with the
+// number of agents and hit the mirror node's rate limit at around 25 of them.
+// A consensus timestamp rather than a sequence number, because that is what
+// TopicMessageQuery.setStartTime() resumes from after a restart.
+export const listenerState = pgTable("listener_state", {
+  id: integer("id").primaryKey().default(1),
+  topicId: text("topic_id").notNull(),
+  lastConsensusAt: timestamp("last_consensus_at", { withTimezone: true }),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
 export const moderationReports = pgTable("moderation_reports", {

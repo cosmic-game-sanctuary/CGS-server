@@ -237,6 +237,10 @@ const withdrawSchema = z.object({
   // Omit to send the whole balance, which is what "take my money out" usually
   // means and saves the client doing arithmetic on a number it shouldn't.
   amountUnits: z.string().regex(/^\d+$/).optional(),
+  // Required by every exchange deposit address, which are pooled accounts that
+  // use it to tell whose money arrived. Sending to one without it is the
+  // classic way to lose a withdrawal, so it has to be offered.
+  memo: z.string().max(100).optional(),
 });
 
 meRouter.post(
@@ -245,7 +249,7 @@ meRouter.post(
   validate(withdrawSchema),
   asyncHandler(async (req, res) => {
     const auth = req.auth!;
-    const { to, asset, amountUnits } = req.body as z.infer<typeof withdrawSchema>;
+    const { to, asset, amountUnits, memo } = req.body as z.infer<typeof withdrawSchema>;
 
     const from = await resolveHederaAccount(auth);
     if (!from) throw Errors.walletNotFunded("There is nothing in this wallet to withdraw yet.");
@@ -281,6 +285,7 @@ meRouter.post(
       toAccountId,
       asset,
       amountUnits: amount,
+      memo,
     });
 
     res.json({
@@ -289,6 +294,7 @@ meRouter.post(
       to: toAccountId,
       asset,
       amountUnits: intent.amountUnits,
+      memo: intent.memo,
       amountDisplay: toDisplayAmount(Number(intent.amountUnits), asset),
       assetDecimals: assetDecimals(asset),
       expiresAt: new Date(intent.expiresAt).toISOString(),
