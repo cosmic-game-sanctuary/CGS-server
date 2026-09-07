@@ -12,6 +12,8 @@ This repo is the API, the chain integration, and the wishlist agent. The storefr
 
 **The wishlist agent reads the public HCS topic, not our database.** See [`src/agent/watcher.ts`](src/agent/watcher.ts) — it polls the Mirror Node the same way any outside program could, because that's the point. It has its own wallet, its own on-chain identity (HCS-14), and its balance is its entire spending cap. Nothing else limits it, because nothing else needs to.
 
+**Every price change, and how many people wishlisted a game, are public HCS messages, not rows only we can read.** See `changePrice` and `announceDemandIfMilestone` in [`src/services/games/listing.ts`](src/services/games/listing.ts) and [`src/services/games/wishlist.ts`](src/services/games/wishlist.ts) — each one writes to `HCS_LISTINGS_TOPIC` and records the transaction id it got back. Query the topic on the Mirror Node directly and the numbers have to match what the API says, because they're computed from the same messages.
+
 ## Stack
 
 Node + TypeScript (ESM) · Express · Postgres via [Drizzle](https://orm.drizzle.team/) · [`@hiero-ledger/sdk`](https://github.com/hiero-ledger/hiero-sdk-js) for Hedera · [x402](https://x402.org) (`@x402/core` + `@x402/express` + `@x402/hedera`) through the Blocky402 facilitator for payment · [`@privy-io/node`](https://docs.privy.io/) for wallets, auth, and agent signing · [ENSv2](https://docs.ens.domains/) on Sepolia via [viem](https://viem.sh/) for studio names · [Pinata](https://docs.pinata.cloud/) for IPFS.
@@ -40,7 +42,7 @@ Full endpoint list and request/response shapes, written for whoever's wiring a c
 GET /api/games/:id/download
 ```
 
-Returns `200` immediately for a free game or one this wallet already owns. Otherwise it's the [x402](https://x402.org) flow: a `402` with payment terms, a signed payment on retry, verify and settle through Blocky402, then `200` with a playable URL. `POST /api/games/:id/pay` is the same path server-signed, for a logged-in buyer whose browser can't hold a signing key.
+Returns `200` immediately for a free game or one this wallet already owns. Otherwise it's the [x402](https://x402.org) flow: a `402` with payment terms, a signed payment on retry, verify and settle through Blocky402, then `200` with a playable URL. `POST /api/games/:id/pay/prepare` + `POST /api/games/:id/pay/complete` is the same settlement, split in two because the browser holds the signing key and the server holds the Hedera client: the server builds and freezes the transfer, the browser signs it, the server submits.
 
 Auth is a Privy access token as `Authorization: Bearer <token>` — no cookies, no sessions, no CSRF surface. Browsing (catalog, listings, reviews, studio pages) never requires one.
 
