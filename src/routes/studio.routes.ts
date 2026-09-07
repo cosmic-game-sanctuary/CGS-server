@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { and, eq, or } from "drizzle-orm";
+import { and, eq, isNotNull, or } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "../db/client.js";
 import { studios, studioMembers, games, users } from "../db/schema.js";
@@ -15,6 +15,7 @@ import { fallbackHandle } from "../lib/handle.js";
 import { isSubnameAvailable, registerStudioSubname } from "../services/ens/registrar.js";
 import { env } from "../config/env.js";
 import { emailStudioInvite } from "../services/email/messages.js";
+import { studioEarnings } from "../services/earnings/report.js";
 
 const studioRouter = Router({ caseSensitive: true, strict: true });
 
@@ -151,9 +152,12 @@ studioRouter.get(
     });
     if (!studio) throw Errors.notFound("Studio");
 
-    // Owning the studio is what decides whether this page shows unfinished
-    // work, so it has to be known before the games are queried.
+    // Being *on the team* is what decides whether this page shows unfinished
+    // work — not owning it. A collaborator credited on a game they helped make
+    // could not see it before this, which is the wrong side of the line to put
+    // them on. Ownership still gates the members' email addresses below.
     const isOwner = req.auth?.id === studio.ownerUserId;
+    const onTheTeam = isOwner || (await isStudioMember(studio.id, req.auth?.id));
 
     const [members, studioGames, owner] = await Promise.all([
       db.query.studioMembers.findMany({
@@ -165,7 +169,7 @@ studioRouter.get(
         // they may still be changing — so this page showed strangers work that
         // was never published. The owner still sees everything, which is what
         // makes this the "manage my games" view as well as the public one.
-        where: isOwner
+        where: onTheTeam
           ? eq(games.studioId, studio.id)
           : and(eq(games.studioId, studio.id), eq(games.status, "published")),
         columns: { id: true, slug: true, title: true, coverCid: true, coverSeed: true, status: true },
@@ -234,5 +238,39 @@ studioRouter.post(
     res.status(201).json(member);
   }),
 );
+
+// Owner and members. A team that cannot see its own takings is not a team, and
+// a collaborator credited on the games has more reason to look than anyone.
+// Nobody outside the studio sees any of it.
+studioRouter.get(
+  "/:id/earnings",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const studioId = param(req, "id");
+    const studio = await db.query.studios.findFirst({ where: eq(studios.id, studioId) });
+    if (!studio) throw Errors.notFound("Studio");
+
+    const allowed =
+      studio.ownerUserId === req.auth!.id || (await isStudioMember(studio.id, req.auth!.id));
+    if (!allowed) throw Errors.notOwner("Only this studio's team can see its earnings.");
+
+    const report = await studioEarnings(studio.id);
+    if (!report) throw Errors.notFound("Studio");
+    res.json(report);
+  }),
+);
+
+/** Has this person accepted an invite to this studio? */
+async function isStudioMember(studioId: string, userId: string | undefined): Promise<boolean> {
+  if (!userId) return false;
+  const row = await db.query.studioMembers.findFirst({
+    where: and(
+      eq(studioMembers.studioId, studioId),
+      eq(studioMembers.userId, userId),
+      isNotNull(studioMembers.acceptedAt),
+    ),
+  });
+  return row !== undefined;
+}
 
 export default studioRouter;

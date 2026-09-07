@@ -1,4 +1,4 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import {
   TokenMintTransaction,
   TransferTransaction,
@@ -23,7 +23,7 @@ import { submitTopicMessage } from "../hedera/hcs.js";
 import { getAccountByEvmAddress } from "../hedera/mirror.js";
 import { env } from "../../config/env.js";
 import logger from "../../utils/logger.utils.js";
-import { emailSale } from "../email/messages.js";
+import { emailPayoutHeld, emailPayoutSettled, emailSale } from "../email/messages.js";
 
 type Game = typeof games.$inferSelect;
 
@@ -257,6 +257,9 @@ async function distributeSplits(game: Game, saleId: string): Promise<{ paid: num
       { gameId: game.id, saleId, held: held.length },
       "some shares are held pending an invite being claimed",
     );
+    void announceHeld(game, held).catch((err) =>
+      logger.error({ err, gameId: game.id }, "announcing held payouts failed"),
+    );
   }
 
   return { paid: payable.length, held: held.length };
@@ -381,3 +384,110 @@ async function notifyStudio(game: Game) {
 }
 
 export { resolveAccountId, distributeSplits };
+
+/**
+ * Everything held for this person, across every studio they are on.
+ *
+ * `settleHeldPayouts` works per membership row, and a person has one of those
+ * per studio. Money owed is owed regardless of which team produced it, so the
+ * moment someone becomes payable, all of it should move — not just the share
+ * from whichever invite they happened to click.
+ */
+export async function settleHeldPayoutsForUser(userId: string, accountId: string): Promise<number> {
+  const memberships = await db.query.studioMembers.findMany({
+    where: eq(studioMembers.userId, userId),
+    columns: { id: true },
+  });
+  if (memberships.length === 0) return 0;
+
+  let settled = 0;
+  for (const membership of memberships) {
+    settled += await settleHeldPayouts(membership.id, accountId);
+  }
+
+  if (settled > 0) {
+    logger.info({ userId, settled }, "settled held payouts for user");
+    void announceSettled(userId, settled).catch((err) =>
+      logger.error({ err, userId }, "announcing settled payouts failed"),
+    );
+  }
+  return settled;
+}
+
+/**
+ * Tell both sides a share could not be paid.
+ *
+ * Held money used to be silent in both directions: the person owed it never
+ * learned it existed, and the studio never learned a teammate was unpaid. The
+ * collaborator usually has no account yet, so there is no row to write for
+ * them — the invite email is the only channel that reaches them at all.
+ */
+async function announceHeld(
+  game: Game,
+  held: { studioMemberId: string | null; amount: number; reason: string }[],
+): Promise<void> {
+  const studio = await db.query.studios.findFirst({ where: eq(studios.id, game.studioId) });
+  if (!studio) return;
+
+  const total = held.reduce((sum, h) => sum + h.amount, 0);
+  await db.insert(notifications).values({
+    userId: studio.ownerUserId,
+    type: "payout_held",
+    payload: {
+      gameId: game.id,
+      slug: game.slug,
+      title: game.title,
+      heldUnits: total,
+      priceAsset: game.priceAsset,
+      waitingOn: held.length,
+      reasons: held.map((h) => h.reason),
+    },
+  });
+
+  const memberIds = held.map((h) => h.studioMemberId).filter((id): id is string => id !== null);
+  if (memberIds.length === 0) return;
+
+  const members = await db.query.studioMembers.findMany({
+    where: inArray(studioMembers.id, memberIds),
+  });
+  for (const member of members) {
+    const share = held.find((h) => h.studioMemberId === member.id);
+    if (!share) continue;
+    // No account means no notification row is possible, so mail is the only
+    // way this reaches them — and it is also the nudge to claim the invite.
+    void emailPayoutHeld({
+      to: member.email,
+      handle: member.handle,
+      studioName: studio.name,
+      gameTitle: game.title,
+      inviteId: member.id,
+      amountUnits: share.amount,
+      asset: game.priceAsset,
+      accepted: member.acceptedAt !== null,
+    });
+  }
+}
+
+/** The money arrived. Said once, with the total, not once per payout. */
+async function announceSettled(userId: string, count: number): Promise<void> {
+  const recent = await db.query.pendingPayouts.findMany({
+    where: eq(pendingPayouts.status, "settled"),
+    orderBy: desc(pendingPayouts.settledAt),
+    limit: count,
+  });
+  if (recent.length === 0) return;
+
+  const total = recent.reduce((sum, r) => sum + r.amountUnits, 0);
+  const asset = recent[0]!.asset;
+
+  await db.insert(notifications).values({
+    userId,
+    type: "payout_settled",
+    payload: { amountUnits: total, priceAsset: asset, payouts: recent.length },
+  });
+
+  const user = await db.query.users.findFirst({ where: eq(users.id, userId) });
+  if (user) {
+    void emailPayoutSettled({ to: user.email, amountUnits: total, asset, payouts: recent.length });
+  }
+}

@@ -54,6 +54,11 @@ export const notificationTypeEnum = pgEnum("notification_type", [
   "invite",
   "agent_fired",
   "published",
+  // A share that couldn't be paid at settlement, and the moment it finally
+  // was. Held money used to be silent on both ends: the person owed it never
+  // learned it existed, and the studio never learned a teammate was unpaid.
+  "payout_held",
+  "payout_settled",
 ]);
 
 export const users = pgTable("users", {

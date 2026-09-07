@@ -12,6 +12,8 @@ import { assetDecimals, ensFullName, toDisplayAmount } from "../lib/display.js";
 import { validate } from "../middleware/validate.middleware.js";
 import { Errors } from "../lib/errors.js";
 import { consumeWithdrawIntent, prepareWithdraw, submitWithdraw } from "../services/wallet/withdraw.js";
+import { settleHeldPayoutsForUser } from "../services/games/fulfil.js";
+import { personalEarnings } from "../services/earnings/report.js";
 import logger from "../utils/logger.utils.js";
 import { fallbackHandle } from "../lib/handle.js";
 import { gatewayUrl } from "../services/ipfs/pinata.js";
@@ -29,7 +31,20 @@ meRouter.get(
   requireAuth,
   asyncHandler(async (req, res) => {
     const auth = req.auth!;
+    const hadAccount = auth.hederaAccountId !== null;
     const hederaAccountId = await resolveHederaAccount(auth);
+
+    // The moment we learn this wallet is payable, pay it. Money held for
+    // someone who hadn't funded their wallet used to sit until an operator
+    // remembered to run splits:retry — accepting an invite only settles if the
+    // account already exists, and a new user's doesn't. This fires exactly
+    // once, on the request where the account first resolves, and on a request
+    // we were serving anyway.
+    if (!hadAccount && hederaAccountId) {
+      void settleHeldPayoutsForUser(auth.id, hederaAccountId).catch((err) =>
+        logger.error({ err, userId: auth.id }, "auto-settling held payouts failed"),
+      );
+    }
 
     let balanceUnits: string | null = null;
     // Tinybars. Reported separately from the settlement asset because it isn't
@@ -47,6 +62,18 @@ meRouter.get(
 
     const ownedStudio = await db.query.studios.findFirst({ where: eq(studios.ownerUserId, auth.id) });
 
+    // Someone can be on several teams — inviting a collaborator by email is
+    // exactly what produces that — and returning one of them arbitrarily hid
+    // the others. `studio` below stays the primary so nothing breaks; this is
+    // the full list beside it.
+    const allMemberships = await db.query.studioMembers.findMany({
+      where: and(eq(studioMembers.userId, auth.id), isNotNull(studioMembers.acceptedAt)),
+    });
+    const memberStudioIds = allMemberships.map((m) => m.studioId);
+    const relatedStudios = memberStudioIds.length
+      ? await db.query.studios.findMany({ where: inArray(studios.id, memberStudioIds) })
+      : [];
+
     // `handle` is what appears on a split and in the studio credits, so the
     // publish flow needs it before it can put you on your own game's splits.
     // It lives on the membership row, which every studio owner now gets at
@@ -59,9 +86,7 @@ meRouter.get(
       handle: string;
     } | null = null;
 
-    const membership = await db.query.studioMembers.findFirst({
-      where: and(eq(studioMembers.userId, auth.id), isNotNull(studioMembers.acceptedAt)),
-    });
+    const membership = allMemberships[0];
 
     if (ownedStudio) {
       const ownRow =
@@ -105,6 +130,16 @@ meRouter.get(
       hbarUnits,
       hbar: hbarUnits === null ? 0 : toDisplayAmount(Number(hbarUnits), "0.0.0"),
       studio,
+      // Every studio this person can act in, owned or joined. `studio` above
+      // is whichever of these is primary, kept so existing callers don't move.
+      studios: [
+        ...(ownedStudio
+          ? [{ id: ownedStudio.id, name: ownedStudio.name, slug: ownedStudio.slug, role: "owner" as const }]
+          : []),
+        ...relatedStudios
+          .filter((st) => st.id !== ownedStudio?.id)
+          .map((st) => ({ id: st.id, name: st.name, slug: st.slug, role: "member" as const })),
+      ],
     });
   }),
 );
@@ -176,6 +211,14 @@ meRouter.get(
         myPlaytimeSeconds: statsByGame.get(g.id)?.playtimeSeconds ?? 0,
       })),
     });
+  }),
+);
+
+meRouter.get(
+  "/earnings",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    res.json(await personalEarnings(req.auth!.id));
   }),
 );
 

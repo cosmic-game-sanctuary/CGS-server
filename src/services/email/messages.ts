@@ -109,3 +109,62 @@ export function emailAgentNeedsFunds(input: {
     ].join("\n"),
   });
 }
+
+/**
+ * A share that couldn't be paid yet. The person usually has no account, so
+ * there is no notification row that could reach them — this is the only
+ * channel, and it doubles as the reason to claim the invite.
+ */
+export function emailPayoutHeld(input: {
+  to: string;
+  handle: string;
+  studioName: string;
+  gameTitle: string;
+  inviteId: string;
+  amountUnits: number;
+  asset: string;
+  accepted: boolean;
+}): Promise<boolean> {
+  const amount = money(input.amountUnits, input.asset);
+  const next = input.accepted
+    ? [
+        `Your wallet has not received anything yet, so there is no account to`,
+        `pay into. Send anything to it, or open the site once, and it will go`,
+        `out on its own.`,
+      ]
+    : [`It goes out the moment you claim your place on the team.`];
+
+  return sendMail({
+    to: input.to,
+    subject: `${amount} is waiting for you from ${input.gameTitle}`,
+    text: [
+      `${input.gameTitle} sold, and ${amount} of it is yours.`,
+      ``,
+      ...next,
+      ``,
+      `Nobody can change your share. It was locked when the game published.`,
+      ``,
+      appUrl(`/invite/${input.inviteId}`),
+    ].join("\n"),
+  });
+}
+
+export function emailPayoutSettled(input: {
+  to: string;
+  amountUnits: number;
+  asset: string;
+  payouts: number;
+}): Promise<boolean> {
+  const amount = money(input.amountUnits, input.asset);
+  const from = input.payouts === 1 ? `a sale` : `${input.payouts} sales`;
+  return sendMail({
+    to: input.to,
+    subject: `${amount} landed in your wallet`,
+    text: [
+      `${amount} from ${from} was being held because your wallet had no`,
+      `account yet. It has one now, so the money has gone out.`,
+      ``,
+      appUrl(`/library`),
+    ].join("\n"),
+  });
+}
