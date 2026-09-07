@@ -92,6 +92,13 @@
       "when": 1788786673893,
       "tag": "0012_cloud_saves",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1788790721294,
+      "tag": "0013_studio_membership",
+      "breakpoints": true
     }
   ]
 }

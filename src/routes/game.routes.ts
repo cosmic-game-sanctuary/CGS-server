@@ -126,8 +126,11 @@ async function studioExtrasFor(studioIds: string[]) {
   });
 
   const [members, owners] = await Promise.all([
+    // Active only — same roster the studio page itself now shows. Someone who
+    // left keeps every credit on `splits`, they just stop counting as "on the
+    // team" here.
     db.query.studioMembers.findMany({
-      where: inArray(studioMembers.studioId, studioIds),
+      where: and(inArray(studioMembers.studioId, studioIds), eq(studioMembers.active, true)),
       columns: { studioId: true },
     }),
     db.query.users.findMany({
@@ -573,7 +576,23 @@ async function findOrInviteMember(studioId: string, email: string, handle: strin
   const existing = await db.query.studioMembers.findFirst({
     where: and(eq(studioMembers.studioId, studioId), eq(studioMembers.email, email)),
   });
-  if (existing) return { ...existing, createdHere: false };
+  if (existing) {
+    // Someone who left or was removed and is now being credited on a new game
+    // is being brought back onto the team, not just quietly named on a split
+    // while still showing as inactive everywhere else. Treated as a fresh
+    // invite (`createdHere: true`) so the usual "you've been added" email
+    // still goes out — being put back on the roster deserves the same
+    // notice as being put on it the first time.
+    if (!existing.active) {
+      const [reactivated] = await db
+        .update(studioMembers)
+        .set({ active: true })
+        .where(eq(studioMembers.id, existing.id))
+        .returning();
+      return { ...reactivated!, createdHere: true };
+    }
+    return { ...existing, createdHere: false };
+  }
 
   const [created] = await db
     .insert(studioMembers)

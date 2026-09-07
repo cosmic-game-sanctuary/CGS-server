@@ -70,8 +70,15 @@ meRouter.get(
     // exactly what produces that — and returning one of them arbitrarily hid
     // the others. `studio` below stays the primary so nothing breaks; this is
     // the full list beside it.
+    // Active only — someone who left a studio, or was removed from one, should
+    // stop seeing it here even though every credit they earned on it stays
+    // exactly where it is, in `splits`.
     const allMemberships = await db.query.studioMembers.findMany({
-      where: and(eq(studioMembers.userId, auth.id), isNotNull(studioMembers.acceptedAt)),
+      where: and(
+        eq(studioMembers.userId, auth.id),
+        isNotNull(studioMembers.acceptedAt),
+        eq(studioMembers.active, true),
+      ),
     });
     const memberStudioIds = allMemberships.map((m) => m.studioId);
     const relatedStudios = memberStudioIds.length

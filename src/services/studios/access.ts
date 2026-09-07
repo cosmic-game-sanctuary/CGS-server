@@ -24,7 +24,13 @@ import { findGameByRef } from "../games/lookup.js";
  * the game.
  */
 
-/** Has this person accepted an invite to this studio? */
+/**
+ * Has this person accepted an invite to this studio, and not since left or
+ * been removed? `active` is the org chart, not the credit ledger — someone who
+ * left keeps every historical split forever, they just stop being "on the
+ * team" for what this function gates: seeing drafts, earnings, and counting
+ * toward the roster.
+ */
 export async function isStudioMember(studioId: string, userId: string | undefined): Promise<boolean> {
   if (!userId) return false;
   const row = await db.query.studioMembers.findFirst({
@@ -32,6 +38,7 @@ export async function isStudioMember(studioId: string, userId: string | undefine
       eq(studioMembers.studioId, studioId),
       eq(studioMembers.userId, userId),
       isNotNull(studioMembers.acceptedAt),
+      eq(studioMembers.active, true),
     ),
   });
   return row !== undefined;
@@ -54,6 +61,7 @@ export async function canManageStudio(studioId: string, userId: string | undefin
       eq(studioMembers.userId, userId),
       eq(studioMembers.role, "owner"),
       isNotNull(studioMembers.acceptedAt),
+      eq(studioMembers.active, true),
     ),
   });
   return row !== undefined;

@@ -16,8 +16,15 @@ import { isSubnameAvailable, registerStudioSubname } from "../services/ens/regis
 import { env } from "../config/env.js";
 import { emailStudioInvite } from "../services/email/messages.js";
 import { studioEarnings } from "../services/earnings/report.js";
-import { isStudioMember } from "../services/studios/access.js";
+import { isStudioMember, canManageStudio, isStudioOwner } from "../services/studios/access.js";
 import { authorSummaries } from "../services/users/profile.js";
+import {
+  removeMember,
+  leaveStudio,
+  changeMemberRole,
+  resendInvite,
+  transferOwnership,
+} from "../services/studios/membership.js";
 
 const studioRouter = Router({ caseSensitive: true, strict: true });
 
@@ -162,8 +169,11 @@ studioRouter.get(
     const onTheTeam = isOwner || (await isStudioMember(studio.id, req.auth?.id));
 
     const [members, studioGames, owner] = await Promise.all([
+      // Active roster only. Someone who left keeps every credit they earned —
+      // that lives permanently in `splits`, untouched by this — they just stop
+      // appearing here as part of the working team.
       db.query.studioMembers.findMany({
-        where: eq(studioMembers.studioId, studio.id),
+        where: and(eq(studioMembers.studioId, studio.id), eq(studioMembers.active, true)),
         columns: { id: true, handle: true, role: true, acceptedAt: true, email: true, userId: true },
       }),
       db.query.games.findMany({
@@ -226,7 +236,10 @@ studioRouter.post(
   asyncHandler(async (req, res) => {
     const studio = await db.query.studios.findFirst({ where: eq(studios.id, param(req, "id")) });
     if (!studio) throw Errors.notFound("Studio");
-    if (studio.ownerUserId !== req.auth!.id) throw Errors.notOwner();
+    // Manager, not strictly the founder — inviting a collaborator is exactly
+    // the kind of team decision the manager role exists to allow. See
+    // services/studios/access.ts.
+    if (!(await canManageStudio(studio.id, req.auth!.id))) throw Errors.notOwner();
 
     const { email, handle, role } = req.body;
     const [member] = await db
@@ -246,6 +259,83 @@ studioRouter.post(
     });
 
     res.status(201).json(member);
+  }),
+);
+
+// --- managing the roster ----------------------------------------------------
+//
+// Everything below is new. A studio used to be write-once the same way a game
+// was: no way to remove a member, correct a role, resend a lost invite, leave
+// a team, or hand off the studio if the founder moves on. All of it is
+// deliberately separate from `splits` — see services/studios/membership.ts for
+// why that separation is what makes "remove a member" safe at all.
+
+studioRouter.delete(
+  "/:id/members/:memberId",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const studioId = param(req, "id");
+    if (!(await canManageStudio(studioId, req.auth!.id))) throw Errors.notOwner();
+    const result = await removeMember(studioId, param(req, "memberId"));
+    res.json({
+      outcome: result.outcome,
+      member: { id: result.member.id, handle: result.member.handle, active: result.member.active },
+    });
+  }),
+);
+
+studioRouter.post(
+  "/:id/leave",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const result = await leaveStudio(param(req, "id"), req.auth!.id);
+    res.json({
+      outcome: result.outcome,
+      member: { id: result.member.id, handle: result.member.handle, active: result.member.active },
+    });
+  }),
+);
+
+const roleSchema = z.object({ role: z.enum(["owner", "member"]) });
+
+studioRouter.patch(
+  "/:id/members/:memberId",
+  requireAuth,
+  validate(roleSchema),
+  asyncHandler(async (req, res) => {
+    const studioId = param(req, "id");
+    if (!(await canManageStudio(studioId, req.auth!.id))) throw Errors.notOwner();
+    const updated = await changeMemberRole(studioId, param(req, "memberId"), req.body.role);
+    res.json(updated);
+  }),
+);
+
+studioRouter.post(
+  "/:id/members/:memberId/resend-invite",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const studioId = param(req, "id");
+    if (!(await canManageStudio(studioId, req.auth!.id))) throw Errors.notOwner();
+    const member = await resendInvite(studioId, param(req, "memberId"));
+    res.json({ sent: true, to: member.email });
+  }),
+);
+
+const transferSchema = z.object({ toMemberId: z.string().uuid() });
+
+// The founder specifically, not any manager — see
+// services/studios/membership.ts#transferOwnership for why.
+studioRouter.post(
+  "/:id/transfer",
+  requireAuth,
+  validate(transferSchema),
+  asyncHandler(async (req, res) => {
+    const studioId = param(req, "id");
+    if (!(await isStudioOwner(studioId, req.auth!.id))) {
+      throw Errors.notOwner("Only the studio's founder can transfer it.");
+    }
+    const { studio, newOwner } = await transferOwnership(studioId, req.body.toMemberId);
+    res.json({ studio, newOwner: { id: newOwner.id, handle: newOwner.handle } });
   }),
 );
 

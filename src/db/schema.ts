@@ -145,6 +145,14 @@ export const studioMembers = pgTable("studio_members", {
   role: studioRoleEnum("role").notNull().default("member"),
   invitedAt: timestamp("invited_at", { withTimezone: true }).defaultNow().notNull(),
   acceptedAt: timestamp("accepted_at", { withTimezone: true }),
+  // The org chart, not the credit ledger. Someone who leaves or is removed
+  // stops being active here, but every `splits` row naming them — on every
+  // game they helped make, published or not — is untouched: that credit and
+  // any pending payout are permanent, the same immutability the splits table
+  // already promises everywhere else. This is what makes "remove a member"
+  // possible at all without contradicting that promise. See
+  // services/studios/membership.ts.
+  active: boolean("active").notNull().default(true),
 });
 
 export const games = pgTable("games", {
