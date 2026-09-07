@@ -18,7 +18,8 @@
     "builds:backfill": "tsx scripts/backfill-build-zips.ts",
     "game:delist": "tsx scripts/delist-game.ts",
     "listings:retry": "tsx scripts/retry-announcements.ts",
-    "builds:backfill-versions": "tsx scripts/backfill-build-versions.ts"
+    "builds:backfill-versions": "tsx scripts/backfill-build-versions.ts",
+    "users:backfill-handles": "tsx scripts/backfill-handles.ts"
   },
   "repository": {
     "type": "git",

@@ -1,8 +1,9 @@
 import { Router } from "express";
 import { z } from "zod";
-import { and, eq, inArray, isNotNull, ne } from "drizzle-orm";
+import multer from "multer";
+import { and, desc, eq, inArray, isNotNull, ne } from "drizzle-orm";
 import { db } from "../db/client.js";
-import { studios, studioMembers, games, playSessions } from "../db/schema.js";
+import { studios, studioMembers, games, playSessions, users, sales, gameKeys } from "../db/schema.js";
 import { requireAuth } from "../middleware/auth.middleware.js";
 import { asyncHandler } from "../lib/asyncHandler.js";
 import { env } from "../config/env.js";
@@ -15,8 +16,10 @@ import { consumeWithdrawIntent, prepareWithdraw, submitWithdraw } from "../servi
 import { settleHeldPayoutsForUser } from "../services/games/fulfil.js";
 import { personalEarnings } from "../services/earnings/report.js";
 import logger from "../utils/logger.utils.js";
-import { fallbackHandle } from "../lib/handle.js";
-import { gatewayUrl } from "../services/ipfs/pinata.js";
+import { fallbackHandle, isReservedHandle, normaliseHandle } from "../lib/handle.js";
+import { gatewayUrl, pinFile, unpinByCid } from "../services/ipfs/pinata.js";
+import { checkImages } from "../services/moderation/csam.js";
+import { AppError } from "../lib/errors.js";
 
 const meRouter = Router({ caseSensitive: true, strict: true });
 
@@ -115,10 +118,21 @@ meRouter.get(
       }
     }
 
+    // The profile fields, so the header can render a name and an avatar without
+    // a second request, and so a client knows the URL of this person's own page.
+    const me = await db.query.users.findFirst({ where: eq(users.id, auth.id) });
+
     res.json({
       id: auth.id,
       email: auth.email,
       evmAddress: auth.evmAddress,
+      handle: me?.handle ?? null,
+      displayName: me?.displayName ?? null,
+      label: me?.displayName || me?.handle || auth.email,
+      bio: me?.bio ?? null,
+      avatarCid: me?.avatarCid ?? null,
+      avatarUrl: me?.avatarCid ? gatewayUrl(me.avatarCid) : null,
+      libraryPublic: me?.libraryPublic ?? true,
       hederaAccountId,
       balanceUnits,
       balanceAsset: env.X402_ASSET,
@@ -219,6 +233,186 @@ meRouter.get(
   requireAuth,
   asyncHandler(async (req, res) => {
     res.json(await personalEarnings(req.auth!.id));
+  }),
+);
+
+// --- your own profile ------------------------------------------------------
+
+const avatarUpload = multer({
+  storage: multer.memoryStorage(),
+  // An avatar is a small image. The 200MB ceiling the build upload needs would
+  // be an invitation here.
+  limits: { fileSize: 5 * 1024 * 1024 },
+});
+
+const editProfileSchema = z
+  .object({
+    displayName: z.string().max(60).nullable().optional(),
+    bio: z.string().max(500).nullable().optional(),
+    handle: z.string().min(2).max(30).optional(),
+    libraryPublic: z.boolean().optional(),
+  })
+  .refine((body) => Object.keys(body).length > 0, { message: "nothing to change" });
+
+meRouter.patch(
+  "/profile",
+  requireAuth,
+  validate(editProfileSchema),
+  asyncHandler(async (req, res) => {
+    const body = req.body as z.infer<typeof editProfileSchema>;
+    const fields: Partial<typeof users.$inferInsert> = {};
+
+    if (body.displayName !== undefined) fields.displayName = body.displayName?.trim() || null;
+    if (body.bio !== undefined) fields.bio = body.bio?.trim() || null;
+    if (body.libraryPublic !== undefined) fields.libraryPublic = body.libraryPublic;
+
+    if (body.handle !== undefined) {
+      // Normalised rather than rejected, because "Kai Saha" is a reasonable
+      // thing to type into a field labelled "handle" and turning it into
+      // "kaisaha" is more useful than an error. What it became comes back in
+      // the response so nobody is surprised by their own URL.
+      const handle = normaliseHandle(body.handle);
+      if (!handle) {
+        throw Errors.validationFailed({ handle: "Use letters, numbers, dots, dashes or underscores." });
+      }
+      if (isReservedHandle(handle)) {
+        throw Errors.validationFailed({ handle: `"${handle}" is reserved.` });
+      }
+      const taken = await db.query.users.findFirst({ where: eq(users.handle, handle), columns: { id: true } });
+      if (taken && taken.id !== req.auth!.id) {
+        // A collision belongs to the person choosing, so they are told rather
+        // than quietly handed a numbered variant of the name they wanted.
+        throw new AppError(409, "HANDLE_TAKEN", `"${handle}" is already taken.`);
+      }
+      fields.handle = handle;
+    }
+
+    const [updated] = await db.update(users).set(fields).where(eq(users.id, req.auth!.id)).returning();
+    res.json({
+      handle: updated!.handle,
+      displayName: updated!.displayName,
+      bio: updated!.bio,
+      libraryPublic: updated!.libraryPublic,
+      avatarUrl: updated!.avatarCid ? gatewayUrl(updated!.avatarCid) : null,
+    });
+  }),
+);
+
+meRouter.post(
+  "/avatar",
+  requireAuth,
+  avatarUpload.single("avatar"),
+  asyncHandler(async (req, res) => {
+    const file = req.file;
+    if (!file) throw Errors.validationFailed({ avatar: "an image file is required" });
+    if (!file.mimetype.startsWith("image/")) {
+      throw Errors.validationFailed({ avatar: "that isn't an image" });
+    }
+
+    // The same gate every other uploaded image goes through. An avatar is the
+    // one image on the site that appears next to a person's words everywhere,
+    // which makes skipping the check here worse, not more acceptable.
+    const csam = await checkImages([file.buffer]);
+    if (!csam.pass) {
+      throw new AppError(422, "MODERATION_BLOCKED", "This image can't be accepted.", { reason: csam.reason });
+    }
+
+    const previous = (await db.query.users.findFirst({ where: eq(users.id, req.auth!.id) }))?.avatarCid ?? null;
+    const cid = await pinFile(file.buffer, file.originalname || "avatar", file.mimetype);
+    await db.update(users).set({ avatarCid: cid }).where(eq(users.id, req.auth!.id));
+
+    // Replaced, so the old one has nothing pointing at it. Failing to unpin is
+    // not worth failing the request over — an orphaned pin costs storage, a
+    // failed avatar change costs the person their afternoon.
+    if (previous && previous !== cid) {
+      void unpinByCid(previous).catch((err) => logger.warn({ err, cid: previous }, "unpinning an old avatar failed"));
+    }
+
+    res.json({ avatarCid: cid, avatarUrl: gatewayUrl(cid) });
+  }),
+);
+
+meRouter.delete(
+  "/avatar",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const current = (await db.query.users.findFirst({ where: eq(users.id, req.auth!.id) }))?.avatarCid ?? null;
+    await db.update(users).set({ avatarCid: null }).where(eq(users.id, req.auth!.id));
+    if (current) {
+      void unpinByCid(current).catch((err) => logger.warn({ err, cid: current }, "unpinning an avatar failed"));
+    }
+    res.json({ avatarCid: null, avatarUrl: null });
+  }),
+);
+
+// --- receipts --------------------------------------------------------------
+
+// Every purchase this wallet has made, with the settlement transaction behind
+// it. `sales` has recorded all of this since Stage 4 and nothing ever showed a
+// buyer their own — so the one storefront where every payment is a public,
+// checkable transaction was also the one that couldn't produce a receipt.
+meRouter.get(
+  "/purchases",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const auth = req.auth!;
+    const hederaAccountId = await resolveHederaAccount(auth);
+    if (!hederaAccountId) {
+      res.json({ purchases: [] });
+      return;
+    }
+
+    const rows = await db.query.sales.findMany({
+      where: eq(sales.buyerAccountId, hederaAccountId),
+      orderBy: desc(sales.createdAt),
+    });
+    if (rows.length === 0) {
+      res.json({ purchases: [] });
+      return;
+    }
+
+    const gameIds = [...new Set(rows.map((r) => r.gameId))];
+    const [gameRows, keys] = await Promise.all([
+      db.query.games.findMany({ where: inArray(games.id, gameIds), with: { studio: true } }),
+      db.query.gameKeys.findMany({
+        where: and(eq(gameKeys.ownerAccountId, hederaAccountId), inArray(gameKeys.gameId, gameIds)),
+        columns: { gameId: true, tokenId: true, serial: true },
+      }),
+    ]);
+    const gameById = new Map(gameRows.map((g) => [g.id, g]));
+    const keyByGame = new Map(keys.map((k) => [k.gameId, k]));
+
+    res.json({
+      purchases: rows.map((r) => {
+        const game = gameById.get(r.gameId);
+        const key = keyByGame.get(r.gameId);
+        return {
+          id: r.id,
+          at: r.createdAt,
+          priceUnits: r.priceUnits,
+          priceAsset: r.priceAsset,
+          priceUsd: toDisplayAmount(r.priceUnits, r.priceAsset),
+          assetDecimals: assetDecimals(r.priceAsset),
+          // What makes this a receipt rather than a line in our database: the
+          // buyer can look it up on the Mirror Node themselves.
+          settlementTxId: r.settlementTxId,
+          hcsSaleTxId: r.hcsSaleTxId,
+          game: game
+            ? {
+                id: game.id,
+                slug: game.slug,
+                title: game.title,
+                coverCid: game.coverCid,
+                coverUrl: game.coverCid ? gatewayUrl(game.coverCid) : null,
+                coverSeed: game.coverSeed,
+                status: game.status,
+                studio: { id: game.studio.id, name: game.studio.name, slug: game.studio.slug },
+              }
+            : null,
+          key: key ? { tokenId: key.tokenId, serial: key.serial } : null,
+        };
+      }),
+    });
   }),
 );
 

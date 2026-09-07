@@ -3,6 +3,7 @@ import { db } from "../../db/client.js";
 import { users } from "../../db/schema.js";
 import type { PrivyIdentity } from "../privy/auth.js";
 import { getAccountByEvmAddress } from "../hedera/mirror.js";
+import { allocateHandle, fallbackHandle } from "../../lib/handle.js";
 
 // every route needs our own users.id for foreign keys, not Privy's DID
 // directly, so auth always resolves through here. Creates the row on first
@@ -21,7 +22,11 @@ export async function upsertUser(identity: PrivyIdentity) {
     const walletChanged = existing.privyWalletId !== identity.privyWalletId;
     const identityChanged = existing.email !== identity.email || existing.evmAddress !== identity.evmAddress;
 
-    if (!walletChanged && !identityChanged) return existing;
+    // Accounts that predate profiles have no handle. Filling it in on the next
+    // sign-in means the backfill script is a convenience rather than something
+    // the site is broken without.
+    const needsHandle = !existing.handle;
+    if (!walletChanged && !identityChanged && !needsHandle) return existing;
 
     const [updated] = await db
       .update(users)
@@ -29,6 +34,9 @@ export async function upsertUser(identity: PrivyIdentity) {
         email: identity.email,
         evmAddress: identity.evmAddress,
         privyWalletId: identity.privyWalletId,
+        ...(needsHandle
+          ? { handle: await allocateHandle(fallbackHandle(identity.email), existing.id) }
+          : {}),
         // a different wallet has a different key, and the old one is now
         // wrong rather than merely stale — drop it and re-derive on demand.
         ...(walletChanged ? { publicKeyHex: null } : {}),
@@ -38,6 +46,12 @@ export async function upsertUser(identity: PrivyIdentity) {
     return updated!;
   }
 
+  // Everyone gets a handle at first sign-in rather than on demand later. It is
+  // the address of their profile page and the name on every review they write,
+  // so a user without one would be a user with no way to be linked to — and
+  // asking for one during sign-in is a step nobody would thank us for.
+  const handle = await allocateHandle(fallbackHandle(identity.email));
+
   const [created] = await db
     .insert(users)
     .values({
@@ -45,6 +59,7 @@ export async function upsertUser(identity: PrivyIdentity) {
       email: identity.email,
       evmAddress: identity.evmAddress,
       privyWalletId: identity.privyWalletId,
+      handle,
     })
     .returning();
   return created!;

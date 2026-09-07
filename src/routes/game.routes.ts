@@ -30,6 +30,8 @@ import { findBuild } from "../services/games/buildStore.js";
 import { env } from "../config/env.js";
 import { param, isUuid } from "../lib/params.js";
 import { assetDecimals, ensFullName, toDisplayAmount } from "../lib/display.js";
+import { authorSummaries, type AuthorSummary } from "../services/users/profile.js";
+import { findGameByRef } from "../services/games/lookup.js";
 import { pinFile, gatewayUrl } from "../services/ipfs/pinata.js";
 import { ingestBuild, commitBuild } from "../services/games/builds.js";
 import { announce } from "../services/games/listing.js";
@@ -132,6 +134,71 @@ async function studioExtrasFor(studioIds: string[]) {
   return out;
 }
 
+// The profile behind each split line, so a credit is a link rather than a bare
+// word. A share names its person either directly (`userId`) or through the
+// studio membership that was created for them by email — the second is the
+// whole point of the invite flow, so resolving only the first would leave
+// exactly the collaborators this product exists to credit uncredited.
+async function creditProfilesFor(splitRows: (typeof splits.$inferSelect)[]) {
+  const out = new Map<string, AuthorSummary | null>();
+  if (splitRows.length === 0) return out;
+
+  const memberIds = splitRows
+    .filter((s) => !s.userId && s.studioMemberId)
+    .map((s) => s.studioMemberId!);
+  const members = memberIds.length
+    ? await db.query.studioMembers.findMany({
+        where: inArray(studioMembers.id, [...new Set(memberIds)]),
+        columns: { id: true, userId: true },
+      })
+    : [];
+  const userIdByMember = new Map(members.map((m) => [m.id, m.userId]));
+
+  // The third way a share names someone: a bare wallet, which is what the
+  // publish form writes when a developer credits themselves by address. That
+  // is the most common split on the site and it was the one that resolved to
+  // nobody, so a game's own author showed up uncredited on their own page.
+  const wallets = splitRows
+    .filter((s) => !s.userId && !s.studioMemberId && s.wallet)
+    .map((s) => s.wallet!);
+  const byWallet = new Map<string, string>();
+  if (wallets.length > 0) {
+    const evm = [...new Set(wallets.filter((w) => w.startsWith("0x")).map((w) => w.toLowerCase()))];
+    const accounts = [...new Set(wallets.filter((w) => /^\d+\.\d+\.\d+$/.test(w)))];
+    const matches = await db.query.users.findMany({
+      where: or(
+        // Case-insensitive: Privy hands back a checksummed address and a
+        // person pasting one rarely preserves the capitalisation.
+        evm.length ? sql`lower(${users.evmAddress}) IN ${evm}` : undefined,
+        accounts.length ? inArray(users.hederaAccountId, accounts) : undefined,
+      ),
+      columns: { id: true, evmAddress: true, hederaAccountId: true },
+    });
+    for (const m of matches) {
+      byWallet.set(m.evmAddress.toLowerCase(), m.id);
+      if (m.hederaAccountId) byWallet.set(m.hederaAccountId, m.id);
+    }
+  }
+
+  const userIds = [
+    ...splitRows.map((s) => s.userId),
+    ...members.map((m) => m.userId),
+    ...byWallet.values(),
+  ].filter((id): id is string => id !== null);
+  const summaries = await authorSummaries(userIds);
+
+  // Three ways in, tried in order of how certain each one is.
+  for (const row of splitRows) {
+    let userId: string | null = row.userId;
+    if (!userId && row.studioMemberId) userId = userIdByMember.get(row.studioMemberId) ?? null;
+    if (!userId && row.wallet) {
+      userId = byWallet.get(row.wallet.toLowerCase()) ?? byWallet.get(row.wallet) ?? null;
+    }
+    out.set(row.id, userId ? (summaries.get(userId) ?? null) : null);
+  }
+  return out;
+}
+
 async function likeCountsFor(gameIds: string[]) {
   if (gameIds.length === 0) return new Map<string, number>();
   const rows = await db.query.likes.findMany({
@@ -220,6 +287,7 @@ gameRouter.get(
     ]);
     const splitsByGame = new Map<string, typeof splitRows>();
     for (const s of splitRows) splitsByGame.set(s.gameId, [...(splitsByGame.get(s.gameId) ?? []), s]);
+    const credits = await creditProfilesFor(splitRows);
 
     res.json({
       games: page.map((g) =>
@@ -230,6 +298,7 @@ gameRouter.get(
           plays.get(g.id),
           likeCounts.get(g.id),
           studioExtras.get(g.studioId),
+          credits,
         ),
       ),
       nextCursor: hasMore ? String(cursor + limit) : null,
@@ -274,6 +343,7 @@ gameRouter.get(
         plays.get(game.id),
         likeCounts.get(game.id),
         studioExtras.get(game.studioId),
+        await creditProfilesFor(gameSplits),
       ),
       // the client shows screenshots from a gateway URL, so send the CID it
       // needs rather than making it know how we address IPFS.
@@ -294,6 +364,7 @@ function serializeGame(
   plays?: number,
   likeCount?: number,
   studioExtras?: StudioExtras,
+  credits?: Map<string, AuthorSummary | null>,
 ) {
   return {
     id: game.id,
@@ -329,7 +400,17 @@ function serializeGame(
     updatedAt: game.updatedAt,
     buildVersion: game.buildVersion,
     delistedBy: game.delistedBy,
-    splits: gameSplits.map((s) => ({ handle: s.handle, role: s.role, pct: s.pct })),
+    // `handle` is the name on this game's credits, which is per-game on
+    // purpose — someone can be "kai (art)" here and something else elsewhere.
+    // `profile` is the person behind it, and null when they have never signed
+    // in: an invited collaborator is credited and paid from the first sale
+    // whether or not they ever open the site.
+    splits: gameSplits.map((s) => ({
+      handle: s.handle,
+      role: s.role,
+      pct: s.pct,
+      profile: credits?.get(s.id) ?? null,
+    })),
     rating: rating?.rating ?? 0,
     reviewCount: rating?.reviewCount ?? 0,
     // a real count at last, batched the same way rating is above — the
@@ -610,7 +691,7 @@ gameRouter.post(
   "/:id/publish",
   requireAuth,
   asyncHandler(async (req, res) => {
-    const game = await db.query.games.findFirst({ where: eq(games.id, param(req, "id")) });
+    const game = await findGameByRef(param(req, "id"));
     if (!game) throw Errors.notFound("Game");
 
     const studio = await db.query.studios.findFirst({ where: eq(studios.id, game.studioId) });
@@ -678,7 +759,7 @@ gameRouter.get(
   "/:id/download",
   optionalAuth,
   asyncHandler(async (req, res) => {
-    const game = await db.query.games.findFirst({ where: eq(games.id, param(req, "id")) });
+    const game = await findGameByRef(param(req, "id"));
     if (!game) throw Errors.notFound("Game");
 
     // Free, or already bought. Both answered in services/games/download.ts,
@@ -781,7 +862,7 @@ gameRouter.get(
   "/:id/build.zip",
   requireAuth,
   asyncHandler(async (req, res) => {
-    const game = await db.query.games.findFirst({ where: eq(games.id, param(req, "id")) });
+    const game = await findGameByRef(param(req, "id"));
     if (!game) throw Errors.notFound("Game");
     if (game.status === "removed") throw Errors.notFound("Game");
 
@@ -813,7 +894,7 @@ gameRouter.get(
   "/:id/owned",
   requireAuth,
   asyncHandler(async (req, res) => {
-    const game = await db.query.games.findFirst({ where: eq(games.id, param(req, "id")) });
+    const game = await findGameByRef(param(req, "id"));
     if (!game) throw Errors.notFound("Game");
     const result = await ownsGame(req.auth!.evmAddress, game.htsTokenId);
     res.json(result);
@@ -857,7 +938,7 @@ gameRouter.post(
   "/:id/pay/prepare",
   requireAuth,
   asyncHandler(async (req, res) => {
-    const game = await db.query.games.findFirst({ where: eq(games.id, param(req, "id")) });
+    const game = await findGameByRef(param(req, "id"));
     if (!game) throw Errors.notFound("Game");
 
     // Free or already owned, so there is nothing to sign. Answered here rather
@@ -904,7 +985,7 @@ gameRouter.post(
   validate(completePaymentSchema),
   asyncHandler(async (req, res) => {
     const body = req.body as z.infer<typeof completePaymentSchema>;
-    const game = await db.query.games.findFirst({ where: eq(games.id, param(req, "id")) });
+    const game = await findGameByRef(param(req, "id"));
     if (!game) throw Errors.notFound("Game");
 
     const result = await completePayment({
@@ -929,31 +1010,31 @@ gameRouter.get(
   validate(listReviewsSchema, "query"),
   asyncHandler(async (req, res) => {
     const { cursor, limit } = req.query as unknown as z.infer<typeof listReviewsSchema>;
+    // Resolved rather than used raw: the segment may be a slug, and a game that
+    // doesn't exist should say so instead of returning an empty list that reads
+    // like a game with no reviews.
+    const game = await findGameByRef(param(req, "id"));
+    if (!game) throw Errors.notFound("Game");
+
     const rows = await db.query.reviews.findMany({
-      where: and(eq(reviews.gameId, param(req, "id")), cursor ? lt(reviews.createdAt, new Date(cursor)) : undefined),
+      where: and(eq(reviews.gameId, game.id), cursor ? lt(reviews.createdAt, new Date(cursor)) : undefined),
       orderBy: desc(reviews.createdAt),
       limit: limit + 1,
     });
     const hasMore = rows.length > limit;
     const page = hasMore ? rows.slice(0, limit) : rows;
 
-    // batched, not a relation — this is the only place reviews need the
-    // author's address, and it's read-only display, same pattern as the
-    // catalog's rating batching above.
-    const authorIds = [...new Set(page.map((r) => r.userId))];
-    const authors =
-      authorIds.length > 0
-        ? await db.query.users.findMany({ where: inArray(users.id, authorIds), columns: { id: true, evmAddress: true } })
-        : [];
-    const authorById = new Map(authors.map((a) => [a.id, a.evmAddress]));
+    // Batched identity, shared with comments below so the same person is named
+    // the same way in both lists. `author` stays a plain string for the clients
+    // already rendering one; `authorProfile` is what links somewhere.
+    const authors = await authorSummaries(page.map((r) => r.userId));
 
     res.json({
       reviews: page.map((r) => ({
         ...r,
-        // no ENS lookup exists yet (Stage 7) — a truncated address is the
-        // only identity there is to show right now, for anyone.
-        author: truncateAddress(authorById.get(r.userId) ?? "0x0"),
+        author: authors.get(r.userId)?.label ?? truncateAddress("0x0"),
         authorIsEns: false,
+        authorProfile: authors.get(r.userId) ?? null,
       })),
       nextCursor: hasMore ? page[page.length - 1]!.createdAt.toISOString() : null,
     });
@@ -970,7 +1051,7 @@ gameRouter.post(
   requireAuth,
   validate(postReviewSchema),
   asyncHandler(async (req, res) => {
-    const game = await db.query.games.findFirst({ where: eq(games.id, param(req, "id")) });
+    const game = await findGameByRef(param(req, "id"));
     if (!game) throw Errors.notFound("Game");
 
     const { owned } = await ownsGame(req.auth!.evmAddress, game.htsTokenId);
@@ -995,7 +1076,7 @@ gameRouter.post(
   "/:id/like",
   requireAuth,
   asyncHandler(async (req, res) => {
-    const game = await db.query.games.findFirst({ where: eq(games.id, param(req, "id")) });
+    const game = await findGameByRef(param(req, "id"));
     if (!game) throw Errors.notFound("Game");
 
     const existing = await db.query.likes.findFirst({
@@ -1025,7 +1106,7 @@ gameRouter.post(
   "/:id/sessions",
   requireAuth,
   asyncHandler(async (req, res) => {
-    const game = await db.query.games.findFirst({ where: eq(games.id, param(req, "id")) });
+    const game = await findGameByRef(param(req, "id"));
     if (!game) throw Errors.notFound("Game");
     if (game.status === "removed") throw Errors.notFound("Game");
 
@@ -1093,9 +1174,12 @@ gameRouter.get(
   validate(listCommentsSchema, "query"),
   asyncHandler(async (req, res) => {
     const { cursor, limit } = req.query as unknown as z.infer<typeof listCommentsSchema>;
+    const game = await findGameByRef(param(req, "id"));
+    if (!game) throw Errors.notFound("Game");
+
     const rows = await db.query.comments.findMany({
       where: and(
-        eq(comments.gameId, param(req, "id")),
+        eq(comments.gameId, game.id),
         cursor ? lt(comments.createdAt, new Date(cursor)) : undefined,
       ),
       orderBy: desc(comments.createdAt),
@@ -1104,18 +1188,14 @@ gameRouter.get(
     const hasMore = rows.length > limit;
     const page = hasMore ? rows.slice(0, limit) : rows;
 
-    const authorIds = [...new Set(page.map((c) => c.userId))];
-    const authors =
-      authorIds.length > 0
-        ? await db.query.users.findMany({ where: inArray(users.id, authorIds), columns: { id: true, evmAddress: true } })
-        : [];
-    const authorById = new Map(authors.map((a) => [a.id, a.evmAddress]));
+    const authors = await authorSummaries(page.map((c) => c.userId));
 
     res.json({
       comments: page.map((c) => ({
         ...c,
-        author: truncateAddress(authorById.get(c.userId) ?? "0x0"),
+        author: authors.get(c.userId)?.label ?? truncateAddress("0x0"),
         authorIsEns: false,
+        authorProfile: authors.get(c.userId) ?? null,
       })),
       nextCursor: hasMore ? page[page.length - 1]!.createdAt.toISOString() : null,
     });
@@ -1129,7 +1209,7 @@ gameRouter.post(
   requireAuth,
   validate(postCommentSchema),
   asyncHandler(async (req, res) => {
-    const game = await db.query.games.findFirst({ where: eq(games.id, param(req, "id")) });
+    const game = await findGameByRef(param(req, "id"));
     if (!game) throw Errors.notFound("Game");
 
     const [comment] = await db

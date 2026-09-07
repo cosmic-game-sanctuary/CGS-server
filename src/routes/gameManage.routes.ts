@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { and, asc, eq, inArray, or } from "drizzle-orm";
+import { and, asc, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import multer from "multer";
 import { db } from "../db/client.js";
@@ -23,9 +23,10 @@ import { requireAuth } from "../middleware/auth.middleware.js";
 import { validate } from "../middleware/validate.middleware.js";
 import { asyncHandler } from "../lib/asyncHandler.js";
 import { AppError, Errors } from "../lib/errors.js";
-import { param, isUuid } from "../lib/params.js";
+import { param } from "../lib/params.js";
 import { assetDecimals, toDisplayAmount } from "../lib/display.js";
 import { loadManageableGame } from "../services/studios/access.js";
+import { findGameByRef } from "../services/games/lookup.js";
 import { ingestBuild, commitBuild, listBuilds } from "../services/games/builds.js";
 import { announce, changePrice, priceHistory } from "../services/games/listing.js";
 import { deleteBuild } from "../services/games/buildStore.js";
@@ -50,16 +51,6 @@ import logger from "../utils/logger.utils.js";
 const gameManageRouter = Router({ caseSensitive: true, strict: true });
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
-
-/**
- * By id or by slug, for the two routes here that are public. Every link into
- * them comes off a game page, which knows a slug and may not know an id.
- */
-async function findGame(idOrSlug: string) {
-  return db.query.games.findFirst({
-    where: isUuid(idOrSlug) ? or(eq(games.id, idOrSlug), eq(games.slug, idOrSlug)) : eq(games.slug, idOrSlug),
-  });
-}
 
 /** Load the game and refuse unless this caller may change it. */
 async function requireManageable(gameId: string, userId: string) {
@@ -246,7 +237,7 @@ async function notifyOwnersOfBuild(game: typeof games.$inferSelect, version: num
 gameManageRouter.get(
   "/:id/builds",
   asyncHandler(async (req, res) => {
-    const game = await findGame(param(req, "id"));
+    const game = await findGameByRef(param(req, "id"));
     if (!game || game.status === "removed") throw Errors.notFound("Game");
     res.json({ current: game.buildVersion, builds: await listBuilds(game.id) });
   }),
@@ -257,7 +248,7 @@ gameManageRouter.get(
 gameManageRouter.get(
   "/:id/price-history",
   asyncHandler(async (req, res) => {
-    const game = await findGame(param(req, "id"));
+    const game = await findGameByRef(param(req, "id"));
     if (!game || game.status === "removed") throw Errors.notFound("Game");
 
     const history = await priceHistory(game);

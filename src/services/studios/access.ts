@@ -1,7 +1,7 @@
 import { and, eq, isNotNull } from "drizzle-orm";
 import { db } from "../../db/client.js";
-import { studios, studioMembers, games } from "../../db/schema.js";
-import { isUuid } from "../../lib/params.js";
+import { studios, studioMembers } from "../../db/schema.js";
+import { findGameByRef } from "../games/lookup.js";
 
 /**
  * Who is allowed to do what inside a studio.
@@ -64,12 +64,10 @@ export async function canManageStudio(studioId: string, userId: string | undefin
  * Every mutating game route needs both and doing it separately meant two round
  * trips and two chances to check the wrong thing.
  */
-export async function loadManageableGame(gameId: string, userId: string | undefined) {
-  // Comparing a non-uuid against a uuid column makes Postgres throw
-  // "invalid input syntax for type uuid", which surfaces as a 500 on what is
-  // really a 404. See lib/params.ts#isUuid.
-  if (!isUuid(gameId)) return { game: null, canManage: false } as const;
-  const game = await db.query.games.findFirst({ where: eq(games.id, gameId) });
+export async function loadManageableGame(idOrSlug: string, userId: string | undefined) {
+  // By slug as well as by id, like every other game route — see
+  // services/games/lookup.ts for why that isn't just convenience.
+  const game = await findGameByRef(idOrSlug);
   if (!game) return { game: null, canManage: false } as const;
   return { game, canManage: await canManageStudio(game.studioId, userId) } as const;
 }

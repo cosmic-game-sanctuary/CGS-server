@@ -17,6 +17,7 @@ import { env } from "../config/env.js";
 import { emailStudioInvite } from "../services/email/messages.js";
 import { studioEarnings } from "../services/earnings/report.js";
 import { isStudioMember } from "../services/studios/access.js";
+import { authorSummaries } from "../services/users/profile.js";
 
 const studioRouter = Router({ caseSensitive: true, strict: true });
 
@@ -163,7 +164,7 @@ studioRouter.get(
     const [members, studioGames, owner] = await Promise.all([
       db.query.studioMembers.findMany({
         where: eq(studioMembers.studioId, studio.id),
-        columns: { id: true, handle: true, role: true, acceptedAt: true, email: true },
+        columns: { id: true, handle: true, role: true, acceptedAt: true, email: true, userId: true },
       }),
       db.query.games.findMany({
         // A draft is a game its studio hasn't announced — a title and cover
@@ -181,6 +182,10 @@ studioRouter.get(
       }),
     ]);
 
+    const memberProfiles = await authorSummaries(
+      members.map((m) => m.userId).filter((id): id is string => id !== null),
+    );
+
     // This page is public, so a member's email can't be. The id is safe and
     // the splits editor needs it to name someone who has no wallet yet; the
     // address is the studio's own, which every listing already shows.
@@ -197,6 +202,10 @@ studioRouter.get(
         handle: m.handle,
         role: m.role,
         acceptedAt: m.acceptedAt,
+        // Null for anyone who was invited by email and hasn't signed in. That
+        // is a real state, not a gap: they are on the team and on the splits
+        // already, they just have no page yet.
+        profile: m.userId ? (memberProfiles.get(m.userId) ?? null) : null,
         ...(isOwner ? { email: m.email } : {}),
       })),
       games: studioGames,

@@ -12,6 +12,7 @@ import { pingMirror } from "./services/hedera/mirror.js";
 
 import gameRouter from "./routes/game.routes.js";
 import gameManageRouter from "./routes/gameManage.routes.js";
+import userRouter from "./routes/user.routes.js";
 import studioRouter from "./routes/studio.routes.js";
 import inviteRouter from "./routes/invite.routes.js";
 import notificationRouter from "./routes/notification.routes.js";
@@ -50,6 +51,7 @@ app.use("/api/comments", commentRouter);
 app.use("/api/agents", agentRouter);
 app.use("/api/reports", reportRouter);
 app.use("/api/me", meRouter);
+app.use("/api/users", userRouter);
 
 // Not mounted at all unless asked for, so in any other configuration the path
 // 404s like anything else that doesn't exist. See routes/dev.routes.ts.

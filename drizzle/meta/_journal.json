@@ -71,6 +71,13 @@
       "when": 1788784550321,
       "tag": "0009_game_versioning",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1788785488518,
+      "tag": "0010_user_profiles",
+      "breakpoints": true
     }
   ]
 }

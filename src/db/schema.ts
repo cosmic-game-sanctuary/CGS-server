@@ -5,6 +5,7 @@ import {
   text,
   integer,
   bigint,
+  boolean,
   timestamp,
   jsonb,
   uniqueIndex,
@@ -86,6 +87,24 @@ export const users = pgTable("users", {
   privyDid: text("privy_did").notNull().unique(),
   email: text("email").notNull(),
   evmAddress: text("evm_address").notNull(),
+  // The public name. Everything a person did — a review, a comment, a credit
+  // on a game's splits — used to display as a truncated address, which made
+  // every author on the site look like the same anonymous stranger and gave
+  // nobody a page to link to. Lowercased and unique, because it is an address:
+  // /u/:handle. Assigned at first sign-in from the email's local part, and
+  // changeable afterwards.
+  //
+  // Not the same thing as `studioMembers.handle`, which is the name on one
+  // game's credits and can differ per studio on purpose.
+  handle: text("handle"),
+  // What is actually printed. A handle has to be URL-safe; a name does not.
+  displayName: text("display_name"),
+  bio: text("bio"),
+  avatarCid: text("avatar_cid"),
+  // Whether strangers see what this person owns. Default open, because a
+  // storefront where nobody can see what anyone plays has no social surface at
+  // all — but it is a real choice and some people will want it off.
+  libraryPublic: boolean("library_public").notNull().default(true),
   // Privy's internal wallet id + compressed public key — both needed to sign
   // a payment on this user's behalf via secp256k1_sign. Neither is secret;
   // Privy still holds the private key.
@@ -101,7 +120,7 @@ export const users = pgTable("users", {
   // the account resolves on the mirror node. see services/hedera/mirror.ts.
   hederaAccountId: text("hedera_account_id"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
-});
+}, (table) => [uniqueIndex("users_handle_idx").on(table.handle)]);
 
 export const studios = pgTable("studios", {
   id: uuid("id").primaryKey().defaultRandom(),
