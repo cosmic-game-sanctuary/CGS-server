@@ -84,6 +84,10 @@ export const notificationTypeEnum = pgEnum("notification_type", [
   "price_drop",
   // A studio replied to your review.
   "review_reply",
+  // A report you filed — on a game, a review, or a comment — was resolved.
+  // The one message that closes the loop: before this, a reporter had no way
+  // to learn whether anything happened after they reported something.
+  "report_resolved",
 ]);
 
 export const users = pgTable("users", {
@@ -397,6 +401,36 @@ export const moderationReports = pgTable("moderation_reports", {
   reportedAt: timestamp("reported_at", { withTimezone: true }).defaultNow().notNull(),
   resolvedAt: timestamp("resolved_at", { withTimezone: true }),
   action: reportActionEnum("action").notNull().default("none"),
+});
+
+export const contentReportTargetEnum = pgEnum("content_report_target", ["review", "comment"]);
+// Deliberately smaller than `report_action`: there is no "delisted" or
+// "removed_from_storage" equivalent for a review or a comment, only whether it
+// stayed or was taken down.
+export const contentReportActionEnum = pgEnum("content_report_action", ["none", "removed"]);
+
+// A report against a review or a comment — the two user-generated surfaces a
+// game report can't cover, since delisting a whole game over one bad review is
+// the wrong tool. `targetId` points at `reviews.id` or `comments.id` depending
+// on `targetType`; it's not a foreign key because it names one of two tables,
+// which Postgres has no way to express as a single constraint.
+//
+// Unlike a game report, **this never acts automatically.** A game report
+// delists on submission because the downside of a false positive (briefly
+// unlisted, easily restored) is small next to the downside of leaving up
+// something that shouldn't be. That trade is upside down here: instantly
+// hiding a review on a single report would hand any developer a one-click way
+// to silence a negative-but-honest review of their own game. So a report here
+// only queues for a human to look at — see services/moderation/contentReports.ts.
+export const contentReports = pgTable("content_reports", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  targetType: contentReportTargetEnum("target_type").notNull(),
+  targetId: uuid("target_id").notNull(),
+  reporterUserId: uuid("reporter_user_id").notNull().references(() => users.id),
+  reason: text("reason").notNull(),
+  reportedAt: timestamp("reported_at", { withTimezone: true }).defaultNow().notNull(),
+  resolvedAt: timestamp("resolved_at", { withTimezone: true }),
+  action: contentReportActionEnum("action").notNull().default("none"),
 });
 
 // only the two sides the catalog query actually uses (`with: { studio: true }`)

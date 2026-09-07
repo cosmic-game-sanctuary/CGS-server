@@ -6,7 +6,7 @@
 // demo, the same shape as scripts/retry-failed-splits.ts.
 import { eq, isNull } from "drizzle-orm";
 import { db } from "../../db/client.js";
-import { games, gameMedia, moderationReports } from "../../db/schema.js";
+import { games, gameMedia, moderationReports, notifications } from "../../db/schema.js";
 import { unpinByCid } from "../ipfs/pinata.js";
 import { deleteBuild } from "../games/buildStore.js";
 
@@ -56,5 +56,25 @@ export async function resolveReport(reportId: string, action: ReportAction) {
     .returning();
 
   const updatedGame = await db.query.games.findFirst({ where: eq(games.id, game.id) });
+
+  // The reporter used to have no way to learn what happened after they
+  // reported something — the report vanished into a queue and, if the action
+  // was "none", the game just quietly came back. `reporterUserId` is nullable
+  // (an operator can raise a report with no specific reporter behind it), so
+  // this only fires when there's someone real to tell.
+  if (report.reporterUserId) {
+    await db.insert(notifications).values({
+      userId: report.reporterUserId,
+      type: "report_resolved",
+      payload: {
+        reportKind: "game" as const,
+        gameId: game.id,
+        slug: game.slug,
+        title: game.title,
+        action,
+      },
+    });
+  }
+
   return { report: updatedReport, game: updatedGame };
 }
