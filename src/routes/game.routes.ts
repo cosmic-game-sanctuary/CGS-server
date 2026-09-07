@@ -32,6 +32,7 @@ import { param, isUuid } from "../lib/params.js";
 import { assetDecimals, ensFullName, toDisplayAmount } from "../lib/display.js";
 import { authorSummaries, type AuthorSummary } from "../services/users/profile.js";
 import { findGameByRef } from "../services/games/lookup.js";
+import { activePromotionFor, serializePromotion } from "../services/games/promotions.js";
 import {
   listSaves,
   readSave,
@@ -344,6 +345,8 @@ gameRouter.get(
       studioExtrasFor([game.studioId]),
     ]);
 
+    const activeSale = await activePromotionFor(game.id);
+
     let owned: boolean | undefined;
     let liked: boolean | undefined;
     if (req.auth) {
@@ -370,6 +373,10 @@ gameRouter.get(
       liked,
       // The same value under the name the list actually has now.
       wishlisted: liked,
+      // The sale this price came from, when it came from one. `endsAt` is the
+      // part worth rendering — a discount with a visible deadline is a
+      // different thing from a cheap game.
+      promotion: activeSale ? serializePromotion(activeSale) : null,
     });
   }),
 );

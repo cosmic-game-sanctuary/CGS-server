@@ -19,6 +19,7 @@ import {
   users,
   wishlistAgents,
   saveStates,
+  gamePromotions,
 } from "../db/schema.js";
 import { requireAuth } from "../middleware/auth.middleware.js";
 import { validate } from "../middleware/validate.middleware.js";
@@ -31,6 +32,14 @@ import { findGameByRef } from "../services/games/lookup.js";
 import { ingestBuild, commitBuild, listBuilds } from "../services/games/builds.js";
 import { announce, changePrice, priceHistory } from "../services/games/listing.js";
 import { notifyPriceDrop, wishlistCount } from "../services/games/wishlist.js";
+import {
+  activePromotionFor,
+  createPromotion,
+  endPromotion,
+  extendPromotion,
+  promotionHistory,
+  serializePromotion,
+} from "../services/games/promotions.js";
 import { deleteBuild } from "../services/games/buildStore.js";
 import { gatewayUrl, pinFile, unpinByCid } from "../services/ipfs/pinata.js";
 import { checkImages } from "../services/moderation/csam.js";
@@ -132,6 +141,20 @@ gameManageRouter.patch(
     // so the message it sends carries the new title too.
     let priceChanged: Awaited<ReturnType<typeof changePrice>> | null = null;
     if (body.priceUnits !== undefined && body.priceUnits !== game.priceUnits) {
+      // A running sale owns the price until it ends — it captured a base price
+      // to put back, and editing underneath it would either be silently undone
+      // at `endsAt` or would revert to a number nobody chose. Say which sale,
+      // and what to do about it, rather than just refusing.
+      const running = await activePromotionFor(game.id);
+      if (running) {
+        throw new AppError(
+          409,
+          "PROMOTION_ACTIVE",
+          "This game is on sale. Change or end the sale instead of setting the price directly.",
+          { promotionId: running.id, endsAt: running.endsAt },
+        );
+      }
+
       priceChanged = await changePrice(updated, body.priceUnits, req.auth!.id);
       updated = priceChanged.game;
 
@@ -490,6 +513,117 @@ gameManageRouter.delete(
     await unpinByCid(media.cid).catch((err) => logger.warn({ err, cid: media.cid }, "unpin failed"));
 
     res.json({ deleted: true, id: media.id });
+  }),
+);
+
+// --- sales ------------------------------------------------------------------
+//
+// A sale is a *scheduled* price, not a special kind of price. Everything here
+// ends up in `changePrice`, so a promotional move produces the same history
+// row, the same topic message and the same wishlist notifications a manual one
+// does — plus the end date, which is what anything reading the topic needs in
+// order to reason about deadlines rather than guess.
+
+const newPromotionSchema = z.object({
+  salePriceUnits: z.number().int().nonnegative(),
+  // Omit to start now. A scheduled sale is announced when it starts, not when
+  // it is created — the topic describes what is on offer, not what is planned.
+  startsAt: z.string().datetime().optional(),
+  endsAt: z.string().datetime(),
+  // Reviving an ended sale points at the old one rather than editing it.
+  supersedesId: z.string().uuid().optional(),
+});
+
+gameManageRouter.post(
+  "/:id/promotions",
+  requireAuth,
+  validate(newPromotionSchema),
+  asyncHandler(async (req, res) => {
+    const game = await requireManageable(param(req, "id"), req.auth!.id);
+    const body = req.body as z.infer<typeof newPromotionSchema>;
+
+    const promotion = await createPromotion(
+      game,
+      {
+        salePriceUnits: body.salePriceUnits,
+        startsAt: body.startsAt ? new Date(body.startsAt) : undefined,
+        endsAt: new Date(body.endsAt),
+        supersedesId: body.supersedesId ?? null,
+      },
+      req.auth!.id,
+    );
+
+    res.status(201).json(serializePromotion(promotion));
+  }),
+);
+
+// Public: a game's sale history is price history, and price history here is
+// meant to be checkable by someone who doesn't trust us.
+gameManageRouter.get(
+  "/:id/promotions",
+  asyncHandler(async (req, res) => {
+    const game = await findGameByRef(param(req, "id"));
+    if (!game || game.status === "removed") throw Errors.notFound("Game");
+    const active = await activePromotionFor(game.id);
+    res.json({
+      active: active ? serializePromotion(active) : null,
+      history: await promotionHistory(game.id),
+    });
+  }),
+);
+
+const extendSchema = z.object({ endsAt: z.string().datetime() });
+
+gameManageRouter.patch(
+  "/:id/promotions/:promotionId",
+  requireAuth,
+  validate(extendSchema),
+  asyncHandler(async (req, res) => {
+    const game = await requireManageable(param(req, "id"), req.auth!.id);
+    const promotion = await db.query.gamePromotions.findFirst({
+      where: and(
+        eq(gamePromotions.id, param(req, "promotionId")),
+        eq(gamePromotions.gameId, game.id),
+      ),
+    });
+    if (!promotion) throw Errors.notFound("Sale");
+
+    const updated = await extendPromotion(promotion, new Date(req.body.endsAt));
+    res.json(serializePromotion(updated));
+  }),
+);
+
+// Ending a sale early. Announced like any other price change — a deadline that
+// was published has to be seen to move.
+gameManageRouter.delete(
+  "/:id/promotions/:promotionId",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const game = await requireManageable(param(req, "id"), req.auth!.id);
+    const promotion = await db.query.gamePromotions.findFirst({
+      where: and(
+        eq(gamePromotions.id, param(req, "promotionId")),
+        eq(gamePromotions.gameId, game.id),
+      ),
+    });
+    if (!promotion) throw Errors.notFound("Sale");
+
+    if (promotion.status === "scheduled") {
+      // Never started, so there is no price to put back and nothing to announce.
+      const [cancelled] = await db
+        .update(gamePromotions)
+        .set({ status: "cancelled", updatedAt: new Date() })
+        .where(eq(gamePromotions.id, promotion.id))
+        .returning();
+      res.json(serializePromotion(cancelled!));
+      return;
+    }
+    if (promotion.status !== "active") {
+      throw Errors.validationFailed({ promotionId: "that sale is already over" });
+    }
+
+    const ended = await endPromotion(promotion, "cancelled");
+    res.json(serializePromotion(ended ?? promotion));
   }),
 );
 

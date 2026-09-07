@@ -92,7 +92,17 @@ export async function announce(
  * Silently dropping the change would leave the price history with a gap and no
  * way to know one existed.
  */
-export async function changePrice(game: Game, toUnits: number, byUserId: string) {
+export async function changePrice(
+  game: Game,
+  toUnits: number,
+  // Null when nobody pressed anything — a promotion reverting on its own
+  // schedule is a real price change with no author.
+  byUserId: string | null,
+  // Extra fields for the topic message. A promotional change carries its
+  // `endsAt`, which is the whole reason anything reading the topic can reason
+  // about deadlines rather than guessing — see services/games/promotions.ts.
+  announceExtra: Record<string, unknown> = {},
+) {
   const fromUnits = game.priceUnits;
 
   const [updated] = await db
@@ -104,7 +114,9 @@ export async function changePrice(game: Game, toUnits: number, byUserId: string)
   // A draft has never been on the topic, so there is nothing to correct there
   // and no agent watching it. Its price history starts at publish.
   const hcsTxId =
-    updated!.status === "published" ? await announce(updated!, "price_changed", { fromUnits }) : null;
+    updated!.status === "published"
+      ? await announce(updated!, "price_changed", { fromUnits, ...announceExtra })
+      : null;
 
   const [change] = await db
     .insert(gamePriceChanges)

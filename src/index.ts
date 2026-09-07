@@ -23,6 +23,7 @@ import reportRouter from "./routes/report.routes.js";
 import meRouter from "./routes/me.routes.js";
 import devRouter from "./routes/dev.routes.js";
 import { runWatcherTick } from "./agent/watcher.js";
+import { runPromotionTick } from "./services/games/promotions.js";
 import logger from "./utils/logger.utils.js";
 
 const app: Express = express();
@@ -63,6 +64,19 @@ if (env.DEV_FAUCET === "on") {
   app.use("/api/dev", devRouter);
   logger.warn("DEV_FAUCET is on — /api/dev/faucet will move funds out of the operator account");
 }
+
+// Sales start and end on their own. Both halves claim their rows with a
+// conditional UPDATE, so running a second process never double-applies one.
+// A minute is fine: a sale is a thing measured in days, and `endsAt` is
+// published, so anything reading the topic knows the deadline exactly rather
+// than inferring it from when we happened to notice.
+setInterval(() => {
+  runPromotionTick()
+    .then(({ started, ended }) => {
+      if (started || ended) logger.info({ started, ended }, "promotions moved");
+    })
+    .catch((err) => logger.error({ err }, "promotion tick crashed"));
+}, 60_000);
 
 app.use(notFoundHandler);
 app.use(errorHandler);

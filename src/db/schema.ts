@@ -247,6 +247,53 @@ export const gameBuilds = pgTable(
   (table) => [uniqueIndex("game_builds_game_version_idx").on(table.gameId, table.version)],
 );
 
+export const promotionStatusEnum = pgEnum("promotion_status", [
+  "scheduled",
+  "active",
+  "ended",
+  "cancelled",
+]);
+
+// A sale: a price, a start, an end, and an automatic revert.
+//
+// Before this a "sale" was a developer changing a number and remembering to
+// change it back, which is why sales barely happened. Two things follow from
+// making it a real record:
+//
+//   The revert is ours to do, not theirs to remember. `ends_at` passing is what
+//   restores `base_price_units`, and both the start and the end go on the
+//   public listings topic like any other price change.
+//
+//   **`ends_at` is published**, which is what makes deadline reasoning possible
+//   for anything reading the topic. An agent can only safely wait for a better
+//   price if it knows when waiting stops being an option — see
+//   ../../docs/wishlist-agent-spec.md §4.
+export const gamePromotions = pgTable("game_promotions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  gameId: uuid("game_id").notNull().references(() => games.id),
+  salePriceUnits: bigint("sale_price_units", { mode: "number" }).notNull(),
+  // Captured when the promotion is created, and what the price returns to when
+  // it ends. Stored rather than re-read at revert time because the listing
+  // price *is* the sale price while it runs, so by then the original is gone.
+  basePriceUnits: bigint("base_price_units", { mode: "number" }).notNull(),
+  asset: text("asset").notNull(),
+  startsAt: timestamp("starts_at", { withTimezone: true }).notNull(),
+  endsAt: timestamp("ends_at", { withTimezone: true }).notNull(),
+  status: promotionStatusEnum("status").notNull().default("scheduled"),
+  createdByUserId: uuid("created_by_user_id").references(() => users.id),
+  // Both ends of a sale are public events, so both get a transaction id.
+  hcsStartTxId: text("hcs_start_tx_id"),
+  hcsEndTxId: text("hcs_end_tx_id"),
+  // A sale that ended and was brought back is a *new* row pointing at the old
+  // one, never an edit of it — so the public history stays truthful about what
+  // was actually on offer when. Deliberately not a foreign key: it references
+  // this same table, and drizzle needs a type annotation dance for self
+  // references that buys nothing here.
+  supersedesId: uuid("supersedes_id"),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
 // One row per price change, each carrying the HCS message that announced it.
 //
 // Every storefront could show a price history and none of them can make it
