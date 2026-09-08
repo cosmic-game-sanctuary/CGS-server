@@ -56,7 +56,12 @@ async function readChallenge(gameId: string): Promise<ChallengeResult> {
 }
 
 /** Sign the challenge with whatever signer, then retry the gated request. */
-async function settle(gameId: string, challenge: Challenge, signer: ClientHederaSigner) {
+async function settle(
+  gameId: string,
+  challenge: Challenge,
+  signer: ClientHederaSigner,
+  ownerAccountId?: string,
+) {
   const scheme = new ExactHederaScheme(signer);
   const { payload } = await scheme.createPaymentPayload(
     challenge.x402Version,
@@ -73,7 +78,15 @@ async function settle(gameId: string, challenge: Challenge, signer: ClientHedera
     }),
   ).toString("base64");
 
-  const paid = await fetch(downloadUrl(gameId), { headers: { "payment-signature": header } });
+  const headers: Record<string, string> = { "payment-signature": header };
+  // Who pays and who owns are the same person for every purchase except an
+  // agent's — it pays with its own wallet, on behalf of whoever funded it.
+  // The route only honours this when the payer really is a known agent (see
+  // game.routes.ts's download handler), so a regular buyer sending this
+  // header changes nothing about their own purchase.
+  if (ownerAccountId) headers["x-owner-account-id"] = ownerAccountId;
+
+  const paid = await fetch(downloadUrl(gameId), { headers });
   const body = (await paid.json()) as {
     error?: { code?: string; message?: string; details?: unknown };
   };
@@ -94,10 +107,10 @@ async function settle(gameId: string, challenge: Challenge, signer: ClientHedera
  * That means the agent's wallet, which we created and therefore have authority
  * over. A person's embedded wallet is not one of these; see preparePayment.
  */
-export async function payForGame(gameId: string, payer: PrivyPayer) {
+export async function payForGame(gameId: string, payer: PrivyPayer, ownerAccountId?: string) {
   const result = await readChallenge(gameId);
   if (result.paid) return result.body;
-  return settle(gameId, result.challenge, createPrivyHederaSigner(payer));
+  return settle(gameId, result.challenge, createPrivyHederaSigner(payer), ownerAccountId);
 }
 
 export type PreparedPayment = {

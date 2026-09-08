@@ -14,6 +14,7 @@ import {
   users,
   playSessions,
   wishlistItems,
+  wishlistAgents,
   comments,
   gameBuilds,
 } from "../db/schema.js";
@@ -47,6 +48,7 @@ import {
   wishlistCount,
   announceDemandIfMilestone,
 } from "../services/games/wishlist.js";
+import { agentBalance } from "../services/agent/wallet.js";
 import logger from "../utils/logger.utils.js";
 import { pinFile, gatewayUrl } from "../services/ipfs/pinata.js";
 import { ingestBuild, commitBuild } from "../services/games/builds.js";
@@ -874,7 +876,22 @@ gameRouter.get(
     // Awaited, though, because fulfilPurchase records the purchase before it
     // returns and only the chain work runs on. The client asks for the build
     // the instant this responds, and that request checks the record.
-    const buyerAccountId = settlement.payer ?? payload.accepted?.payTo;
+    let buyerAccountId = settlement.payer ?? payload.accepted?.payTo;
+
+    // An agent pays with its own wallet on behalf of whoever funded it — the
+    // GameKey belongs to that person, not to the agent's own account, which
+    // nobody ever logs into. Only honoured when the account that actually
+    // signed the payment is a real agent's, so this header changes nothing
+    // for an ordinary buyer's own purchase.
+    const ownerOverride = req.headers["x-owner-account-id"];
+    if (typeof ownerOverride === "string" && settlement.payer) {
+      const payerIsAgent = await db.query.wishlistAgents.findFirst({
+        where: eq(wishlistAgents.agentAccountId, settlement.payer),
+        columns: { id: true },
+      });
+      if (payerIsAgent) buyerAccountId = ownerOverride;
+    }
+
     if (buyerAccountId) {
       await fulfilPurchase(game, buyerAccountId, settlement.transaction);
     }
@@ -1181,6 +1198,67 @@ gameRouter.delete(
     if (!game) throw Errors.notFound("Game");
     await removeFromWishlist(game.id, req.auth!.id);
     res.json(await wishlistState(game.id, req.auth!.id, false));
+  }),
+);
+
+// Upgrading a plain wishlist row into a "want" the agent may act on — see
+// wishlist-agent-spec.md §2. Deliberately not a separate table: same row,
+// one extra field, so un-wishlisting a game removes the want along with it
+// and there is exactly one list to look at rather than two that can disagree.
+const setWantSchema = z
+  .object({
+    // Null clears the want and leaves a plain wishlist entry. Omit to leave
+    // it as it is.
+    agentMaxUnits: z.number().int().positive().nullable().optional(),
+    agentNote: z.string().max(280).nullable().optional(),
+  })
+  .refine((b) => Object.keys(b).length > 0, { message: "nothing to change" });
+
+gameRouter.patch(
+  "/:id/wishlist",
+  requireAuth,
+  validate(setWantSchema),
+  asyncHandler(async (req, res) => {
+    const game = await findGameByRef(param(req, "id"));
+    if (!game) throw Errors.notFound("Game");
+    const body = req.body as z.infer<typeof setWantSchema>;
+
+    const item = await db.query.wishlistItems.findFirst({
+      where: and(eq(wishlistItems.gameId, game.id), eq(wishlistItems.userId, req.auth!.id)),
+    });
+    if (!item) {
+      throw Errors.validationFailed({ game: "wishlist this game first — POST /api/games/:id/wishlist" });
+    }
+
+    const fields: { agentMaxUnits?: number | null; agentNote?: string | null } = {};
+
+    if (body.agentMaxUnits !== undefined) {
+      if (body.agentMaxUnits !== null) {
+        const agent = await db.query.wishlistAgents.findFirst({ where: eq(wishlistAgents.buyerUserId, req.auth!.id) });
+        if (!agent) {
+          throw new AppError(422, "NO_AGENT", "Set up your agent first.", { setupUrl: "/api/me/agent" });
+        }
+        // The minimum-stake rule: a want is only as real as the money behind
+        // it. Checked against the wallet's live balance, not a number we
+        // remembered, for the same reason every balance in this app is read
+        // fresh rather than cached.
+        const balance = await agentBalance(agent);
+        if (balance < BigInt(body.agentMaxUnits)) {
+          throw Errors.validationFailed({
+            agentMaxUnits: `your agent's wallet holds ${balance}, which doesn't cover this want`,
+          });
+        }
+      }
+      fields.agentMaxUnits = body.agentMaxUnits;
+    }
+    if (body.agentNote !== undefined) fields.agentNote = body.agentNote;
+
+    const [updated] = await db.update(wishlistItems).set(fields).where(eq(wishlistItems.id, item.id)).returning();
+    res.json({
+      gameId: game.id,
+      agentMaxUnits: updated!.agentMaxUnits,
+      agentNote: updated!.agentNote,
+    });
   }),
 );
 

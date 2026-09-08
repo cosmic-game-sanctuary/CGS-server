@@ -37,3 +37,9 @@ export const FULL_ADMIN_BITMAP =
 // from under the platform's control — that stays with the operator, same
 // spirit as GameKey treasury staying with the operator rather than the studio.
 export const STUDIO_BITMAP = ROLE_SET_RESOLVER | ROLE_RENEW;
+
+// Identical scope to a studio's, under a different name for clarity at the
+// call site — an agent's subname is "each with their own identity and
+// permissions" (ENS's own stated bonus for this), not a studio's vanity name,
+// even though the actual role set an owner needs is the same either way.
+export const AGENT_BITMAP = STUDIO_BITMAP;

@@ -120,6 +120,20 @@
       "when": 1788814589478,
       "tag": "0016_promotions",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1788839579963,
+      "tag": "0017_agent_1n_step_a",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1788839609370,
+      "tag": "0018_agent_1n_step_b",
+      "breakpoints": true
     }
   ]
 }

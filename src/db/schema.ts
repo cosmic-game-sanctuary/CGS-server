@@ -28,6 +28,10 @@ export const mintStatusEnum = pgEnum("mint_status", [
   "confirmed",
   "failed",
 ]);
+// Rewritten for the 1:N redesign (wishlist-agent-spec.md) — no live rows
+// existed under the old 1:1 shape, so this is a clean replacement rather than
+// an addition. "fired" is gone: an agent with several wants does not end after
+// one purchase, it keeps watching the rest.
 export const agentStatusEnum = pgEnum("agent_status", [
   "draft",
   "funded",
@@ -36,13 +40,23 @@ export const agentStatusEnum = pgEnum("agent_status", [
   // into it, which is what makes a double purchase impossible when a message
   // is replayed or two processes both see the same price drop.
   "buying",
-  // A waiting state, not a failure. The price was met and the wallet was
-  // short, so it keeps watching and keeps re-checking. An agent is never
-  // closed by us — only buying the game or the buyer cancelling ends one.
-  "underfunded",
-  "fired",
-  "failed",
   "cancelled",
+  // Hit its expiry with wants still open. Distinct from `cancelled` only in
+  // who ended it; both return the balance the same way.
+  "expired",
+  "failed",
+]);
+export const agentModeEnum = pgEnum("agent_mode", ["autonomous", "ask_first"]);
+export const agentTimeoutActionEnum = pgEnum("agent_timeout_action", ["buy", "skip"]);
+// What one round of evaluating an agent against a price event produced. Kept
+// even for a plain deterministic buy (no model involved) so the audit trail
+// has one shape from the start — Stage 19 only adds `reasoning` to it, it
+// does not introduce the table.
+export const agentDecisionKindEnum = pgEnum("agent_decision_kind", [
+  "bought",
+  "held",
+  "declined",
+  "asked",
 ]);
 export const reportActionEnum = pgEnum("report_action", [
   "none",
@@ -72,6 +86,16 @@ export const notificationTypeEnum = pgEnum("notification_type", [
   "agent_underfunded",
   "agent_cancelled",
   "agent_failed",
+  // A purchase the agent made on its own — the 1:N replacement for
+  // `agent_fired`, which named a thing that could only ever happen once.
+  // `agent_fired` stays in this type (Postgres cannot drop an enum value) but
+  // nothing writes it any more.
+  "agent_purchased",
+  // Its expiry passed. The balance was returned; this is what tells the
+  // person that happened and why.
+  "agent_expired",
+  // Ask-first mode found real contention and wants an answer before deciding.
+  "agent_asked",
   // The game an agent is watching stopped being for sale. It cannot fire now,
   // but we still don't close it — the buyer decides that, and their money is
   // sitting in it.
@@ -389,11 +413,17 @@ export const reviews = pgTable("reviews", {
   developerReplyByUserId: uuid("developer_reply_by_user_id").references(() => users.id),
 });
 
+// One per person — the 1:N redesign. A "want" (which game, up to what price)
+// lives on the wishlist row it upgrades (see `wishlistItems.agentMaxUnits`
+// below), not here. This table is the wallet, the identity, and the settings
+// that apply across every want at once.
 export const wishlistAgents = pgTable("wishlist_agents", {
   id: uuid("id").primaryKey().defaultRandom(),
-  buyerUserId: uuid("buyer_user_id").notNull().references(() => users.id),
+  buyerUserId: uuid("buyer_user_id").notNull().unique().references(() => users.id),
   // the agent's wallet. always a separate wallet from the buyer's own — never
-  // the same one. its balance is the spending cap, nothing else.
+  // the same one. its balance is the spending cap, nothing else, and it is
+  // never mirrored into a column here — see me.routes.ts's own balance field
+  // for why a cached balance is just a wrong balance waiting to happen.
   agentWalletId: text("agent_wallet_id").notNull(),
   agentEvmAddress: text("agent_evm_address").notNull(),
   // captured at wallet creation — needed to sign a payment with this
@@ -401,28 +431,46 @@ export const wishlistAgents = pgTable("wishlist_agents", {
   // null-until-first-outgoing-tx gotcha the account id already has.
   agentPublicKeyHex: text("agent_public_key_hex").notNull(),
   agentAccountId: text("agent_account_id"),
-  targetGameId: uuid("target_game_id").notNull().references(() => games.id),
-  triggerPriceUnits: bigint("trigger_price_units", { mode: "number" }).notNull(),
   hcs14Aid: text("hcs14_aid"),
   status: agentStatusEnum("status").notNull().default("draft"),
-  // Dead since the listener replaced the poller: the cursor is shared now and
-  // lives in `listenerState`. Kept rather than dropped only because removing a
-  // column mid-migration needs an interactive rename/drop answer; nothing
-  // reads it.
-  lastSeenSequence: integer("last_seen_sequence").notNull().default(0),
-  // The price it last saw and could not afford. Kept so a top-up can complete
-  // the purchase without waiting for another price message, which may never
-  // come.
-  pendingPriceUnits: bigint("pending_price_units", { mode: "number" }),
-  // Drives the sweep's backoff. Agents abandoned without funding stay
-  // underfunded forever by design, so checking every one of them every minute
-  // would grow without bound; the longer one has waited, the less often it is
-  // looked at.
-  underfundedSince: timestamp("underfunded_since", { withTimezone: true }),
-  lastBalanceCheckAt: timestamp("last_balance_check_at", { withTimezone: true }),
-  // So a stuck agent is mentioned once rather than on every price change.
-  notifiedShortfallUnits: bigint("notified_shortfall_units", { mode: "number" }),
-  underfundedNotifiedAt: timestamp("underfunded_notified_at", { withTimezone: true }),
+  // Autonomous acts and tells you after. Ask-first sends the recommendation
+  // and waits, but only when a human could plausibly answer before the sale
+  // ends — see services/agent/decide.ts.
+  mode: agentModeEnum("mode").notNull().default("autonomous"),
+  // What happens if an ask-first question goes unanswered past its deadline.
+  // Defaults to buying: the person funded a wallet in order to buy things,
+  // and defaulting to inaction contradicts why they set it up.
+  onTimeout: agentTimeoutActionEnum("on_timeout").notNull().default("buy"),
+  // Null = watches indefinitely. When set and passed, the sweep cancels the
+  // agent and returns its balance automatically — see agent/sweep.ts.
+  expiresAt: timestamp("expires_at", { withTimezone: true }),
+  // Optional human-readable identity, minted the same way a studio subname is
+  // — same subregistry, same real on-chain availability check — so "my agent
+  // is scout.cgs-sanctuary.eth" is something a person can actually have
+  // instead of a raw EVM address. Entirely optional; an agent works the same
+  // without one.
+  ensLabel: text("ens_label"),
+  ensTxHash: text("ens_tx_hash"),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+// The audit trail: what the agent considered, what it chose, and why. Written
+// even for a plain deterministic buy with no model involved — `reasoning` is
+// null there — so the shape exists before Stage 19 needs it rather than being
+// introduced alongside the model. This is what makes "the agent's thinking is
+// inspectable" true rather than a claim.
+export const agentDecisions = pgTable("agent_decisions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  agentId: uuid("agent_id").notNull().references(() => wishlistAgents.id),
+  kind: agentDecisionKindEnum("kind").notNull(),
+  consideredGameIds: uuid("considered_game_ids").array().notNull().default([]),
+  chosenGameIds: uuid("chosen_game_ids").array().notNull().default([]),
+  // Null for a deterministic decision (Shape A/B — no contention, nothing to
+  // explain). Populated once contention actually requires a model (Stage 19).
+  reasoning: text("reasoning"),
+  inferenceCostUnits: bigint("inference_cost_units", { mode: "number" }),
+  // Set only while a hold or an ask-first question has not yet resolved.
+  decideBy: timestamp("decide_by", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
@@ -543,6 +591,17 @@ export const wishlistItems = pgTable(
     // Per-row rather than per-person: someone may want telling about one game
     // and not about the eleven others they saved on a whim.
     notifyOnDrop: boolean("notify_on_drop").notNull().default(true),
+    // Upgrades a plain wishlist row into a "want" the person's agent may act
+    // on — the maximum price they'd pay for this one specific game. Null means
+    // a plain wishlist entry with no agent involvement, which is the default
+    // and the common case. This is what makes "the agent is the paid upgrade
+    // of the free wishlist" literal: same row, one extra field, and
+    // un-wishlisting the game removes the want along with it.
+    agentMaxUnits: bigint("agent_max_units", { mode: "number" }),
+    // In the person's own words — "only under $4", "for co-op", "notify me,
+    // don't buy". Gives a future model something human to reason with without
+    // us inventing a preference taxonomy.
+    agentNote: text("agent_note"),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [uniqueIndex("likes_game_user_idx").on(table.gameId, table.userId)],

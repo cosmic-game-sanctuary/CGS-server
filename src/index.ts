@@ -22,7 +22,7 @@ import agentRouter from "./routes/agent.routes.js";
 import reportRouter from "./routes/report.routes.js";
 import meRouter from "./routes/me.routes.js";
 import devRouter from "./routes/dev.routes.js";
-import { runWatcherTick } from "./agent/watcher.js";
+import { startAgentListener, runAgentSweep } from "./agent/watcher.js";
 import { runPromotionTick } from "./services/games/promotions.js";
 import logger from "./utils/logger.utils.js";
 
@@ -53,7 +53,9 @@ app.use("/api/invites", inviteRouter);
 app.use("/api/notifications", notificationRouter);
 app.use("/api/reviews", reviewRouter);
 app.use("/api/comments", commentRouter);
-app.use("/api/agents", agentRouter);
+// One per person, so it hangs off /api/me like /api/me/wishlist and
+// /api/me/library — a singular resource, not a collection.
+app.use("/api/me/agent", agentRouter);
 app.use("/api/reports", reportRouter);
 app.use("/api/me", meRouter);
 app.use("/api/users", userRouter);
@@ -84,11 +86,16 @@ app.use(errorHandler);
 app.listen(env.PORT, () => {
   console.log(`cgs-server listening on :${env.PORT} (${env.HEDERA_NETWORK})`);
 
-  // the wishlist agent's whole loop: poll the public listings topic through
-  // the Mirror Node, fire the same purchase path a person would. One tick at
-  // a time, never overlapping — a slow tick delays the next one rather than
-  // stacking concurrent ticks against the same agents.
+  // The agent's whole trigger mechanism: one subscription to the public
+  // listings topic, for every agent at once — never a poll. See
+  // agent/watcher.ts for why this replaced a per-agent timer.
+  startAgentListener().catch((err) => logger.error({ err }, "starting the agent listener failed"));
+
+  // The two things a subscription cannot do by itself: anchor an agent's
+  // identity the first time its wallet resolves, and end agents whose expiry
+  // has passed. Both are cheap and low-frequency, so a slow timer is enough —
+  // this does not scale with agent count the way the old poll did.
   setInterval(() => {
-    runWatcherTick().catch((err) => logger.error({ err }, "watcher tick crashed"));
+    runAgentSweep().catch((err) => logger.error({ err }, "agent sweep crashed"));
   }, env.AGENT_POLL_INTERVAL_MS);
 });

@@ -66,44 +66,45 @@ export function emailSale(input: {
   });
 }
 
-export function emailAgentBought(input: {
+/**
+ * One agent, one round of buying — for however many wants matched at once.
+ * A single email per round rather than one per game, on the same reasoning
+ * as the notification it accompanies: an agent watching six games should
+ * never become a spam machine on the round it happens to fire on several.
+ */
+export function emailAgentPurchased(input: {
   to: string;
-  gameTitle: string;
-  slug: string;
-  priceUnits: number;
-  asset: string;
+  purchases: { gameTitle: string; priceUnits: number; asset: string }[];
 }): Promise<boolean> {
+  const totalAsset = input.purchases[0]?.asset ?? "0.0.0";
+  const total = input.purchases.reduce((sum, p) => sum + p.priceUnits, 0);
+  const lines =
+    input.purchases.length === 1
+      ? [`Your agent bought ${input.purchases[0]!.gameTitle} for ${money(input.purchases[0]!.priceUnits, input.purchases[0]!.asset)}.`]
+      : [
+          `Your agent bought ${input.purchases.length} games for ${money(total, totalAsset)} total:`,
+          ``,
+          ...input.purchases.map((p) => `  ${p.gameTitle} — ${money(p.priceUnits, p.asset)}`),
+        ];
+
   return sendMail({
     to: input.to,
-    subject: `Your buyer got ${input.gameTitle}`,
-    text: [
-      `${input.gameTitle} dropped to ${money(input.priceUnits, input.asset)} and your buyer took it.`,
-      ``,
-      `The key is in your wallet. Anything left over went back to you.`,
-      ``,
-      appUrl(`/library`),
-    ].join("\n"),
+    subject:
+      input.purchases.length === 1
+        ? `Your agent bought ${input.purchases[0]!.gameTitle}`
+        : `Your agent bought ${input.purchases.length} games`,
+    text: [...lines, ``, `The keys are in your library.`, ``, appUrl(`/library`)].join("\n"),
   });
 }
 
-export function emailAgentNeedsFunds(input: {
-  to: string;
-  gameTitle: string;
-  slug: string;
-  priceUnits: number;
-  balanceUnits: number;
-  asset: string;
-}): Promise<boolean> {
-  const short = money(input.priceUnits - input.balanceUnits, input.asset);
+/** The agent hit its expiry with wants still open. Its balance was returned. */
+export function emailAgentExpired(input: { to: string; returnedUnits: number; asset: string }): Promise<boolean> {
   return sendMail({
     to: input.to,
-    subject: `${input.gameTitle} hit your price, but your buyer is short`,
+    subject: `Your agent expired`,
     text: [
-      `${input.gameTitle} dropped to ${money(input.priceUnits, input.asset)}.`,
-      `Your buyer holds ${money(input.balanceUnits, input.asset)}, so it needs ${short} more.`,
-      ``,
-      `It is still watching. Top it up and it will buy without you setting`,
-      `anything up again.`,
+      `Your wishlist agent reached its expiry date and stopped watching.`,
+      `${money(input.returnedUnits, input.asset)} was returned to your wallet.`,
       ``,
       appUrl(`/library`),
     ].join("\n"),

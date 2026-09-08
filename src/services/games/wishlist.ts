@@ -184,14 +184,14 @@ export async function wishlistFor(userId: string) {
   if (items.length === 0) return [];
 
   const gameIds = items.map((i) => i.gameId);
-  const [rows, agents] = await Promise.all([
+  const [rows, agent] = await Promise.all([
     db.query.games.findMany({ where: inArray(games.id, gameIds), with: { studio: true } }),
-    db.query.wishlistAgents.findMany({
-      where: and(eq(wishlistAgents.buyerUserId, userId), inArray(wishlistAgents.targetGameId, gameIds)),
-    }),
+    // One per person now, not one per game — see db/schema.ts#wishlistAgents.
+    // Whether it is relevant to a given row is decided per item below, from
+    // that row's own `agentMaxUnits`, not from a second table keyed by game.
+    db.query.wishlistAgents.findFirst({ where: eq(wishlistAgents.buyerUserId, userId) }),
   ]);
   const byId = new Map(rows.map((g) => [g.id, g]));
-  const agentByGame = new Map(agents.map((a) => [a.targetGameId, a]));
 
   return items
     .filter((i) => byId.get(i.gameId)?.status !== "removed")
@@ -231,15 +231,16 @@ export async function wishlistFor(userId: string) {
         // loud rather than quietly dropped — someone who saved it deserves to
         // know what happened to it.
         stillForSale: game.status === "published",
-        // The upgrade path. An agent turns "tell me" into "buy it for me", and
-        // this is where the offer to set one up belongs.
-        agent: agentByGame.get(item.gameId)
-          ? {
-              id: agentByGame.get(item.gameId)!.id,
-              status: agentByGame.get(item.gameId)!.status,
-              triggerPriceUnits: agentByGame.get(item.gameId)!.triggerPriceUnits,
-            }
-          : null,
+        // The upgrade path. An agent turns "tell me" into "buy it for me": null
+        // here means this row is a plain wishlist entry, not that no agent
+        // exists — a person may have an agent and still leave some games as
+        // plain wishlist rows on purpose.
+        agentMaxUnits: item.agentMaxUnits,
+        agentNote: item.agentNote,
+        agent:
+          agent && item.agentMaxUnits !== null
+            ? { id: agent.id, status: agent.status, mode: agent.mode }
+            : null,
       };
     });
 }

@@ -10,7 +10,7 @@ import {
   TransferTransaction,
 } from "@hiero-ledger/sdk";
 import { env } from "../../config/env.js";
-import { hederaPublicKeyFromHex, publicKeyForAddress } from "../privy/signing.js";
+import { hederaPublicKeyFromHex, publicKeyForAddress, signHederaMessage } from "../privy/signing.js";
 import { attachSignatures, signingHashes, toCompactSignature } from "../x402/transfer.js";
 
 /**
@@ -128,6 +128,63 @@ export function consumeWithdrawIntent(id: string, userId: string): WithdrawInten
   if (intent.userId !== userId) return undefined;
   if (intent.expiresAt <= Date.now()) return undefined;
   return intent;
+}
+
+/**
+ * Move money out of a wallet the server itself holds — an agent's — with no
+ * browser round trip at all.
+ *
+ * A user's withdrawal needs the two-step prepare/sign/submit shape because
+ * their key is theirs and only their browser can sign with it. An agent's key
+ * belongs to a wallet we created, so both signatures — the agent's own and the
+ * operator's fee — happen here in one call. This is what makes cancelling or
+ * expiring an agent a single server-side action rather than something that
+ * waits on the person coming back to approve it.
+ */
+export async function refundAgentBalance(input: {
+  agentWalletId: string;
+  agentPublicKeyHex: string;
+  fromAccountId: string;
+  toAccountId: string;
+  asset: string;
+  amountUnits: bigint;
+}): Promise<string | null> {
+  if (input.amountUnits <= 0n) return null; // nothing to return is not an error
+
+  const from = AccountId.fromString(input.fromAccountId);
+  const to = AccountId.fromString(input.toAccountId);
+  const tx = new TransferTransaction();
+
+  if (input.asset === "0.0.0") {
+    tx.addHbarTransfer(from, Hbar.fromTinybars((-input.amountUnits).toString()));
+    tx.addHbarTransfer(to, Hbar.fromTinybars(input.amountUnits.toString()));
+  } else {
+    const token = TokenId.fromString(input.asset);
+    tx.addTokenTransfer(token, from, -input.amountUnits);
+    tx.addTokenTransfer(token, to, input.amountUnits);
+  }
+  tx.setTransactionId(TransactionId.generate(AccountId.fromString(env.HEDERA_OPERATOR_ID)));
+
+  const c = client();
+  try {
+    tx.freezeWith(c);
+    // The agent's own signature, produced the same way a purchase's is — see
+    // x402/signer.ts#createPrivyHederaSigner. `signWith` handles the
+    // per-node signing a multi-node transaction actually needs; there is no
+    // browser step to hand hashes to here.
+    await tx.signWith(hederaPublicKeyFromHex(input.agentPublicKeyHex), (message) =>
+      signHederaMessage(input.agentWalletId, message),
+    );
+    const withFee = await tx.sign(PrivateKey.fromStringECDSA(env.HEDERA_OPERATOR_KEY.replace(/^0x/, "")));
+    const response = await withFee.execute(c);
+    const receipt = await response.getReceipt(c);
+    if (receipt.status.toString() !== "SUCCESS") {
+      throw new Error(`agent refund failed on the network: ${receipt.status.toString()}`);
+    }
+    return response.transactionId.toString();
+  } finally {
+    c.close();
+  }
 }
 
 export async function submitWithdraw(

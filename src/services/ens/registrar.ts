@@ -1,7 +1,7 @@
 import { decodeEventLog, encodeFunctionData, keccak256, toHex, type Hex } from "viem";
 import { publicClient, walletClient, ensAccount } from "./client.js";
 import { erc20Abi, ethRegistrarAbi, verifiableFactoryAbi, userRegistryInitAbi, permissionedRegistryAbi } from "./abis.js";
-import { FULL_ADMIN_BITMAP, STUDIO_BITMAP } from "./roles.js";
+import { FULL_ADMIN_BITMAP, STUDIO_BITMAP, AGENT_BITMAP } from "./roles.js";
 import { env } from "../../config/env.js";
 
 const ONE_YEAR = 365n * 24n * 60n * 60n;
@@ -147,22 +147,35 @@ export async function isSubnameAvailable(subregistryAddress: Hex, label: string)
   }
 }
 
-// Per studio: mint "studio.cgs-sanctuary.eth" under the subregistry the
-// platform owns. Grants a limited role set (STUDIO_BITMAP) — enough for the
-// studio to point its own name somewhere, not enough to unregister or
-// transfer it away from platform control.
-export async function registerStudioSubname(
+// Shared by studios and agents: mint "<label>.cgs-sanctuary.eth" under the
+// subregistry the platform owns. `bitmap` is the only thing that differs
+// between them and both grant the same limited scope today — enough for the
+// owner to point their own name somewhere, not enough to unregister or
+// transfer it away from platform control. One flat namespace, so a studio and
+// an agent compete for the same label and `isSubnameAvailable` catches either.
+async function registerSubname(
   subregistryAddress: Hex,
   label: string,
   ownerAddress: Hex,
+  bitmap: bigint,
 ): Promise<Hex> {
   const expiry = BigInt(Math.floor(Date.now() / 1000)) + ONE_YEAR;
   const hash = await walletClient.writeContract({
     address: subregistryAddress,
     abi: permissionedRegistryAbi,
     functionName: "register",
-    args: [label, ownerAddress, "0x0000000000000000000000000000000000000000", env.ENS_RESOLVER as Hex, STUDIO_BITMAP, expiry],
+    args: [label, ownerAddress, "0x0000000000000000000000000000000000000000", env.ENS_RESOLVER as Hex, bitmap, expiry],
   });
   await publicClient.waitForTransactionReceipt({ hash });
   return hash;
+}
+
+export function registerStudioSubname(subregistryAddress: Hex, label: string, ownerAddress: Hex): Promise<Hex> {
+  return registerSubname(subregistryAddress, label, ownerAddress, STUDIO_BITMAP);
+}
+
+// Optional, at the buyer's choice: a name for their agent rather than a raw
+// EVM address. See db/schema.ts#wishlistAgents.ensLabel.
+export function registerAgentSubname(subregistryAddress: Hex, label: string, ownerAddress: Hex): Promise<Hex> {
+  return registerSubname(subregistryAddress, label, ownerAddress, AGENT_BITMAP);
 }

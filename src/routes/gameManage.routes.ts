@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray, isNotNull } from "drizzle-orm";
 import { z } from "zod";
 import multer from "multer";
 import { db } from "../db/client.js";
@@ -18,6 +18,7 @@ import {
   notifications,
   users,
   wishlistAgents,
+  wishlistItems,
   saveStates,
   gamePromotions,
 } from "../db/schema.js";
@@ -380,8 +381,10 @@ gameManageRouter.delete(
     if (sold) {
       throw new AppError(409, "GAME_HAS_SALES", "This game has sold at least once, so it can't be deleted.");
     }
-    const watched = await db.query.wishlistAgents.findFirst({
-      where: eq(wishlistAgents.targetGameId, game.id),
+    // "Watched" is now a want on a wishlist row (agentMaxUnits set), not a
+    // dedicated agent row per target — see db/schema.ts#wishlistAgents.
+    const watched = await db.query.wishlistItems.findFirst({
+      where: and(eq(wishlistItems.gameId, game.id), isNotNull(wishlistItems.agentMaxUnits)),
     });
     if (watched) {
       throw new AppError(409, "GAME_IS_WATCHED", "An agent is watching this game, so it can't be deleted.");
