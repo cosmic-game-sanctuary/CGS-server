@@ -15,11 +15,12 @@ import { env } from "../../config/env.js";
 
 export type PrivyPayer = { walletId: string; accountId: string; publicKeyHex: string };
 
-// Consumes our own x402-gated download route the same way any external client
-// would — read the 402 challenge, sign a payment, retry. Doing it over HTTP
-// rather than by calling the handler directly is the point: the gate is the
-// same gate for us, an agent, and a stranger's client.
+// Consumes our own x402-gated routes the same way any external client would —
+// read the 402 challenge, sign a payment, retry. Doing it over HTTP rather
+// than by calling the handler directly is the point: the gate is the same
+// gate for us, an agent, and a stranger's client.
 const downloadUrl = (gameId: string) => `http://127.0.0.1:${env.PORT}/api/games/${gameId}/download`;
+const verdictUrl = () => `http://127.0.0.1:${env.PORT}/api/agent/verdict`;
 
 type Challenge = {
   x402Version: number;
@@ -30,12 +31,12 @@ type Challenge = {
 /** Either the route wants paying, or it already handed over the goods. */
 type ChallengeResult = { paid: false; challenge: Challenge } | { paid: true; body: unknown };
 
-async function readChallenge(gameId: string): Promise<ChallengeResult> {
-  const response = await fetch(downloadUrl(gameId));
+async function readChallenge(url: string): Promise<ChallengeResult> {
+  const response = await fetch(url);
 
   if (response.status !== 402) {
     if (!response.ok) {
-      throw new AppError(response.status, "PAYMENT_FAILED", "Could not check this game's price.");
+      throw new AppError(response.status, "PAYMENT_FAILED", "Could not check the price for this.");
     }
     // Free, or the anonymous read already resolved it. Same response shape.
     return { paid: true, body: await response.json() };
@@ -57,7 +58,7 @@ async function readChallenge(gameId: string): Promise<ChallengeResult> {
 
 /** Sign the challenge with whatever signer, then retry the gated request. */
 async function settle(
-  gameId: string,
+  url: string,
   challenge: Challenge,
   signer: ClientHederaSigner,
   ownerAccountId?: string,
@@ -86,7 +87,7 @@ async function settle(
   // header changes nothing about their own purchase.
   if (ownerAccountId) headers["x-owner-account-id"] = ownerAccountId;
 
-  const paid = await fetch(downloadUrl(gameId), { headers });
+  const paid = await fetch(url, { headers });
   const body = (await paid.json()) as {
     error?: { code?: string; message?: string; details?: unknown };
   };
@@ -108,9 +109,33 @@ async function settle(
  * over. A person's embedded wallet is not one of these; see preparePayment.
  */
 export async function payForGame(gameId: string, payer: PrivyPayer, ownerAccountId?: string) {
-  const result = await readChallenge(gameId);
+  const url = downloadUrl(gameId);
+  const result = await readChallenge(url);
   if (result.paid) return result.body;
-  return settle(gameId, result.challenge, createPrivyHederaSigner(payer), ownerAccountId);
+  return settle(url, result.challenge, createPrivyHederaSigner(payer), ownerAccountId);
+}
+
+/**
+ * Pay for one verdict from the agent's own decision endpoint (Stage 19) — the
+ * literal meaning of "inference is metered over x402": this is a real
+ * settlement, same rails as buying a game, just gated on a route that answers
+ * with a recommendation instead of a build. See routes/agentInference.routes.ts.
+ *
+ * Deliberately carries no request body. The route re-derives which agent is
+ * asking from who signed the payment (`settlement.payer`, matched against
+ * `wishlistAgents.agentAccountId`) and recomputes its own eligible wants and
+ * balance fresh rather than trusting whatever this process happened to see a
+ * few hundred milliseconds earlier — the same "never trust a stale snapshot"
+ * rule Mirror Node reads follow everywhere else.
+ */
+export async function payForVerdict(
+  payer: PrivyPayer,
+): Promise<{ verdict: unknown; costUnits: number; settlementTxId?: string }> {
+  const url = verdictUrl();
+  const result = await readChallenge(url);
+  if (result.paid) return result.body as { verdict: unknown; costUnits: number };
+  const body = await settle(url, result.challenge, createPrivyHederaSigner(payer));
+  return body as { verdict: unknown; costUnits: number; settlementTxId?: string };
 }
 
 export type PreparedPayment = {
@@ -154,7 +179,7 @@ export async function preparePayment(input: {
   const existing = findLiveIntent(input.userId, input.gameId);
   if (existing) return { prepared: describe(existing) };
 
-  const result = await readChallenge(input.gameId);
+  const result = await readChallenge(downloadUrl(input.gameId));
   if (result.paid) return { granted: result.body };
 
   const { challenge } = result;
@@ -256,7 +281,7 @@ export async function completePayment(input: {
   }
 
   return settle(
-    input.gameId,
+    downloadUrl(input.gameId),
     { x402Version: intent.x402Version, resource: intent.resource, requirements: intent.requirements },
     presignedSigner(intent.accountId, signedTx),
   );

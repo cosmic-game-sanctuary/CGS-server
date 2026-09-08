@@ -7,9 +7,11 @@ import { requireAuth } from "../middleware/auth.middleware.js";
 import { validate } from "../middleware/validate.middleware.js";
 import { asyncHandler } from "../lib/asyncHandler.js";
 import { AppError, Errors } from "../lib/errors.js";
+import { param } from "../lib/params.js";
 import { assetDecimals, ensFullName, toDisplayAmount } from "../lib/display.js";
 import { env } from "../config/env.js";
 import { createAgent, agentBalance, retireAgent } from "../services/agent/wallet.js";
+import { respondToDecision } from "../agent/watcher.js";
 
 /**
  * The one agent a person may have. Mounted under /api/me, matching
@@ -148,6 +150,38 @@ agentRouter.get(
       limit: 50,
     });
     res.json({ decisions: rows });
+  }),
+);
+
+const respondSchema = z.object({ action: z.enum(["buy", "skip", "remove", "keep"]) });
+
+// Ask-first's four buttons (§4). "skip" and "keep" both decline this round —
+// the only difference a person actually cares about is whether the game
+// stays a want, which only "remove" changes. Kept as four names anyway
+// because that's the choice someone is actually offered.
+agentRouter.post(
+  "/decisions/:id/respond",
+  requireAuth,
+  validate(respondSchema),
+  asyncHandler(async (req, res) => {
+    const agent = await requireOwnAgent(req.auth!.id);
+    const decision = await db.query.agentDecisions.findFirst({
+      where: eq(agentDecisions.id, param(req, "id")),
+    });
+    if (!decision || decision.agentId !== agent.id) throw Errors.notFound("Decision");
+    if (decision.kind !== "asked") {
+      throw new AppError(422, "NOT_ASKABLE", "This decision isn't waiting on an answer.");
+    }
+    if (decision.resolvedAt) {
+      throw new AppError(409, "ALREADY_RESOLVED", "This question was already answered or timed out.");
+    }
+
+    const { action } = req.body as z.infer<typeof respondSchema>;
+    const { outcome, alreadyResolved } = await respondToDecision(agent, decision, action);
+    if (alreadyResolved) {
+      throw new AppError(409, "ALREADY_RESOLVED", "This question was already answered or timed out.");
+    }
+    res.json({ outcome });
   }),
 );
 

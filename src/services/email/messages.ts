@@ -98,6 +98,44 @@ export function emailAgentPurchased(input: {
 }
 
 /** The agent hit its expiry with wants still open. Its balance was returned. */
+/**
+ * Ask-first mode found something genuinely worth a person's answer, and there
+ * is time to wait for it — see services/agent/timing.ts. `deadline` is
+ * repeated in the text because this is the one message that expects a click
+ * back, and "by when" is the fact a person acts on.
+ */
+export function emailAgentAsked(input: {
+  to: string;
+  decisionId: string;
+  reasoning: string;
+  candidates: { gameTitle: string; priceUnits: number; asset: string }[];
+  deadline: Date;
+  onTimeout: "buy" | "skip";
+}): Promise<boolean> {
+  const list = input.candidates.map((c) => `  ${c.gameTitle} — ${money(c.priceUnits, c.asset)}`);
+  const fallback =
+    input.onTimeout === "buy"
+      ? "If you don't answer in time, it buys them."
+      : "If you don't answer in time, it skips them.";
+
+  return sendMail({
+    to: input.to,
+    subject:
+      input.candidates.length === 1
+        ? `Your agent wants to buy ${input.candidates[0]!.gameTitle}`
+        : `Your agent wants to buy ${input.candidates.length} games`,
+    text: [
+      input.reasoning,
+      ``,
+      ...list,
+      ``,
+      `Answer by ${input.deadline.toISOString()}. ${fallback}`,
+      ``,
+      appUrl(`/library?agentDecision=${input.decisionId}`),
+    ].join("\n"),
+  });
+}
+
 export function emailAgentExpired(input: { to: string; returnedUnits: number; asset: string }): Promise<boolean> {
   return sendMail({
     to: input.to,

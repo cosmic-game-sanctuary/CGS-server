@@ -134,6 +134,13 @@
       "when": 1788839609370,
       "tag": "0018_agent_1n_step_b",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1788844123620,
+      "tag": "0019_loose_the_hunter",
+      "breakpoints": true
     }
   ]
 }

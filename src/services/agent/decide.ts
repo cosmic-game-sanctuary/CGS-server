@@ -3,18 +3,22 @@ import { db } from "../../db/client.js";
 import { wishlistItems, games, users, wishlistAgents } from "../../db/schema.js";
 import { hasEntitlement } from "../games/entitlement.js";
 import { activePromotionFor } from "../games/promotions.js";
+import { priceHistory } from "../games/listing.js";
 
 type Agent = typeof wishlistAgents.$inferSelect;
 
 /**
- * Eligibility and allocation — the part of the agent that runs with no model
- * at all.
+ * Eligibility, allocation, and — since Stage 19 — the shape a model verdict is
+ * validated against before anything acts on it.
  *
- * This is deliberately the whole decision for Stage 18. Stage 19 adds a model
- * only for genuine contention (more affordable than the balance covers); this
- * file's greedy allocation is also *that* stage's fallback when the model
- * times out, errs, or is skipped — see wishlist-agent-spec.md §4, rule 7:
- * "degrade to working, never to stuck."
+ * Stages A and B (one thing fits; several things fit together) are still
+ * decided here with no model call at all: `planPurchases` clearing every
+ * eligible want *is* the decision. A model is only ever consulted when it
+ * doesn't — something eligible was left unbought — which is Shape C
+ * (contention) and Shape D (a deliberate hold) from wishlist-agent-spec.md §4.
+ * `planPurchases`'s output remains the fallback for both: if the model times
+ * out, errs, or returns something that doesn't survive `sanitizeVerdict`,
+ * rule 7 applies — "degrade to working, never to stuck."
  */
 
 export type EligibleWant = {
@@ -25,6 +29,10 @@ export type EligibleWant = {
   agentMaxUnits: number;
   currentPriceUnits: number;
   asset: string;
+  /** In the buyer's own words, or null if they left it blank. */
+  note: string | null;
+  /** The cheapest this game has ever been, current price included. */
+  lowestEverUnits: number;
   /** From an active promotion on this game, if there is one. */
   promotionEndsAt: Date | null;
 };
@@ -62,6 +70,7 @@ export async function eligibleWantsFor(agent: Agent): Promise<EligibleWant[]> {
     if (owned.owned) continue; // drop silently — rule 6, nothing to tell anyone
 
     const promo = await activePromotionFor(game.id);
+    const history = await priceHistory(game);
     out.push({
       wishlistItemId: want.id,
       gameId: game.id,
@@ -70,6 +79,8 @@ export async function eligibleWantsFor(agent: Agent): Promise<EligibleWant[]> {
       agentMaxUnits: want.agentMaxUnits!,
       currentPriceUnits: game.priceUnits,
       asset: game.priceAsset,
+      note: want.agentNote,
+      lowestEverUnits: history.reduce((low, h) => Math.min(low, h.toUnits), game.priceUnits),
       promotionEndsAt: promo?.endsAt ?? null,
     });
   }
@@ -111,4 +122,88 @@ export function planPurchases(eligible: EligibleWant[], balanceUnits: bigint): E
     }
   }
   return chosen;
+}
+
+/**
+ * True when the deterministic pass didn't clear the whole eligible set — the
+ * only condition under which Stage 19 spends anything on thinking. An agent
+ * with nothing left over after `planPurchases` is Shape A or B and this is
+ * `false`; nothing calls the model.
+ */
+export function needsJudgement(eligible: EligibleWant[], deterministic: EligibleWant[]): boolean {
+  return deterministic.length < eligible.length;
+}
+
+/** What the model is asked to return. Kept flat so a strict JSON schema can
+ * describe it exactly — see services/agent/model.ts. */
+export type RawVerdict = {
+  buyNow: string[];
+  hold: { gameId: string; holdHours: number }[];
+  decline: string[];
+  askFirst: boolean;
+  reasoning: string;
+};
+
+export type Verdict = {
+  buyNow: EligibleWant[];
+  hold: { want: EligibleWant; holdHours: number }[];
+  decline: EligibleWant[];
+  askFirst: boolean;
+  reasoning: string | null;
+  /** null for the deterministic fallback — nothing was actually inferred. */
+  costUnits: number | null;
+};
+
+/**
+ * Rules enforced in code, not trusted from the prompt (§4's numbered list).
+ * A model's `buyNow` is honoured only if every id is genuinely eligible and
+ * the total genuinely fits the balance; otherwise the whole verdict is
+ * discarded in favour of the deterministic plan, per rule 7. A game named in
+ * more than one list is resolved buy > hold > decline, so the worst that
+ * happens is it gets bought — never silently dropped, never bought twice.
+ */
+export function sanitizeVerdict(
+  raw: RawVerdict,
+  eligible: EligibleWant[],
+  balanceUnits: bigint,
+  deterministic: EligibleWant[],
+  costUnits: number,
+): Verdict {
+  const byId = new Map(eligible.map((w) => [w.gameId, w]));
+  const fellBack = () => fallbackVerdict(eligible, deterministic);
+
+  const buyNow = raw.buyNow.map((id) => byId.get(id)).filter((w): w is EligibleWant => !!w);
+  const totalCost = buyNow.reduce((sum, w) => sum + BigInt(w.currentPriceUnits), 0n);
+  if (buyNow.length !== raw.buyNow.length || totalCost > balanceUnits) return fellBack();
+
+  const claimed = new Set(buyNow.map((w) => w.gameId));
+  const hold = raw.hold
+    .filter((h) => !claimed.has(h.gameId))
+    .map((h) => ({ want: byId.get(h.gameId), holdHours: h.holdHours }))
+    .filter((h): h is { want: EligibleWant; holdHours: number } => !!h.want)
+    .map((h) => {
+      claimed.add(h.want.gameId);
+      return h;
+    });
+
+  const decline = raw.decline
+    .map((id) => byId.get(id))
+    .filter((w): w is EligibleWant => !!w && !claimed.has(w.gameId));
+
+  return { buyNow, hold, decline, askFirst: raw.askFirst, reasoning: raw.reasoning, costUnits };
+}
+
+/** No model call happened, or its answer didn't survive `sanitizeVerdict` —
+ * buy whatever the greedy allocation already decided, explain nothing,
+ * charge nothing. This is rule 7's floor. */
+export function fallbackVerdict(eligible: EligibleWant[], deterministic: EligibleWant[]): Verdict {
+  const chosenIds = new Set(deterministic.map((w) => w.gameId));
+  return {
+    buyNow: deterministic,
+    hold: [],
+    decline: eligible.filter((w) => !chosenIds.has(w.gameId)),
+    askFirst: false,
+    reasoning: null,
+    costUnits: null,
+  };
 }

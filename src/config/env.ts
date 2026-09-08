@@ -126,7 +126,24 @@ const envSchema = z.object({
   // a default, and it stays "block" until a real provider is chosen.
   CSAM_MODE: z.enum(["block", "skip"]).default("block"),
 
-  AGENT_POLL_INTERVAL_MS: z.coerce.number().default(5000),
+  // Drives runAgentSweep — anchoring identity and expiring agents, plus (since
+  // Stage 19) resolving holds and unanswered questions past their `decideBy`.
+  // Renamed from AGENT_POLL_INTERVAL_MS: Stage 18 replaced the per-agent poll
+  // this once drove with an HCS subscription, and this timer runs the sweep.
+  AGENT_SWEEP_INTERVAL_MS: z.coerce.number().default(5000),
+
+  // From console.groq.com. What the agent pays inference cost (not tinybar)
+  // to reason about a contested or ambiguous purchase — see
+  // services/agent/model.ts and docs/stage-19.md.
+  GROQ_API_KEY: z.string(),
+  // gpt-oss-20b: fast, and one of the models Groq's structured-output "strict"
+  // mode actually enforces, which matters more here than raw quality — a
+  // verdict that fails to parse must never be able to happen.
+  GROQ_MODEL: z.string().default("openai/gpt-oss-20b"),
+  // Smallest-units, same asset as X402_ASSET. Deliberately tiny: shapes A and
+  // B (most decisions) never call this at all, and the ones that do are
+  // capped and reported separately from what the agent spends on games.
+  AGENT_INFERENCE_PRICE_UNITS: z.coerce.number().positive().default(500),
 
   // A dev-only route that funds a wallet from the operator account. It exists
   // because a Privy embedded wallet has no Hedera account until it first

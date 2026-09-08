@@ -471,6 +471,14 @@ export const agentDecisions = pgTable("agent_decisions", {
   inferenceCostUnits: bigint("inference_cost_units", { mode: "number" }),
   // Set only while a hold or an ask-first question has not yet resolved.
   decideBy: timestamp("decide_by", { withTimezone: true }),
+  // Null while a `held`/`asked` row is still live. Set the moment it stops
+  // being live — the person answered, `decideBy` passed and the sweep acted,
+  // or a fresh price event superseded it before either happened (§4: "a
+  // pending question expires if the world moves"). `bought`/`declined` rows
+  // are resolved the instant they're written, same timestamp as `createdAt`.
+  // The live pending decision for an agent, if it has one, is the most recent
+  // row with `resolvedAt IS NULL`.
+  resolvedAt: timestamp("resolved_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
 

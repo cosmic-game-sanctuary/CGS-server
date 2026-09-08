@@ -19,6 +19,7 @@ import notificationRouter from "./routes/notification.routes.js";
 import reviewRouter from "./routes/review.routes.js";
 import commentRouter from "./routes/comment.routes.js";
 import agentRouter from "./routes/agent.routes.js";
+import agentInferenceRouter from "./routes/agentInference.routes.js";
 import reportRouter from "./routes/report.routes.js";
 import meRouter from "./routes/me.routes.js";
 import devRouter from "./routes/dev.routes.js";
@@ -56,6 +57,10 @@ app.use("/api/comments", commentRouter);
 // One per person, so it hangs off /api/me like /api/me/wishlist and
 // /api/me/library — a singular resource, not a collection.
 app.use("/api/me/agent", agentRouter);
+// x402-gated, no bearer auth — a payment is the only credential this route
+// checks before it starts, exactly like /api/games/:id/download. See
+// routes/agentInference.routes.ts.
+app.use("/api/agent", agentInferenceRouter);
 app.use("/api/reports", reportRouter);
 app.use("/api/me", meRouter);
 app.use("/api/users", userRouter);
@@ -97,5 +102,5 @@ app.listen(env.PORT, () => {
   // this does not scale with agent count the way the old poll did.
   setInterval(() => {
     runAgentSweep().catch((err) => logger.error({ err }, "agent sweep crashed"));
-  }, env.AGENT_POLL_INTERVAL_MS);
+  }, env.AGENT_SWEEP_INTERVAL_MS);
 });
