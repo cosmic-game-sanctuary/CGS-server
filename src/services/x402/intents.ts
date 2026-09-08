@@ -42,6 +42,20 @@ export type PaymentIntent = {
    * from the signature and checked against this.
    */
   evmAddress: string;
+  /**
+   * The buyer's own bearer token, carried so the self-calls to the gated route
+   * are made *as them*.
+   *
+   * `/download` prices a purchase by subtracting whatever trial credit the
+   * authenticated caller has earned, and both runs of that handler — the one
+   * that issues the 402 and the one that settles the retry — have to agree on
+   * the number. An anonymous read would quote the full price and silently
+   * throw the credit away.
+   *
+   * In memory only, for the ~100 seconds an intent lives, never logged and
+   * never persisted. It is the same token the client sent to reach `prepare`.
+   */
+  authorization?: string;
   /** The frozen, unsigned transfer, base64. */
   frozenTx: string;
   /** Every body the wallet has to sign, as hex keccak256 hashes. */

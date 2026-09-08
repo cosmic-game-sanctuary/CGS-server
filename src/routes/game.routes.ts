@@ -65,7 +65,12 @@ import { preparePayment, completePayment, prepareTrialChunk, completeTrialChunk 
 import { emailStudioInvite } from "../services/email/messages.js";
 import { createGameToken } from "../services/hedera/hts.js";
 import { resolveHederaAccount } from "../services/users/repo.js";
-import { trialEnabled, trialStatusFor, resolvePurchasePrice } from "../services/games/trials.js";
+import {
+  trialEnabled,
+  trialStatusFor,
+  resolvePurchasePrice,
+  trialChunksFor,
+} from "../services/games/trials.js";
 
 const gameRouter = Router({ caseSensitive: true, strict: true });
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
@@ -972,7 +977,23 @@ gameRouter.get(
 
     if (game.priceUnits > 0) {
       const { owned } = await hasEntitlement(req.auth!.evmAddress, game);
-      if (!owned) throw Errors.notOwner("You need to own this game to download it.");
+      if (!owned) {
+        // A trial serves the same build a purchase does, because that is the
+        // entire pitch: the real game, not a separate demo build. One paid
+        // chunk is what earns the file.
+        //
+        // That is not a weaker gate than it looks. The build is unpacked and
+        // run in the browser, so a trial was never technically enforceable —
+        // see the note above `/:id/trial` — only honoured. Whatever gate goes
+        // here, whoever holds the zip holds it. So the honest line is the one
+        // that matches what was actually sold: money changed hands for access,
+        // and the clock is the client's promise to keep.
+        const accountId = await resolveHederaAccount(req.auth!);
+        const chunks = accountId ? await trialChunksFor(game.id, accountId) : [];
+        if (chunks.length === 0) {
+          throw Errors.notOwner("You need to own this game, or a trial chunk of it, to download it.");
+        }
+      }
     }
 
     const file = await findBuild(game.id, game.buildZipCid);
@@ -1060,6 +1081,10 @@ gameRouter.post(
       gameId: game.id,
       accountId: payer.accountId,
       evmAddress: req.auth!.evmAddress,
+      // Handed on so the self-call to /download is made as this buyer. That
+      // handler prices a purchase by subtracting their trial credit, and it
+      // can only do that for a caller it can see.
+      authorization: req.headers.authorization,
     });
 
     if ("granted" in result) {
@@ -1247,6 +1272,7 @@ gameRouter.post(
       gameId: game.id,
       accountId: buyerAccountId,
       evmAddress: req.auth!.evmAddress,
+      authorization: req.headers.authorization,
     });
 
     if ("granted" in result) {
