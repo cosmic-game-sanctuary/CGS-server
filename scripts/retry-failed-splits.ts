@@ -7,10 +7,11 @@
 // the distribution from scratch.
 //
 // A **held** payout is a share belonging to someone who hasn't claimed their
-// invite, so there is no account to pay. That is not a failure and it retries
-// itself the moment they accept (see invite.routes.ts). This script settles
-// them early only for the case where they *do* now have an account and the
-// accept hook didn't run — a wallet funded out of band, say.
+// invite, so there is no address to pay at all. That is not a failure and it
+// retries itself the moment they accept — settleHeldPayouts pays their EVM
+// alias directly, account or not, so a held row for someone who *has*
+// accepted only means the accept-time attempt itself failed. This script is
+// the backstop for that case.
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import { db } from "../src/db/client.js";
 import { sales, games, pendingPayouts, studioMembers, users } from "../src/db/schema.js";
@@ -76,14 +77,11 @@ for (const member of members) {
   const user = await db.query.users.findFirst({ where: eq(users.id, member.userId) });
   if (!user) continue;
 
+  // Not gated on an account already existing — settleHeldPayouts pays their
+  // EVM alias directly otherwise, which creates one as a side effect.
   const accountId = await resolveHederaAccount(user);
-  if (!accountId) {
-    console.log(`  ${member.handle}: accepted, but their wallet has never received anything — leaving held`);
-    continue;
-  }
-
-  const settled = await settleHeldPayouts(member.id, accountId);
-  console.log(`  ${member.handle}: settled ${settled} payout(s) to ${accountId}`);
+  const settled = await settleHeldPayouts(member.id, { accountId, evmAddress: user.evmAddress });
+  console.log(`  ${member.handle}: settled ${settled} payout(s) to ${accountId ?? `alias ${user.evmAddress}`}`);
 }
 
 // Shares held against a split with no member behind it can't be settled by

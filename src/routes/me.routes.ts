@@ -38,15 +38,15 @@ meRouter.get(
     const hadAccount = auth.hederaAccountId !== null;
     const hederaAccountId = await resolveHederaAccount(auth);
 
-    // The moment we learn this wallet is payable, pay it. Money held for
-    // someone who hadn't funded their wallet used to sit until an operator
-    // remembered to run splits:retry — accepting an invite only settles if the
-    // account already exists, and a new user's doesn't. This fires exactly
-    // once, on the request where the account first resolves, and on a request
-    // we were serving anyway.
+    // A safety net, not the primary path any more — settleHeldPayouts pays a
+    // known EVM address directly now, account or not (fulfil.ts), so a share
+    // is held only for as long as an invite is genuinely unaccepted. This
+    // just catches anything from before that was true, or a transient
+    // failure at accept-time. Fires once, on the request where the account
+    // first resolves, and on a request we were serving anyway.
     if (!hadAccount && hederaAccountId) {
-      void settleHeldPayoutsForUser(auth.id, hederaAccountId).catch((err) =>
-        logger.error({ err, userId: auth.id }, "auto-settling held payouts failed"),
+      void settleHeldPayoutsForUser(auth.id, { accountId: hederaAccountId, evmAddress: auth.evmAddress }).catch(
+        (err) => logger.error({ err, userId: auth.id }, "auto-settling held payouts failed"),
       );
     }
 

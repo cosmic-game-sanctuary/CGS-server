@@ -234,14 +234,21 @@ async function mintAndTransferKey(game: Game, buyerAccountId: string): Promise<n
  * paid together or not at all, which is the "nobody chases a teammate for
  * their share" promise. What changed is who counts as a recipient. A split can
  * name someone who has never opened CGS — that is the entire point of adding a
- * collaborator by email — and such a person has no Hedera account for the
- * network to pay. Treating that as a failure of the whole distribution meant
- * one unclaimed invite stopped everybody's money, which is the opposite of
- * what the product says out loud.
+ * collaborator by email — and until they accept the invite, nobody knows an
+ * address to pay at all. Treating that as a failure of the whole distribution
+ * meant one unclaimed invite stopped everybody's money, which is the opposite
+ * of what the product says out loud.
  *
- * So their share is held instead, and settled the moment they accept. Nothing
- * is lost and nothing is stranded: the amounts still total `priceUnits`, the
- * held part simply stays in the operator account until it has somewhere to go.
+ * So their share is held instead, until they accept — but that is the *only*
+ * reason a share is ever held. Once the invite is accepted, their EVM address
+ * is known, and that alone is enough to pay them: a token transfer to a fresh
+ * alias creates the Hedera account as a side effect (HIP-542), fee on the
+ * sender, never taken out of what they're owed. A collaborator who has simply
+ * never touched Hedera is paid the moment there's something to pay them —
+ * they don't sit waiting on an account that this very payment is what
+ * creates. Nothing is ever lost either way: the amounts still total
+ * `priceUnits`, and whatever is genuinely held (an unaccepted invite) simply
+ * stays in the operator account until it has somewhere to go.
  */
 async function distributeSplits(
   game: Game,
@@ -271,23 +278,34 @@ async function distributeSplits(
     largest.amount += remainder;
   }
 
-  const payable: { accountId: string; amount: number }[] = [];
+  const payable: { destination: AccountId; amount: number }[] = [];
   const held: { splitId: string; studioMemberId: string | null; amount: number; reason: string }[] = [];
 
   for (const share of shares) {
-    const accountId = share.row.wallet ? await resolveAccountId(share.row.wallet) : null;
-    if (accountId) {
-      payable.push({ accountId, amount: share.amount });
-    } else {
+    // Held now means exactly one thing: nobody has told us who this person
+    // is yet — `wallet` is still null because the invite hasn't been
+    // accepted. The moment it has, we know their EVM address, and that is
+    // enough to pay them whether or not they have ever touched Hedera: a
+    // token transfer to a fresh alias creates the account as a side effect,
+    // the same HIP-542 mechanic every other first-funding moment in this app
+    // already relies on, with the creation fee on the sender (us), never
+    // taken out of what they're owed. So a known wallet is never held
+    // waiting for an account to show up first — it's paid straight to the
+    // alias, which *is* the account showing up.
+    if (!share.row.wallet) {
       held.push({
         splitId: share.row.id,
         studioMemberId: share.row.studioMemberId,
         amount: share.amount,
-        reason: share.row.wallet
-          ? `${share.row.handle}'s wallet has no Hedera account yet`
-          : `${share.row.handle} hasn't claimed their invite yet`,
+        reason: `${share.row.handle} hasn't claimed their invite yet`,
       });
+      continue;
     }
+    const resolved = await resolveAccountId(share.row.wallet);
+    const destination = resolved
+      ? AccountId.fromString(resolved)
+      : AccountId.fromEvmAddress(0, 0, share.row.wallet);
+    payable.push({ destination, amount: share.amount });
   }
 
   if (payable.length > 0) {
@@ -295,11 +313,11 @@ async function distributeSplits(
     const tx = new TransferTransaction();
     if (game.priceAsset === "0.0.0") {
       tx.addHbarTransfer(env.HEDERA_OPERATOR_ID, Hbar.fromTinybars(-total));
-      for (const r of payable) tx.addHbarTransfer(r.accountId, Hbar.fromTinybars(r.amount));
+      for (const r of payable) tx.addHbarTransfer(r.destination, Hbar.fromTinybars(r.amount));
     } else {
       const tokenId = TokenId.fromString(game.priceAsset);
       tx.addTokenTransfer(tokenId, env.HEDERA_OPERATOR_ID, -total);
-      for (const r of payable) tx.addTokenTransfer(tokenId, r.accountId, r.amount);
+      for (const r of payable) tx.addTokenTransfer(tokenId, r.destination, r.amount);
     }
     const response = await tx.execute(client);
     await response.getReceipt(client);
@@ -330,17 +348,28 @@ async function distributeSplits(
 }
 
 /**
- * Pay out everything held for one person, now that they have an account.
+ * Pay out everything held for one person — called the moment they accept an
+ * invite, since that's the moment their EVM address stops being unknown.
  *
- * Called when an invite is accepted. Each payout is settled on its own rather
+ * Never gated on them already having a Hedera account: `destination` falls
+ * back to their EVM alias, which creates the account as a side effect of this
+ * very payment (HIP-542) rather than requiring some earlier, unrelated
+ * transaction to have done it first. Each payout is settled on its own rather
  * than batched: they belong to different sales, and one bad row should not
  * strand the rest.
  */
-export async function settleHeldPayouts(studioMemberId: string, accountId: string): Promise<number> {
+export async function settleHeldPayouts(
+  studioMemberId: string,
+  payee: { accountId?: string | null; evmAddress: string },
+): Promise<number> {
   const owed = await db.query.pendingPayouts.findMany({
     where: and(eq(pendingPayouts.studioMemberId, studioMemberId), eq(pendingPayouts.status, "held")),
   });
   if (owed.length === 0) return 0;
+
+  const destination = payee.accountId
+    ? AccountId.fromString(payee.accountId)
+    : AccountId.fromEvmAddress(0, 0, payee.evmAddress);
 
   let settled = 0;
   for (const payout of owed) {
@@ -348,11 +377,11 @@ export async function settleHeldPayouts(studioMemberId: string, accountId: strin
       const tx = new TransferTransaction();
       if (payout.asset === "0.0.0") {
         tx.addHbarTransfer(env.HEDERA_OPERATOR_ID, Hbar.fromTinybars(-payout.amountUnits));
-        tx.addHbarTransfer(accountId, Hbar.fromTinybars(payout.amountUnits));
+        tx.addHbarTransfer(destination, Hbar.fromTinybars(payout.amountUnits));
       } else {
         const tokenId = TokenId.fromString(payout.asset);
         tx.addTokenTransfer(tokenId, env.HEDERA_OPERATOR_ID, -payout.amountUnits);
-        tx.addTokenTransfer(tokenId, accountId, payout.amountUnits);
+        tx.addTokenTransfer(tokenId, destination, payout.amountUnits);
       }
       const response = await tx.execute(client);
       await response.getReceipt(client);
@@ -457,7 +486,10 @@ export { resolveAccountId, distributeSplits };
  * moment someone becomes payable, all of it should move — not just the share
  * from whichever invite they happened to click.
  */
-export async function settleHeldPayoutsForUser(userId: string, accountId: string): Promise<number> {
+export async function settleHeldPayoutsForUser(
+  userId: string,
+  payee: { accountId?: string | null; evmAddress: string },
+): Promise<number> {
   const memberships = await db.query.studioMembers.findMany({
     where: eq(studioMembers.userId, userId),
     columns: { id: true },
@@ -466,7 +498,7 @@ export async function settleHeldPayoutsForUser(userId: string, accountId: string
 
   let settled = 0;
   for (const membership of memberships) {
-    settled += await settleHeldPayouts(membership.id, accountId);
+    settled += await settleHeldPayouts(membership.id, payee);
   }
 
   if (settled > 0) {

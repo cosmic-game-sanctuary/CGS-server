@@ -63,15 +63,21 @@ inviteRouter.post(
       .where(eq(splits.studioMemberId, member.id));
 
     // Anything that sold while they hadn't claimed it was held rather than
-    // paid. This is where they get it. Deliberately not awaited into the
-    // response: it is one transfer per sale and the screen shouldn't wait,
-    // and a failure leaves the row `failed` for `npm run splits:retry`.
+    // paid. This is where they get it — and it doesn't wait on them having a
+    // Hedera account already: `settleHeldPayouts` pays their EVM alias
+    // directly when no account resolves, which creates the account as a side
+    // effect of this very payment. `resolveHederaAccount` is still tried
+    // first purely because it's cheap and caches a real answer for every
+    // other route that needs one later; nothing here is gated on it
+    // succeeding. Deliberately not awaited into the response: it is one
+    // transfer per sale and the screen shouldn't wait, and a failure leaves
+    // the row `failed` for `npm run splits:retry`.
     void resolveHederaAccount({
       id: req.auth!.id,
       evmAddress: req.auth!.evmAddress,
       hederaAccountId: req.auth!.hederaAccountId,
     })
-      .then((accountId) => (accountId ? settleHeldPayouts(member.id, accountId) : 0))
+      .then((accountId) => settleHeldPayouts(member.id, { accountId, evmAddress: req.auth!.evmAddress }))
       .then((settled) => {
         if (settled > 0) logger.info({ memberId: member.id, settled }, "settled held payouts on invite accept");
       })
