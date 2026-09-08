@@ -93,6 +93,12 @@ export async function callAgentModel(input: {
   balanceUnits: bigint;
   asset: string;
 }): Promise<RawVerdict> {
+  // Guarded at both call sites already (the route refuses before charging,
+  // the watcher falls back before paying). Repeated here so this function is
+  // safe to call from anywhere without silently sending "Bearer undefined".
+  const apiKey = env.GROQ_API_KEY;
+  if (!apiKey) throw new Error("GROQ_API_KEY is not configured");
+
   const decimals = assetDecimals(input.asset);
   const balanceUsd = toDisplayAmount(Number(input.balanceUnits), input.asset);
   const userPrompt = `Wallet balance: $${balanceUsd.toFixed(decimals)}.\n\nGames to weigh:\n${input.eligible.map(describeWant).join("\n")}`;
@@ -105,7 +111,7 @@ export async function callAgentModel(input: {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        authorization: `Bearer ${env.GROQ_API_KEY}`,
+        authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
         model: env.GROQ_MODEL,

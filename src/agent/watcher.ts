@@ -233,6 +233,11 @@ async function getVerdict(
   balance: bigint,
   deterministic: EligibleWant[],
 ): Promise<Verdict> {
+  // Checked here rather than only inside the route, so a deployment with no
+  // model configured never *pays* for a verdict it cannot be given. The
+  // deterministic plan is a real answer, not an error state.
+  if (!env.GROQ_API_KEY) return fallbackVerdict(eligible, deterministic);
+
   try {
     const paid = await payForVerdict({
       walletId: agent.agentWalletId,

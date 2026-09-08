@@ -39,6 +39,14 @@ const agentInferenceRouter = Router({ caseSensitive: true, strict: true });
 agentInferenceRouter.get(
   "/verdict",
   asyncHandler(async (req, res) => {
+    // Refused before any payment terms are offered, not after settling. A
+    // deployment with no model configured must never take money for a verdict
+    // it cannot produce — the caller falls back to its deterministic plan and
+    // is charged nothing.
+    if (!env.GROQ_API_KEY) {
+      throw new AppError(503, "MODEL_UNAVAILABLE", "No decision model is configured on this server.");
+    }
+
     await ensureInitialized();
 
     const requirements = await resourceServer.buildPaymentRequirements({

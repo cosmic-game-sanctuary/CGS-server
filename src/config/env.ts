@@ -135,7 +135,15 @@ const envSchema = z.object({
   // From console.groq.com. What the agent pays inference cost (not tinybar)
   // to reason about a contested or ambiguous purchase — see
   // services/agent/model.ts and docs/stage-19.md.
-  GROQ_API_KEY: z.string(),
+  //
+  // Optional on purpose. Without it the agent still works: a contested round
+  // falls back to the deterministic plan, which is the same path rule 7
+  // already takes when the model times out or errs ("degrade to working,
+  // never to stuck"). Making it required meant the whole server refused to
+  // boot for anyone whose .env predates Stage 19 — a teammate checking out
+  // this branch got a config error instead of a running API, which is a much
+  // worse failure than an agent that reasons a little less well.
+  GROQ_API_KEY: z.string().optional(),
   // gpt-oss-20b: fast, and one of the models Groq's structured-output "strict"
   // mode actually enforces, which matters more here than raw quality — a
   // verdict that fails to parse must never be able to happen.
