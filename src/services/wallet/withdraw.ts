@@ -36,6 +36,7 @@ export type WithdrawIntent = {
   userId: string;
   evmAddress: string;
   fromAccountId: string;
+  /** What to call the destination on screen: an account id, or the address. */
   toAccountId: string;
   asset: string;
   amountUnits: string;
@@ -63,7 +64,20 @@ export async function prepareWithdraw(input: {
   userId: string;
   evmAddress: string;
   fromAccountId: string;
-  toAccountId: string;
+  /** Null when the destination has no Hedera account yet. See `toEvmAddress`. */
+  toAccountId: string | null;
+  /**
+   * The destination as an EVM address, when that is what was given.
+   *
+   * A wallet that has never received value has no account to send to, and
+   * refusing on that basis made a whole class of destination unreachable — a
+   * brand new agent's wallet most of all, since funding it *is* the first thing
+   * that would ever have landed there. Transferring to the alias creates the
+   * account as a side effect, which is the same HIP-542 mechanic a held payout
+   * already uses to pay a collaborator who has never touched Hedera. The
+   * creation fee falls on the sender, and the sender here is the operator.
+   */
+  toEvmAddress?: string | null;
   asset: string;
   amountUnits: bigint;
   memo?: string | null;
@@ -72,7 +86,9 @@ export async function prepareWithdraw(input: {
   for (const [id, held] of intents) if (held.expiresAt <= now) intents.delete(id);
 
   const from = AccountId.fromString(input.fromAccountId);
-  const to = AccountId.fromString(input.toAccountId);
+  const to = input.toAccountId
+    ? AccountId.fromString(input.toAccountId)
+    : AccountId.fromEvmAddress(0, 0, input.toEvmAddress!);
   const tx = new TransferTransaction();
 
   if (input.asset === "0.0.0") {
@@ -105,7 +121,7 @@ export async function prepareWithdraw(input: {
     userId: input.userId,
     evmAddress: input.evmAddress,
     fromAccountId: input.fromAccountId,
-    toAccountId: input.toAccountId,
+    toAccountId: input.toAccountId ?? input.toEvmAddress!,
     asset: input.asset,
     amountUnits: input.amountUnits.toString(),
     memo: input.memo ?? null,

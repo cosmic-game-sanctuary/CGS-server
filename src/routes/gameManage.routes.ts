@@ -38,6 +38,7 @@ import {
   createPromotion,
   endPromotion,
   extendPromotion,
+  windDownPromotion,
   promotionHistory,
   serializePromotion,
 } from "../services/games/promotions.js";
@@ -663,8 +664,13 @@ gameManageRouter.delete(
       throw Errors.validationFailed({ promotionId: "that sale is already over" });
     }
 
-    const ended = await endPromotion(promotion, "cancelled");
-    res.json(serializePromotion(ended ?? promotion));
+    // Wound down to its last hour rather than switched off. See
+    // services/games/promotions.ts#windDownPromotion — a deadline that was
+    // published is something other people, and other people's agents, have
+    // planned around, and pulling it instantly is how our own "decide at the
+    // wire" behaviour would cost a buyer a game they were going to get.
+    const winding = await windDownPromotion(promotion);
+    res.json(serializePromotion(winding));
   }),
 );
 

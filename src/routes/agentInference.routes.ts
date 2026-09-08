@@ -5,7 +5,7 @@ import { wishlistAgents } from "../db/schema.js";
 import { asyncHandler } from "../lib/asyncHandler.js";
 import { AppError } from "../lib/errors.js";
 import { env } from "../config/env.js";
-import { eligibleWantsFor } from "../services/agent/decide.js";
+import { wantsFor } from "../services/agent/decide.js";
 import { agentBalance } from "../services/agent/wallet.js";
 import { callAgentModel } from "../services/agent/model.js";
 import {
@@ -101,11 +101,13 @@ agentInferenceRouter.get(
       throw new AppError(403, "NOT_AN_AGENT", "Only a known agent wallet can pay for a verdict.");
     }
 
-    const eligible = await eligibleWantsFor(agent);
+    // Both halves, because the question is an allocation one: what the budget
+    // is *also* wanted for is what makes spending it a decision at all.
+    const { eligible, pending } = await wantsFor(agent);
     const balanceUnits = await agentBalance(agent);
 
     try {
-      const verdict = await callAgentModel({ eligible, balanceUnits, asset: env.X402_ASSET });
+      const verdict = await callAgentModel({ eligible, pending, balanceUnits, asset: env.X402_ASSET });
       res.json({ verdict, costUnits: env.AGENT_INFERENCE_PRICE_UNITS, settlementTxId: settlement.transaction });
     } catch (err) {
       // The payment already settled — thinking failed, not paying for it. The

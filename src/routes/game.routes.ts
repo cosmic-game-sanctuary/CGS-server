@@ -358,11 +358,20 @@ gameRouter.get(
 
     let owned: boolean | undefined;
     let liked: boolean | undefined;
+    // The want on that same row, when there is one. The lookup was already
+    // happening and was throwing everything but a boolean away, which left a
+    // client with no way to render "your agent buys this at X" without
+    // fetching the whole wishlist to find one row.
+    let agentMaxUnits: number | null = null;
+    let agentNote: string | null = null;
     if (req.auth) {
       owned = (await ownsGame(req.auth.evmAddress, game.htsTokenId)).owned;
-      liked = !!(await db.query.wishlistItems.findFirst({
+      const saved = await db.query.wishlistItems.findFirst({
         where: and(eq(wishlistItems.gameId, game.id), eq(wishlistItems.userId, req.auth.id)),
-      }));
+      });
+      liked = !!saved;
+      agentMaxUnits = saved?.agentMaxUnits ?? null;
+      agentNote = saved?.agentNote ?? null;
     }
 
     res.json({
@@ -382,6 +391,10 @@ gameRouter.get(
       liked,
       // The same value under the name the list actually has now.
       wishlisted: liked,
+      // The ceiling this person's agent will buy at, and their note to it.
+      // Null for a plain saved game, and for anyone signed out.
+      agentMaxUnits,
+      agentNote,
       // The sale this price came from, when it came from one. `endsAt` is the
       // part worth rendering — a discount with a visible deadline is a
       // different thing from a cheap game.

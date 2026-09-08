@@ -38,43 +38,62 @@ export type EligibleWant = {
 };
 
 /**
- * Every want belonging to this agent's buyer that is affordable *right now*,
- * still published, and not already owned.
+ * A want the buyer has that is **not** affordable yet.
+ *
+ * These are the whole reason the agent has anything to think about. A budget
+ * only feels scarce next to what else it is wanted for, and an agent that can
+ * see nothing but what is on sale this second cannot know that spending now
+ * costs it something later. It just buys the first cheap thing and runs out.
+ */
+export type PendingWant = {
+  gameId: string;
+  title: string;
+  agentMaxUnits: number;
+  currentPriceUnits: number;
+  asset: string;
+  note: string | null;
+  lowestEverUnits: number;
+  promotionEndsAt: Date | null;
+};
+
+/**
+ * Everything this buyer wants, split by whether it can be had right now.
  *
  * Ownership is checked with `hasEntitlement`, not the Mirror Node alone — the
  * same reasoning as everywhere else it's used: the gap between a settlement
  * and a mint landing is real, and re-buying something already paid for in that
  * gap would be a second charge for the same game.
  */
-export async function eligibleWantsFor(agent: Agent): Promise<EligibleWant[]> {
+export async function wantsFor(
+  agent: Agent,
+): Promise<{ eligible: EligibleWant[]; pending: PendingWant[] }> {
   const buyer = await db.query.users.findFirst({ where: eq(users.id, agent.buyerUserId) });
-  if (!buyer) return [];
+  if (!buyer) return { eligible: [], pending: [] };
 
   const wants = await db.query.wishlistItems.findMany({
     where: and(eq(wishlistItems.userId, agent.buyerUserId), isNotNull(wishlistItems.agentMaxUnits)),
   });
-  if (wants.length === 0) return [];
+  if (wants.length === 0) return { eligible: [], pending: [] };
 
   const gameRows = await db.query.games.findMany({
     where: inArray(games.id, wants.map((w) => w.gameId)),
   });
   const gameById = new Map(gameRows.map((g) => [g.id, g]));
 
-  const out: EligibleWant[] = [];
+  const eligible: EligibleWant[] = [];
+  const pending: PendingWant[] = [];
+
   for (const want of wants) {
     const game = gameById.get(want.gameId);
     if (!game || game.status !== "published") continue;
-    if (game.priceUnits > want.agentMaxUnits!) continue; // not affordable yet
 
     const owned = await hasEntitlement(buyer.evmAddress, game);
     if (owned.owned) continue; // drop silently — rule 6, nothing to tell anyone
 
     const promo = await activePromotionFor(game.id);
     const history = await priceHistory(game);
-    out.push({
-      wishlistItemId: want.id,
+    const common = {
       gameId: game.id,
-      slug: game.slug,
       title: game.title,
       agentMaxUnits: want.agentMaxUnits!,
       currentPriceUnits: game.priceUnits,
@@ -82,9 +101,25 @@ export async function eligibleWantsFor(agent: Agent): Promise<EligibleWant[]> {
       note: want.agentNote,
       lowestEverUnits: history.reduce((low, h) => Math.min(low, h.toUnits), game.priceUnits),
       promotionEndsAt: promo?.endsAt ?? null,
-    });
+    };
+
+    if (game.priceUnits > want.agentMaxUnits!) {
+      pending.push(common);
+      continue;
+    }
+    eligible.push({ ...common, wishlistItemId: want.id, slug: game.slug });
   }
-  return out;
+
+  return { eligible, pending };
+}
+
+/**
+ * Every want that is affordable *right now*. The half of `wantsFor` that
+ * existing callers want, kept as its own name because "what can I buy" is a
+ * different question from "what does this person want".
+ */
+export async function eligibleWantsFor(agent: Agent): Promise<EligibleWant[]> {
+  return (await wantsFor(agent)).eligible;
 }
 
 /**
@@ -125,13 +160,42 @@ export function planPurchases(eligible: EligibleWant[], balanceUnits: bigint): E
 }
 
 /**
- * True when the deterministic pass didn't clear the whole eligible set — the
- * only condition under which Stage 19 spends anything on thinking. An agent
- * with nothing left over after `planPurchases` is Shape A or B and this is
- * `false`; nothing calls the model.
+ * Is there actually a decision here, or just an obvious purchase?
+ *
+ * This used to ask only whether the greedy plan left something eligible
+ * unbought, and that turned out to be the wrong question in the case the agent
+ * exists for. Two games, both wanted at $1, a $1.20 budget: they almost never
+ * go on sale in the same instant. The first one to drop is the only thing
+ * eligible, the greedy plan clears it, nothing looks contested, and the agent
+ * spends the budget on whichever sale happened to start first. The second game
+ * then never becomes affordable. **No decision was ever made** — the outcome
+ * was decided by the order two studios happened to press a button.
+ *
+ * So the real question is not "is something left over now" but **"does buying
+ * this cost me something I also want"**. Money the buyer has earmarked for
+ * other wants is not spare, even when nothing else is on sale this second.
+ *
+ * When that is true, the choice is genuinely open: buy now, or wait. Waiting
+ * is close to free, because a sale is still there until it ends — so the agent
+ * can hold and decide at the last responsible moment, with more of the world
+ * visible than it has right now. That is the judgement worth paying for.
  */
-export function needsJudgement(eligible: EligibleWant[], deterministic: EligibleWant[]): boolean {
-  return deterministic.length < eligible.length;
+export function needsJudgement(
+  eligible: EligibleWant[],
+  deterministic: EligibleWant[],
+  pending: PendingWant[] = [],
+  balanceUnits = 0n,
+): boolean {
+  // Something eligible was left unbought: contention in the plainest sense.
+  if (deterministic.length < eligible.length) return true;
+  if (deterministic.length === 0) return false;
+
+  // Nothing left over, but is the money spoken for? A want the buyer cannot
+  // afford yet is still a claim on this balance, and spending down past it
+  // forecloses that claim without anyone deciding to.
+  const spend = deterministic.reduce((sum, w) => sum + BigInt(w.currentPriceUnits), 0n);
+  const left = balanceUnits - spend;
+  return pending.some((w) => BigInt(w.agentMaxUnits) > left);
 }
 
 /** What the model is asked to return. Kept flat so a strict JSON schema can

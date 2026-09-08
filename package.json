@@ -17,6 +17,7 @@
     "seed:wipe": "tsx scripts/seed-dev.ts --wipe",
     "builds:backfill": "tsx scripts/backfill-build-zips.ts",
     "game:delist": "tsx scripts/delist-game.ts",
+    "sale:end": "tsx scripts/end-sale.ts",
     "listings:retry": "tsx scripts/retry-announcements.ts",
     "builds:backfill-versions": "tsx scripts/backfill-build-versions.ts",
     "users:backfill-handles": "tsx scripts/backfill-handles.ts",

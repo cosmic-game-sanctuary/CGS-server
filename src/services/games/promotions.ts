@@ -5,6 +5,9 @@ import { AppError, Errors } from "../../lib/errors.js";
 import { assetDecimals, toDisplayAmount } from "../../lib/display.js";
 import { announce, changePrice } from "./listing.js";
 import { notifyPriceDrop } from "./wishlist.js";
+// The same hour an agent is guaranteed to execute a decision in. Imported
+// rather than redeclared so the two can never drift apart.
+import { PURCHASE_BUFFER_MS } from "../agent/timing.js";
 import logger from "../../utils/logger.utils.js";
 
 type Game = typeof games.$inferSelect;
@@ -220,6 +223,60 @@ export async function endPromotion(
 
   logger.info({ promotionId: claimed.id, gameId: game.id, reason }, "promotion over, price restored");
   return withTx!;
+}
+
+/**
+ * Wind a running sale down: not off, but to its last hour.
+ *
+ * A sale used to be endable instantly, and that turned out to be a way for a
+ * studio to take a deal off the table from under someone who was relying on
+ * it. An agent that decided to wait for the deadline — the whole point of
+ * letting it decide at the wire rather than spend on the first thing that got
+ * cheap — could lose a game its buyer would otherwise have got. That is our
+ * change costing them the purchase, which is not acceptable.
+ *
+ * So the same hour that lets an agent execute a decision (`PURCHASE_BUFFER_MS`
+ * in agent/timing.ts) is now also the notice a studio has to give. One
+ * constant, two uses: whoever is watching the deadline always has exactly as
+ * long to act as the system already believes acting takes.
+ *
+ * A sale already inside that hour is refused rather than extended, and a sale
+ * that never started is cancelled outright by the caller — nothing was
+ * announced, so nobody can have planned around it.
+ */
+export async function windDownPromotion(promotion: Promotion, now = new Date()) {
+  if (promotion.status !== "active") {
+    throw Errors.validationFailed({ promotionId: "that sale is not running" });
+  }
+
+  const lastHour = new Date(now.getTime() + PURCHASE_BUFFER_MS);
+  if (promotion.endsAt <= lastHour) {
+    throw Errors.validationFailed({
+      promotionId: "this sale already ends within the hour, so it is on its way out either way",
+    });
+  }
+
+  const [updated] = await db
+    .update(gamePromotions)
+    .set({ endsAt: lastHour, updatedAt: new Date() })
+    .where(eq(gamePromotions.id, promotion.id))
+    .returning();
+
+  // Announced like any other deadline move. This is the message an agent acts
+  // on: it re-decides, and because the new end is exactly one buffer away, any
+  // hold it was sitting on resolves immediately rather than at a deadline that
+  // no longer exists.
+  const game = await db.query.games.findFirst({ where: eq(games.id, promotion.gameId) });
+  if (game && game.status === "published") {
+    await announce(game, "price_changed", {
+      promotionId: updated!.id,
+      endsAt: updated!.endsAt.toISOString(),
+      fromUnits: game.priceUnits,
+      saleEndingEarly: true,
+    });
+  }
+
+  return updated!;
 }
 
 /** Push a running sale's end date later. Only ever later. */

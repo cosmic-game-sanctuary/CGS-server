@@ -473,13 +473,13 @@ meRouter.post(
     const from = await resolveHederaAccount(auth);
     if (!from) throw Errors.walletNotFunded("There is nothing in this wallet to withdraw yet.");
 
-    const toAccountId = await resolveDestination(to);
-    if (!toAccountId) {
+    const destination = await resolveDestination(to);
+    if (!destination) {
       throw Errors.validationFailed({
-        to: "No Hedera account was found for that address. Check it, or send it some HBAR first so it exists.",
+        to: "That doesn't look like a Hedera account id or a wallet address.",
       });
     }
-    if (toAccountId === from) {
+    if (destination.accountId === from || destination.evmAddress?.toLowerCase() === auth.evmAddress.toLowerCase()) {
       throw Errors.validationFailed({ to: "That is this wallet. Send it somewhere else." });
     }
 
@@ -501,7 +501,8 @@ meRouter.post(
       userId: auth.id,
       evmAddress: auth.evmAddress,
       fromAccountId: from,
-      toAccountId,
+      toAccountId: destination.accountId,
+      toEvmAddress: destination.evmAddress,
       asset,
       amountUnits: amount,
       memo,
@@ -510,7 +511,7 @@ meRouter.post(
     res.json({
       intentId: intent.id,
       hashes: intent.hashes,
-      to: toAccountId,
+      to: intent.toAccountId,
       asset,
       amountUnits: intent.amountUnits,
       memo: intent.memo,
@@ -566,13 +567,26 @@ meRouter.post(
   }),
 );
 
-/** A Hedera account id as given, or the account behind an EVM address. */
-async function resolveDestination(input: string): Promise<string | null> {
+/**
+ * Where the money is going, as either kind of address.
+ *
+ * An EVM address with no account behind it yet is a **valid destination**, not
+ * a bad one. It used to be refused, which made a brand new wallet unfundable
+ * by the one route that could have funded it — and funding an agent is exactly
+ * that case, since the agent's wallet has by definition never received
+ * anything. `prepareWithdraw` sends to the alias in that case and the transfer
+ * brings the account into existence.
+ *
+ * Null now means only what it says: that is not an address.
+ */
+async function resolveDestination(
+  input: string,
+): Promise<{ accountId: string | null; evmAddress: string | null } | null> {
   const value = input.trim();
-  if (/^\d+\.\d+\.\d+$/.test(value)) return value;
+  if (/^\d+\.\d+\.\d+$/.test(value)) return { accountId: value, evmAddress: null };
   if (!/^0x[a-fA-F0-9]{40}$/.test(value)) return null;
   const account = await getAccountByEvmAddress(value);
-  return account?.account ?? null;
+  return { accountId: account?.account ?? null, evmAddress: value };
 }
 
 export default meRouter;
