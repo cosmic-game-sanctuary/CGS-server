@@ -33,14 +33,33 @@ type Game = typeof games.$inferSelect;
 // background. A failure here never costs the buyer their purchase — the
 // payment is already final and provable on-chain, and `game_keys.mint_status`
 // records what still needs retrying.
-export async function fulfilPurchase(game: Game, buyerAccountId: string, settlementTxId: string) {
+//
+/**
+ * `amountUnits` is what was **actually received**, and every downstream figure
+ * is derived from it rather than from `game.priceUnits`.
+ *
+ * That distinction used to not exist, and it was a live money bug. Splits were
+ * computed from the game's price *at the moment the split ran*, which was fine
+ * while prices only moved by hand and stopped being fine the moment promotions
+ * started moving them on their own: a $2 sale whose split distribution failed
+ * and was retried after the promotion reverted would pay out $6 of shares, out
+ * of the platform's own account. The mirror case underpaid. Paying out what
+ * arrived is the only version that is correct under a price that can change
+ * underneath it.
+ */
+export async function fulfilPurchase(
+  game: Game,
+  buyerAccountId: string,
+  settlementTxId: string,
+  amountUnits: number,
+) {
   // Two rows, and the caller waits for them. They are what says this person
   // bought this game — everything below is chain work that can be retried, but
   // until these exist the buyer looks to the rest of the system like someone
   // who hasn't paid. The download route hands back a build the instant it
   // responds, and the request for that build arrives in milliseconds, so
   // leaving this in the background raced the buyer against their own purchase.
-  const { sale, key } = await recordPurchase(game, buyerAccountId, settlementTxId);
+  const { sale, key } = await recordPurchase(game, buyerAccountId, settlementTxId, amountUnits);
   // Nothing awaits this, so nothing would catch it either. Every step inside
   // handles its own failure; this is the backstop that keeps an unexpected one
   // from taking the process down with it.
@@ -49,13 +68,18 @@ export async function fulfilPurchase(game: Game, buyerAccountId: string, settlem
   );
 }
 
-async function recordPurchase(game: Game, buyerAccountId: string, settlementTxId: string) {
+async function recordPurchase(
+  game: Game,
+  buyerAccountId: string,
+  settlementTxId: string,
+  amountUnits: number,
+) {
   const [sale] = await db
     .insert(sales)
     .values({
       gameId: game.id,
       buyerAccountId,
-      priceUnits: game.priceUnits,
+      priceUnits: amountUnits,
       priceAsset: game.priceAsset,
       settlementTxId,
     })
@@ -103,13 +127,16 @@ async function settleOnChain(
   // recorded on the sale row rather than just logged — scripts/retry-failed-splits.ts
   // is what actually retries it. There was no way to retry this before Stage 4;
   // it just logged an error and moved on.
-  await runSplitDistribution(sale.id, game);
+  // `sale.priceUnits` rather than `game.priceUnits` throughout: the sale row is
+  // the record of what was actually received, and it cannot drift when the
+  // listing price moves afterwards.
+  await runSplitDistribution(sale.id, game, sale.priceUnits);
 
   await submitTopicMessage(env.HCS_SALES_TOPIC!, {
     gameId: game.id,
     slug: game.slug,
     buyer: buyerAccountId,
-    amountUnits: game.priceUnits,
+    amountUnits: sale.priceUnits,
     asset: game.priceAsset,
     settlementTxId,
     at: new Date().toISOString(),
@@ -117,18 +144,18 @@ async function settleOnChain(
     .then((hcsTxId) => db.update(sales).set({ hcsSaleTxId: hcsTxId }).where(eq(sales.id, sale.id)))
     .catch((err) => logger.error({ err, gameId: game.id }, "HCS sale log failed"));
 
-  await notifyStudio(game).catch(() => {});
+  await notifyStudio(game, sale.priceUnits).catch(() => {});
 }
 
-async function runSplitDistribution(saleId: string, game: Game) {
-  if (game.priceUnits <= 0) {
+async function runSplitDistribution(saleId: string, game: Game, amountUnits: number) {
+  if (amountUnits <= 0) {
     // nothing owed on a free game — there's nothing to retry, so it's not
     // "pending" forever, it's just done.
     await db.update(sales).set({ splitStatus: "distributed" }).where(eq(sales.id, saleId));
     return;
   }
   try {
-    const { held } = await distributeSplits(game, saleId);
+    const { held } = await distributeSplits(game, saleId, amountUnits);
     // "partial" rather than "failed": the money that could move, moved. What
     // is left belongs to someone who hasn't claimed their invite, and it is
     // recorded in pending_payouts rather than lost.
@@ -183,8 +210,12 @@ async function mintAndTransferKey(game: Game, buyerAccountId: string): Promise<n
  * is lost and nothing is stranded: the amounts still total `priceUnits`, the
  * held part simply stays in the operator account until it has somewhere to go.
  */
-async function distributeSplits(game: Game, saleId: string): Promise<{ paid: number; held: number }> {
-  if (game.priceUnits <= 0) return { paid: 0, held: 0 };
+async function distributeSplits(
+  game: Game,
+  saleId: string,
+  amountUnits: number,
+): Promise<{ paid: number; held: number }> {
+  if (amountUnits <= 0) return { paid: 0, held: 0 };
 
   const rows = await db.query.splits.findMany({ where: eq(splits.gameId, game.id) });
   if (rows.length === 0) return { paid: 0, held: 0 };
@@ -194,14 +225,14 @@ async function distributeSplits(game: Game, saleId: string): Promise<{ paid: num
   // largest share rather than shifting to whoever has an account today.
   const shares = rows.map((row) => ({
     row,
-    amount: Math.floor((game.priceUnits * row.pct) / 100),
+    amount: Math.floor((amountUnits * row.pct) / 100),
   }));
 
   // integer division leaves a remainder of at most (recipients - 1) units;
   // give it to the largest share rather than letting it strand in the
   // platform account.
   const allocated = shares.reduce((sum, s) => sum + s.amount, 0);
-  const remainder = game.priceUnits - allocated;
+  const remainder = amountUnits - allocated;
   if (remainder > 0) {
     const largest = shares.reduce((a, b) => (b.amount > a.amount ? b : a));
     largest.amount += remainder;
@@ -323,7 +354,7 @@ async function resolveAccountId(wallet: string): Promise<string | null> {
   return account?.account ?? null;
 }
 
-async function notifyStudio(game: Game) {
+async function notifyStudio(game: Game, amountUnits: number) {
   const studio = await db.query.studios.findFirst({ where: eq(studios.id, game.studioId) });
   const members = await db.query.studioMembers.findMany({
     where: eq(studioMembers.studioId, game.studioId),
@@ -353,12 +384,12 @@ async function notifyStudio(game: Game) {
           gameId: game.id,
           slug: game.slug,
           title: game.title,
-          priceUnits: game.priceUnits,
+          priceUnits: amountUnits,
           priceAsset: game.priceAsset,
           // null when this person isn't on the splits — a studio owner who
           // credited the work to other people still wants to know it sold.
           sharePct: pct,
-          shareUnits: pct === null ? null : Math.floor((game.priceUnits * pct) / 100),
+          shareUnits: pct === null ? null : Math.floor((amountUnits * pct) / 100),
         },
       };
     }),
@@ -377,7 +408,7 @@ async function notifyStudio(game: Game) {
       to: person.email,
       gameTitle: game.title,
       slug: game.slug,
-      shareUnits: pct === null ? null : Math.floor((game.priceUnits * pct) / 100),
+      shareUnits: pct === null ? null : Math.floor((amountUnits * pct) / 100),
       asset: game.priceAsset,
     });
   }

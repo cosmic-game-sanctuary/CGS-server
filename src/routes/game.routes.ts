@@ -893,7 +893,12 @@ gameRouter.get(
     }
 
     if (buyerAccountId) {
-      await fulfilPurchase(game, buyerAccountId, settlement.transaction);
+      // The amount the payment was actually verified and settled against, not
+      // the game's price read a second time. Those are the same number today
+      // and stop being the same number the instant a promotion starts or ends
+      // between the 402 and the retry — see fulfil.ts#fulfilPurchase.
+      const paidUnits = Number(matched.amount ?? game.priceUnits);
+      await fulfilPurchase(game, buyerAccountId, settlement.transaction, paidUnits);
     }
 
     res.setHeader("payment-verified", "true");

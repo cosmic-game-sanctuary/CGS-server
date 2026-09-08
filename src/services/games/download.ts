@@ -81,5 +81,7 @@ async function grantFreeKey(game: Game, buyerEvmAddress: string): Promise<void> 
   const account = await getAccountByEvmAddress(buyerEvmAddress);
   if (!account) return;
 
-  void fulfilPurchase(game, account.account, "free");
+  // Zero received, so zero to split. `runSplitDistribution` short-circuits on
+  // that and marks the sale distributed rather than leaving it pending forever.
+  void fulfilPurchase(game, account.account, "free", 0);
 }

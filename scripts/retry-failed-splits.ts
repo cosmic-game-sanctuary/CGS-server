@@ -32,7 +32,11 @@ if (failed.length === 0) {
     }
 
     try {
-      const { held } = await distributeSplits(game, sale.id);
+      // `sale.priceUnits` — what this buyer actually paid — never the game's
+      // price now. This is the exact path the old bug ran down: a retry after
+      // a promotion reverted would distribute the restored full price for a
+      // sale that was made at the discount, out of the platform's own account.
+      const { held } = await distributeSplits(game, sale.id, sale.priceUnits);
       await db
         .update(sales)
         .set({ splitStatus: held > 0 ? "partial" : "distributed", splitError: null })
