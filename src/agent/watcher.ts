@@ -16,6 +16,7 @@ import { agentBalance, retireAgent } from "../services/agent/wallet.js";
 import { resolveHederaAccount } from "../services/users/repo.js";
 import {
   eligibleWantsFor,
+  wantsFor,
   planPurchases,
   needsJudgement,
   sanitizeVerdict,
@@ -158,8 +159,22 @@ async function handleMessage(
  * in isolation, rather than re-proven every time this logic is tested.
  */
 export async function evaluateAgent(agent: Agent): Promise<void> {
-  const eligible = await eligibleWantsFor(agent);
-  if (eligible.length === 0) return;
+  // Both halves. `pending` is never bought from — it is what tells the agent
+  // that its money is spoken for, which is the difference between an
+  // allocation and a reflex. See decide.ts#needsJudgement.
+  const { eligible, pending } = await wantsFor(agent);
+  if (eligible.length === 0) {
+    // Nothing is buyable any more, and the commonest way that happens is the
+    // one thing holding is genuinely exposed to: a studio ending a sale early.
+    //
+    // A held row always names a game that *was* eligible when it was written,
+    // so if nothing is eligible now it no longer describes anything real.
+    // Leaving it alone would leave a countdown running on the buyer's screen
+    // toward a deadline that stopped mattering, and leave the sweep to
+    // discover the same thing hours later.
+    await supersedeStalePending(agent.id);
+    return;
+  }
 
   const balance = await agentBalance(agent);
   const deterministic = planPurchases(eligible, balance);
@@ -196,9 +211,29 @@ export async function evaluateAgent(agent: Agent): Promise<void> {
     // cancel it and let the fresh evaluation below replace it.
     await supersedeStalePending(claimed.id);
 
-    const verdict = needsJudgement(eligible, deterministic)
+    const judged = needsJudgement(eligible, deterministic, pending, balance);
+    const verdict = judged
       ? await getVerdict(claimed, eligible, balance, deterministic)
-      : fallbackVerdict(eligible, deterministic); // Shape A/B — nothing left over, no model call, no cost.
+      : fallbackVerdict(eligible, deterministic); // Nothing is being traded off: buy it, no model call, no cost.
+
+    // One line per round, because until now the only thing an agent logged was
+    // a completed purchase — and the interesting rounds are the ones where it
+    // decides *not* to buy yet. Watching a hold appear is otherwise invisible
+    // from outside the database.
+    logger.info(
+      {
+        agentId: claimed.id,
+        eligible: eligible.map((w) => w.title),
+        alsoWanted: pending.map((w) => w.title),
+        balanceUnits: balance.toString(),
+        askedModel: judged,
+        thought: verdict.reasoning,
+        buying: verdict.buyNow.map((w) => w.title),
+        holding: verdict.hold.map((h) => h.want.title),
+        declining: verdict.decline.map((w) => w.title),
+      },
+      judged ? "agent decided" : "agent bought without needing to think",
+    );
 
     await actOnVerdict(claimed, buyerAccountId, eligible, verdict);
   } finally {
