@@ -32,8 +32,11 @@ type Challenge = {
 /** Either the route wants paying, or it already handed over the goods. */
 type ChallengeResult = { paid: false; challenge: Challenge } | { paid: true; body: unknown };
 
-async function readChallenge(url: string): Promise<ChallengeResult> {
-  const response = await fetch(url);
+async function readChallenge(url: string, authorization?: string): Promise<ChallengeResult> {
+  // As the buyer, not anonymously. `/download` subtracts trial credit for the
+  // authenticated caller, so an unauthenticated read here would quote the full
+  // price and quietly bin whatever they already paid to try the game.
+  const response = await fetch(url, authorization ? { headers: { authorization } } : undefined);
 
   if (response.status !== 402) {
     if (!response.ok) {
@@ -63,6 +66,7 @@ async function settle(
   challenge: Challenge,
   signer: ClientHederaSigner,
   ownerAccountId?: string,
+  authorization?: string,
 ) {
   const scheme = new ExactHederaScheme(signer);
   const { payload } = await scheme.createPaymentPayload(
@@ -87,6 +91,10 @@ async function settle(
   // game.routes.ts's download handler), so a regular buyer sending this
   // header changes nothing about their own purchase.
   if (ownerAccountId) headers["x-owner-account-id"] = ownerAccountId;
+  // Same reason as in `readChallenge`: the settle run reprices from scratch,
+  // and if it cannot see the buyer it cannot see their credit, so the retry
+  // would no longer match the terms the challenge offered.
+  if (authorization) headers.authorization = authorization;
 
   const paid = await fetch(url, { headers });
   const body = (await paid.json()) as {
@@ -183,11 +191,13 @@ async function prepareGatedPayment(input: {
   evmAddress: string;
   kind: "purchase" | "trial_chunk";
   url: string;
+  /** The buyer's bearer token. See `PaymentIntent.authorization`. */
+  authorization?: string;
 }): Promise<{ prepared: PreparedPayment } | { granted: unknown }> {
   const existing = findLiveIntent(input.userId, input.gameId, input.kind);
   if (existing) return { prepared: describe(existing) };
 
-  const result = await readChallenge(input.url);
+  const result = await readChallenge(input.url, input.authorization);
   if (result.paid) return { granted: result.body };
 
   const { challenge } = result;
@@ -200,6 +210,7 @@ async function prepareGatedPayment(input: {
     gameId: input.gameId,
     kind: input.kind,
     settleUrl: input.url,
+    authorization: input.authorization,
     accountId: input.accountId,
     evmAddress: input.evmAddress,
     frozenTx: Buffer.from(frozenTxBytes).toString("base64"),
@@ -217,6 +228,7 @@ export async function preparePayment(input: {
   gameId: string;
   accountId: string;
   evmAddress: string;
+  authorization?: string;
 }): Promise<{ prepared: PreparedPayment } | { granted: unknown }> {
   return prepareGatedPayment({ ...input, kind: "purchase", url: downloadUrl(input.gameId) });
 }
@@ -233,6 +245,7 @@ export async function prepareTrialChunk(input: {
   gameId: string;
   accountId: string;
   evmAddress: string;
+  authorization?: string;
 }): Promise<{ prepared: PreparedPayment } | { granted: unknown }> {
   return prepareGatedPayment({ ...input, kind: "trial_chunk", url: trialChunkUrl(input.gameId) });
 }
@@ -329,6 +342,8 @@ async function completeGatedPayment(input: {
     intent.settleUrl,
     { x402Version: intent.x402Version, resource: intent.resource, requirements: intent.requirements },
     presignedSigner(intent.accountId, signedTx),
+    undefined,
+    intent.authorization,
   );
 }
 
