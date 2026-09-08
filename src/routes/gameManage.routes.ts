@@ -44,6 +44,7 @@ import {
 import { deleteBuild } from "../services/games/buildStore.js";
 import { gatewayUrl, pinFile, unpinByCid } from "../services/ipfs/pinata.js";
 import { checkImages } from "../services/moderation/csam.js";
+import { trialConfigFits } from "../services/games/trials.js";
 import logger from "../utils/logger.utils.js";
 
 /**
@@ -90,8 +91,18 @@ const editGameSchema = z
     // An existing media row to promote to cover. Null clears it. Uploading new
     // art is POST /:id/media; this only picks which of it is the cover.
     coverMediaId: z.string().uuid().nullable().optional(),
+    // Trial config — see services/games/trials.ts. Set both together to turn
+    // trials on or change them; set both to null together to turn them off.
+    // A price with no cap (or the reverse) is a half-config this schema
+    // refuses to accept rather than silently leaving the other half stale.
+    trialChunkPriceUnits: z.number().int().positive().nullable().optional(),
+    trialChunkMinutes: z.number().int().positive().max(60).optional(),
+    trialMaxChunks: z.number().int().positive().max(100).nullable().optional(),
   })
-  .refine((body) => Object.keys(body).length > 0, { message: "nothing to change" });
+  .refine((body) => Object.keys(body).length > 0, { message: "nothing to change" })
+  .refine((body) => (body.trialChunkPriceUnits !== undefined) === (body.trialMaxChunks !== undefined), {
+    message: "trialChunkPriceUnits and trialMaxChunks must be set (or cleared) together",
+  });
 
 gameManageRouter.patch(
   "/:id",
@@ -126,6 +137,33 @@ gameManageRouter.patch(
         fields.coverCid = media.cid;
       }
     }
+
+    if (body.trialChunkPriceUnits !== undefined) {
+      if (body.trialChunkPriceUnits === null) {
+        // Both together, always — see the schema's own comment on why a
+        // half-config is refused rather than accepted.
+        fields.trialChunkPriceUnits = null;
+        fields.trialMaxChunks = null;
+      } else {
+        if (body.trialMaxChunks === null) {
+          throw Errors.validationFailed({
+            trialMaxChunks: "must be a number when trialChunkPriceUnits is a number",
+          });
+        }
+        // Validated against the price this game will actually have once this
+        // same request finishes applying — a trial config submitted alongside
+        // a price cut has to fit the *new* price, not the one being replaced.
+        const effectivePriceUnits = body.priceUnits ?? game.priceUnits;
+        if (!trialConfigFits(effectivePriceUnits, body.trialChunkPriceUnits, body.trialMaxChunks!)) {
+          throw Errors.validationFailed({
+            trialMaxChunks: "chunk price × max chunks can't exceed the game's price",
+          });
+        }
+        fields.trialChunkPriceUnits = body.trialChunkPriceUnits;
+        fields.trialMaxChunks = body.trialMaxChunks;
+      }
+    }
+    if (body.trialChunkMinutes !== undefined) fields.trialChunkMinutes = body.trialChunkMinutes;
 
     let updated = game;
     if (Object.keys(fields).length > 0) {

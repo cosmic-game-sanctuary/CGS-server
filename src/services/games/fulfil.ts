@@ -52,19 +52,35 @@ export async function fulfilPurchase(
   buyerAccountId: string,
   settlementTxId: string,
   amountUnits: number,
+  kind: "purchase" | "trial_chunk" = "purchase",
+  /** How much of this purchase's price trial credit already covered. Always
+   * 0 for a trial_chunk (a chunk cannot redeem credit against itself) — see
+   * services/games/trials.ts. */
+  creditAppliedUnits = 0,
 ) {
-  // Two rows, and the caller waits for them. They are what says this person
-  // bought this game — everything below is chain work that can be retried, but
-  // until these exist the buyer looks to the rest of the system like someone
-  // who hasn't paid. The download route hands back a build the instant it
-  // responds, and the request for that build arrives in milliseconds, so
-  // leaving this in the background raced the buyer against their own purchase.
-  const { sale, key } = await recordPurchase(game, buyerAccountId, settlementTxId, amountUnits);
+  // The sales row (and, for a real purchase, the gameKeys row), and the caller
+  // waits for both. They are what says this person paid — everything below is
+  // chain work that can be retried, but until these exist the buyer looks to
+  // the rest of the system like someone who hasn't paid. The download route
+  // hands back a build the instant it responds, and that request checks the
+  // record, so this can't be deferred to the background.
+  //
+  // A trial chunk gets no gameKeys row — there is nothing to mint a key for,
+  // five minutes of access is not ownership, and minting one would make every
+  // chunk cost as much chain work as buying the game outright.
+  const { sale, key } = await recordPurchase(
+    game,
+    buyerAccountId,
+    settlementTxId,
+    amountUnits,
+    kind,
+    kind === "purchase" ? creditAppliedUnits : 0,
+  );
   // Nothing awaits this, so nothing would catch it either. Every step inside
   // handles its own failure; this is the backstop that keeps an unexpected one
   // from taking the process down with it.
   void settleOnChain(game, sale, key, buyerAccountId, settlementTxId).catch((err) =>
-    logger.error({ err, gameId: game.id, buyerAccountId }, "fulfilment failed after settlement"),
+    logger.error({ err, gameId: game.id, buyerAccountId, kind }, "fulfilment failed after settlement"),
   );
 }
 
@@ -73,6 +89,8 @@ async function recordPurchase(
   buyerAccountId: string,
   settlementTxId: string,
   amountUnits: number,
+  kind: "purchase" | "trial_chunk",
+  creditAppliedUnits: number,
 ) {
   const [sale] = await db
     .insert(sales)
@@ -82,44 +100,53 @@ async function recordPurchase(
       priceUnits: amountUnits,
       priceAsset: game.priceAsset,
       settlementTxId,
+      kind,
+      creditAppliedUnits,
     })
     .returning();
 
-  const [key] = await db
-    .insert(gameKeys)
-    .values({
-      tokenId: game.htsTokenId!,
-      gameId: game.id,
-      ownerAccountId: buyerAccountId,
-      mintStatus: "pending",
-    })
-    .returning();
+  const key =
+    kind === "purchase"
+      ? (
+          await db
+            .insert(gameKeys)
+            .values({
+              tokenId: game.htsTokenId!,
+              gameId: game.id,
+              ownerAccountId: buyerAccountId,
+              mintStatus: "pending",
+            })
+            .returning()
+        )[0]
+      : undefined;
 
-  return { sale: sale!, key: key! };
+  return { sale: sale!, key };
 }
 
 /**
- * The mint, the split and the sale log. Minutes of chain round trips in the
- * worst case, none of which the buyer should wait for: settlement already
- * happened and is already provable, so a failure here is ours to retry and
- * never costs anyone their purchase.
+ * The mint (skipped for a trial chunk), the split and the sale log. Minutes of
+ * chain round trips in the worst case, none of which the buyer should wait
+ * for: settlement already happened and is already provable, so a failure here
+ * is ours to retry and never costs anyone their purchase.
  */
 async function settleOnChain(
   game: Game,
   sale: typeof sales.$inferSelect,
-  key: typeof gameKeys.$inferSelect,
+  key: typeof gameKeys.$inferSelect | undefined,
   buyerAccountId: string,
   settlementTxId: string,
 ) {
-  try {
-    const serial = await mintAndTransferKey(game, buyerAccountId);
-    await db
-      .update(gameKeys)
-      .set({ serial, mintStatus: "confirmed", mintedAt: new Date(), txId: settlementTxId })
-      .where(eq(gameKeys.id, key.id));
-  } catch (err) {
-    logger.error({ err, gameId: game.id, buyerAccountId }, "GameKey mint failed");
-    await db.update(gameKeys).set({ mintStatus: "failed" }).where(eq(gameKeys.id, key.id));
+  if (key) {
+    try {
+      const serial = await mintAndTransferKey(game, buyerAccountId);
+      await db
+        .update(gameKeys)
+        .set({ serial, mintStatus: "confirmed", mintedAt: new Date(), txId: settlementTxId })
+        .where(eq(gameKeys.id, key.id));
+    } catch (err) {
+      logger.error({ err, gameId: game.id, buyerAccountId }, "GameKey mint failed");
+      await db.update(gameKeys).set({ mintStatus: "failed" }).where(eq(gameKeys.id, key.id));
+    }
   }
 
   // the split and the sale log are independent of the mint — a failed mint
@@ -138,13 +165,19 @@ async function settleOnChain(
     buyer: buyerAccountId,
     amountUnits: sale.priceUnits,
     asset: game.priceAsset,
+    kind: sale.kind,
     settlementTxId,
     at: new Date().toISOString(),
   })
     .then((hcsTxId) => db.update(sales).set({ hcsSaleTxId: hcsTxId }).where(eq(sales.id, sale.id)))
     .catch((err) => logger.error({ err, gameId: game.id }, "HCS sale log failed"));
 
-  await notifyStudio(game, sale.priceUnits).catch(() => {});
+  // A studio hearing about every five-minute trial chunk is a spam machine,
+  // not a notification — the purchase (or the finished trial converting into
+  // one) is the moment worth their attention.
+  if (sale.kind === "purchase") {
+    await notifyStudio(game, sale.priceUnits).catch(() => {});
+  }
 }
 
 async function runSplitDistribution(saleId: string, game: Game, amountUnits: number) {

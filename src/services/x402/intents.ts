@@ -23,6 +23,16 @@ export type PaymentIntent = {
   /** Ours, not Privy's. Whoever prepared it is the only one who may complete it. */
   userId: string;
   gameId: string;
+  /**
+   * What this intent pays for — a game purchase or one trial chunk. The same
+   * (user, game) pair can have a live intent of each kind at once (someone
+   * mid-trial who also opens the buy dialog), so `findLiveIntent` matches on
+   * this too, not just the pair.
+   */
+  kind: "purchase" | "trial_chunk";
+  /** Where `completePayment`/`completeTrialChunk` settles this against — the
+   * same URL `prepareGatedPayment` read the 402 challenge from. */
+  settleUrl: string;
   accountId: string;
   /**
    * Who the signatures must turn out to belong to.
@@ -76,16 +86,28 @@ export function createIntent(
 }
 
 /**
- * A live intent this person already has for this game, if any.
+ * A live intent this person already has for this game and this kind of
+ * payment, if any.
  *
  * Double-clicking "Pay" should not build two transfers, because completing both
  * would charge twice for one game. Handing back the intent already in flight
- * makes prepare idempotent for as long as it matters.
+ * makes prepare idempotent for as long as it matters. Scoped by `kind` as well
+ * as `gameId` — a live trial-chunk intent must never be handed back to someone
+ * asking to buy the game outright, or vice versa.
  */
-export function findLiveIntent(userId: string, gameId: string): PaymentIntent | undefined {
+export function findLiveIntent(
+  userId: string,
+  gameId: string,
+  kind: PaymentIntent["kind"],
+): PaymentIntent | undefined {
   const now = Date.now();
   for (const intent of intents.values()) {
-    if (intent.userId === userId && intent.gameId === gameId && intent.expiresAt > now) {
+    if (
+      intent.userId === userId &&
+      intent.gameId === gameId &&
+      intent.kind === kind &&
+      intent.expiresAt > now
+    ) {
       return intent;
     }
   }

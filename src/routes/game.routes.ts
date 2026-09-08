@@ -61,9 +61,11 @@ import {
 } from "../services/x402/server.js";
 import { fulfilPurchase } from "../services/games/fulfil.js";
 import { getAccountByEvmAddress } from "../services/hedera/mirror.js";
-import { preparePayment, completePayment } from "../services/x402/pay.js";
+import { preparePayment, completePayment, prepareTrialChunk, completeTrialChunk } from "../services/x402/pay.js";
 import { emailStudioInvite } from "../services/email/messages.js";
 import { createGameToken } from "../services/hedera/hts.js";
+import { resolveHederaAccount } from "../services/users/repo.js";
+import { trialEnabled, trialStatusFor, resolvePurchasePrice } from "../services/games/trials.js";
 
 const gameRouter = Router({ caseSensitive: true, strict: true });
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
@@ -822,13 +824,44 @@ gameRouter.get(
     // payment terms for zero.
     if (game.priceUnits === 0) throw Errors.unauthenticated("Sign in to get this game.");
 
+    // Trial credit — every chunk this caller has already paid for on this
+    // game — reduces what's actually owed. Recomputed fresh on every request
+    // to this route rather than cached anywhere, the same way the price
+    // itself always is: this handler runs once to issue the 402 and again to
+    // settle the retry, and both runs need to agree. See
+    // services/games/trials.ts#resolvePurchasePrice for the arithmetic.
+    const creditAccountId = req.auth ? await resolveHederaAccount(req.auth) : null;
+    const { owedUnits, creditUnits } = await resolvePurchasePrice(game, creditAccountId);
+
+    // Credit alone covers the whole price. Below the relay's one-tinybar
+    // floor a zero-amount x402 challenge would just fail confusingly, so this
+    // routes through the same "nothing to charge" shape a free game uses,
+    // rather than ever offering payment terms for zero.
+    if (owedUnits === 0 && creditAccountId) {
+      await fulfilPurchase(
+        game,
+        creditAccountId,
+        `trial-credit:${game.id}:${creditAccountId}`,
+        0,
+        "purchase",
+        game.priceUnits,
+      );
+      res.json({
+        buildPath: buildPathFor(game),
+        buildCid: game.buildCid,
+        tokenId: game.htsTokenId,
+        keyStatus: "pending",
+      });
+      return;
+    }
+
     await ensureInitialized();
 
     const requirements = await resourceServer.buildPaymentRequirements({
       scheme: "exact",
       network: env.X402_NETWORK,
       payTo: env.X402_PAY_TO,
-      price: { asset: game.priceAsset, amount: String(game.priceUnits) },
+      price: { asset: game.priceAsset, amount: String(owedUnits) },
       maxTimeoutSeconds: 180,
     });
 
@@ -858,6 +891,7 @@ gameRouter.get(
     if (!verification.isValid) {
       throw new AppError(402, "PAYMENT_REQUIRED", "Payment could not be verified.", {
         reason: verification.invalidReason,
+        message: verification.invalidMessage,
       });
     }
 
@@ -897,8 +931,12 @@ gameRouter.get(
       // the game's price read a second time. Those are the same number today
       // and stop being the same number the instant a promotion starts or ends
       // between the 402 and the retry — see fulfil.ts#fulfilPurchase.
-      const paidUnits = Number(matched.amount ?? game.priceUnits);
-      await fulfilPurchase(game, buyerAccountId, settlement.transaction, paidUnits);
+      const paidUnits = Number(matched.amount ?? owedUnits);
+      // `creditUnits` was computed once, above, from the same authenticated
+      // caller this challenge was built for — an agent's purchase never has
+      // one (no bearer token on that request), so an agent can never redeem a
+      // person's trial credit on their behalf without them asking.
+      await fulfilPurchase(game, buyerAccountId, settlement.transaction, paidUnits, "purchase", creditUnits);
     }
 
     res.setHeader("payment-verified", "true");
@@ -1055,6 +1093,182 @@ gameRouter.post(
     if (!game) throw Errors.notFound("Game");
 
     const result = await completePayment({
+      userId: req.auth!.id,
+      gameId: game.id,
+      intentId: body.intentId,
+      signatures: body.signatures,
+    });
+    res.json(result);
+  }),
+);
+
+// --- paid trials ------------------------------------------------------------
+//
+// A chunk of play, bought like anything else in this route file — a real
+// x402 payment, prepared and signed the same two-step way a purchase is
+// (services/x402/pay.ts#prepareTrialChunk). What every chunk paid for adds up
+// to credit toward the purchase, applied automatically by /:id/download —
+// see services/games/trials.ts. See docs/stage-20.md for the design and the
+// reason a build being unpacked in the browser means a trial can't be
+// technically enforced, only honoured.
+
+function toTrialUsd(units: number | null, game: { priceAsset: string }) {
+  return units === null ? null : toDisplayAmount(units, game.priceAsset);
+}
+
+// Public config, plus this caller's own numbers if they're signed in and have
+// an account to look up — never anyone else's.
+gameRouter.get(
+  "/:id/trial",
+  optionalAuth,
+  asyncHandler(async (req, res) => {
+    const game = await findGameByRef(param(req, "id"));
+    if (!game) throw Errors.notFound("Game");
+
+    const buyerAccountId = req.auth ? await resolveHederaAccount(req.auth) : null;
+    const status = await trialStatusFor(game, buyerAccountId);
+
+    res.json({
+      ...status,
+      chunkPriceUsd: toTrialUsd(status.chunkPriceUnits, game),
+      worstCaseUsd: toDisplayAmount(status.worstCaseUnits, game.priceAsset),
+      spentUsd: toDisplayAmount(status.spentUnits, game.priceAsset),
+      creditUsd: toDisplayAmount(status.creditUnits, game.priceAsset),
+      asset: game.priceAsset,
+      assetDecimals: assetDecimals(game.priceAsset),
+    });
+  }),
+);
+
+/**
+ * The gated resource itself — never called directly by a browser. It's what
+ * `readChallenge`/`settle` in pay.ts hit as an HTTP client, the same way
+ * `payForGame` and `/download` relate. Identifies the buyer from who signed
+ * the payment, exactly like `/download` does for an anonymous purchase —
+ * there is no bearer token on this request at all, only the settled payment.
+ */
+gameRouter.get(
+  "/:id/trial/chunks/settle",
+  asyncHandler(async (req, res) => {
+    const game = await findGameByRef(param(req, "id"));
+    if (!game) throw Errors.notFound("Game");
+    if (!trialEnabled(game)) {
+      throw new AppError(422, "TRIAL_NOT_ENABLED", "This game doesn't offer a trial.");
+    }
+
+    await ensureInitialized();
+
+    const requirements = await resourceServer.buildPaymentRequirements({
+      scheme: "exact",
+      network: env.X402_NETWORK,
+      payTo: env.X402_PAY_TO,
+      price: { asset: game.priceAsset, amount: String(game.trialChunkPriceUnits) },
+      maxTimeoutSeconds: 180,
+    });
+
+    const resourceInfo = {
+      url: `${req.protocol}://${req.get("host")}${req.originalUrl}`,
+      description: `${game.title} — one trial chunk (${game.trialChunkMinutes} min)`,
+      mimeType: "application/json",
+    };
+
+    const header = readPaymentHeader(req.headers as Record<string, unknown>);
+    if (!header) {
+      const paymentRequired = await resourceServer.createPaymentRequiredResponse(requirements, resourceInfo);
+      res.status(402).json(paymentRequired);
+      return;
+    }
+
+    const payload = decodePaymentPayload(header);
+    const matched = resourceServer.findMatchingRequirements(requirements, payload);
+    if (!matched) {
+      throw new AppError(402, "PAYMENT_REQUIRED", "The payment doesn't match the trial chunk's price.");
+    }
+
+    const verification = await resourceServer.verifyPayment(payload, matched);
+    if (!verification.isValid) {
+      throw new AppError(402, "PAYMENT_REQUIRED", "Payment could not be verified.", {
+        reason: verification.invalidReason,
+        message: verification.invalidMessage,
+      });
+    }
+
+    const settlement = await resourceServer.settlePayment(payload, matched);
+    if (!settlement.success) {
+      throw new AppError(402, "PAYMENT_REQUIRED", "Payment could not be settled.", {
+        reason: settlement.errorReason,
+      });
+    }
+
+    const buyerAccountId = settlement.payer ?? payload.accepted?.payTo;
+    if (buyerAccountId) {
+      // How many chunks this account has already paid for on this game,
+      // checked against the cap here rather than trusted from the client —
+      // the same "never trust a stale snapshot" reasoning as everywhere else
+      // gated on the Mirror Node. The payment already settled by this point,
+      // so a chunk bought past the cap is still recorded (money moved, the
+      // record has to be honest) but the max is enforced by `/prepare`
+      // refusing to build one in the first place — this is the backstop.
+      const paidUnits = Number(matched.amount ?? game.trialChunkPriceUnits);
+      await fulfilPurchase(game, buyerAccountId, settlement.transaction, paidUnits, "trial_chunk");
+    }
+
+    res.setHeader("payment-verified", "true");
+    res.json({
+      chunkMinutes: game.trialChunkMinutes,
+      settlementTxId: settlement.transaction,
+    });
+  }),
+);
+
+gameRouter.post(
+  "/:id/trial/chunks/prepare",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const game = await findGameByRef(param(req, "id"));
+    if (!game) throw Errors.notFound("Game");
+    if (!trialEnabled(game)) {
+      throw new AppError(422, "TRIAL_NOT_ENABLED", "This game doesn't offer a trial.");
+    }
+
+    const buyerAccountId = await resolveHederaAccount(req.auth!);
+    if (!buyerAccountId) throw Errors.walletNotFunded();
+
+    // The cap is enforced here, before a transfer is even built — a chunk
+    // that would push past `trialMaxChunks` is refused rather than sold and
+    // then somehow un-sold. Read fresh, not trusted from an earlier response.
+    const status = await trialStatusFor(game, buyerAccountId);
+    if (status.chunksLeft <= 0) {
+      throw new AppError(409, "TRIAL_CHUNKS_EXHAUSTED", "No trial chunks left for this game.");
+    }
+
+    const result = await prepareTrialChunk({
+      userId: req.auth!.id,
+      gameId: game.id,
+      accountId: buyerAccountId,
+      evmAddress: req.auth!.evmAddress,
+    });
+
+    if ("granted" in result) {
+      // Not a real path today — the settle route always prices a chunk above
+      // zero — but kept rather than assumed away, the same as /pay/prepare.
+      res.json({ status: "granted", ...(result.granted as object) });
+      return;
+    }
+    res.json({ status: "prepared", ...result.prepared });
+  }),
+);
+
+gameRouter.post(
+  "/:id/trial/chunks/complete",
+  requireAuth,
+  validate(completePaymentSchema),
+  asyncHandler(async (req, res) => {
+    const body = req.body as z.infer<typeof completePaymentSchema>;
+    const game = await findGameByRef(param(req, "id"));
+    if (!game) throw Errors.notFound("Game");
+
+    const result = await completeTrialChunk({
       userId: req.auth!.id,
       gameId: game.id,
       intentId: body.intentId,

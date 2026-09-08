@@ -21,6 +21,7 @@ export type PrivyPayer = { walletId: string; accountId: string; publicKeyHex: st
 // gate for us, an agent, and a stranger's client.
 const downloadUrl = (gameId: string) => `http://127.0.0.1:${env.PORT}/api/games/${gameId}/download`;
 const verdictUrl = () => `http://127.0.0.1:${env.PORT}/api/agent/verdict`;
+const trialChunkUrl = (gameId: string) => `http://127.0.0.1:${env.PORT}/api/games/${gameId}/trial/chunks/settle`;
 
 type Challenge = {
   x402Version: number;
@@ -169,17 +170,24 @@ export type PreparedPayment = {
  * A buyer with money has an account, an account has a published key, and asking
  * the wallet to sign something just to learn its own public key was the other
  * thing that needed authority we do not have.
+ *
+ * Shared by `preparePayment` and `prepareTrialChunk` — the only thing that
+ * differs between "buy the game" and "buy one trial chunk" is which URL holds
+ * the 402 challenge. Everything about building, freezing and hashing the
+ * transfer, and about tracking the intent until it's signed, is identical.
  */
-export async function preparePayment(input: {
+async function prepareGatedPayment(input: {
   userId: string;
   gameId: string;
   accountId: string;
   evmAddress: string;
+  kind: "purchase" | "trial_chunk";
+  url: string;
 }): Promise<{ prepared: PreparedPayment } | { granted: unknown }> {
-  const existing = findLiveIntent(input.userId, input.gameId);
+  const existing = findLiveIntent(input.userId, input.gameId, input.kind);
   if (existing) return { prepared: describe(existing) };
 
-  const result = await readChallenge(downloadUrl(input.gameId));
+  const result = await readChallenge(input.url);
   if (result.paid) return { granted: result.body };
 
   const { challenge } = result;
@@ -190,6 +198,8 @@ export async function preparePayment(input: {
   const intent = createIntent({
     userId: input.userId,
     gameId: input.gameId,
+    kind: input.kind,
+    settleUrl: input.url,
     accountId: input.accountId,
     evmAddress: input.evmAddress,
     frozenTx: Buffer.from(frozenTxBytes).toString("base64"),
@@ -200,6 +210,31 @@ export async function preparePayment(input: {
   });
 
   return { prepared: describe(intent) };
+}
+
+export async function preparePayment(input: {
+  userId: string;
+  gameId: string;
+  accountId: string;
+  evmAddress: string;
+}): Promise<{ prepared: PreparedPayment } | { granted: unknown }> {
+  return prepareGatedPayment({ ...input, kind: "purchase", url: downloadUrl(input.gameId) });
+}
+
+/**
+ * First half of paying for one trial chunk — same split as `preparePayment`
+ * and for the same reason (the buyer's own wallet, so this server cannot sign
+ * for it). Points at the game's `/trial/chunks/settle` resource instead of
+ * `/download`, so it prices at `trialChunkPriceUnits`, not the game's price,
+ * and settling it never mints a GameKey. See services/games/trials.ts.
+ */
+export async function prepareTrialChunk(input: {
+  userId: string;
+  gameId: string;
+  accountId: string;
+  evmAddress: string;
+}): Promise<{ prepared: PreparedPayment } | { granted: unknown }> {
+  return prepareGatedPayment({ ...input, kind: "trial_chunk", url: trialChunkUrl(input.gameId) });
 }
 
 function describe(intent: PaymentIntent): PreparedPayment {
@@ -219,12 +254,19 @@ function describe(intent: PaymentIntent): PreparedPayment {
  * transaction does not contain is refused rather than quietly ignored. The
  * intent is consumed before anything is submitted, so a retried request cannot
  * pay twice.
+ *
+ * Shared by `completePayment` and `completeTrialChunk` — attach the browser's
+ * signatures and settle against whichever URL the intent was prepared for.
+ * `expectedKind` guards against an intent id from the wrong endpoint (a
+ * purchase intent handed to `/trial/chunks/complete`, or vice versa) rather
+ * than silently settling the wrong thing.
  */
-export async function completePayment(input: {
+async function completeGatedPayment(input: {
   userId: string;
   gameId: string;
   intentId: string;
   signatures: { hash: string; signature: string }[];
+  expectedKind: "purchase" | "trial_chunk";
 }) {
   const intent = consumeIntent(input.intentId, input.userId);
   if (!intent) {
@@ -236,6 +278,9 @@ export async function completePayment(input: {
   }
   if (intent.gameId !== input.gameId) {
     throw new AppError(409, "PAYMENT_INTENT_EXPIRED", "That payment was for a different game.");
+  }
+  if (intent.kind !== input.expectedKind) {
+    throw new AppError(409, "PAYMENT_INTENT_EXPIRED", "That payment intent doesn't match this endpoint.");
   }
 
   // Which key signed this, proved rather than assumed. Every signature has to
@@ -281,8 +326,27 @@ export async function completePayment(input: {
   }
 
   return settle(
-    downloadUrl(input.gameId),
+    intent.settleUrl,
     { x402Version: intent.x402Version, resource: intent.resource, requirements: intent.requirements },
     presignedSigner(intent.accountId, signedTx),
   );
+}
+
+export async function completePayment(input: {
+  userId: string;
+  gameId: string;
+  intentId: string;
+  signatures: { hash: string; signature: string }[];
+}) {
+  return completeGatedPayment({ ...input, expectedKind: "purchase" });
+}
+
+/** Second half of paying for one trial chunk — see `prepareTrialChunk`. */
+export async function completeTrialChunk(input: {
+  userId: string;
+  gameId: string;
+  intentId: string;
+  signatures: { hash: string; signature: string }[];
+}) {
+  return completeGatedPayment({ ...input, expectedKind: "trial_chunk" });
 }

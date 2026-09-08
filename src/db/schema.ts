@@ -73,6 +73,10 @@ export const splitStatusEnum = pgEnum("split_status", [
   "failed",
 ]);
 export const payoutStatusEnum = pgEnum("payout_status", ["held", "settled", "failed"]);
+// A trial chunk is a real settlement on the same rails as a purchase — same
+// table, same splits, same retry path — distinguished only by this and by
+// minting no GameKey. See services/games/trials.ts.
+export const saleKindEnum = pgEnum("sale_kind", ["purchase", "trial_chunk"]);
 export const notificationTypeEnum = pgEnum("notification_type", [
   "sale",
   "invite",
@@ -214,6 +218,13 @@ export const games = pgTable("games", {
   // endpoint has to be able to tell them apart.
   delistedBy: text("delisted_by"),
   htsTokenId: text("hts_token_id"),
+  // Trial config. Null trialChunkPriceUnits means the developer never opted
+  // in, which is the default and the common case — checked together with
+  // trialMaxChunks in the manage route, not here, since "chunk price without
+  // a cap" is a meaningless half-config. See services/games/trials.ts.
+  trialChunkPriceUnits: bigint("trial_chunk_price_units", { mode: "number" }),
+  trialChunkMinutes: integer("trial_chunk_minutes").notNull().default(5),
+  trialMaxChunks: integer("trial_max_chunks"),
   // The build currently being served. Every version ever published is a row in
   // `gameBuilds`; the columns above always mirror whichever one is current, so
   // nothing that serves a build had to learn about versions.
@@ -685,5 +696,16 @@ export const sales = pgTable("sales", {
   hcsSaleTxId: text("hcs_sale_tx_id"),
   splitStatus: splitStatusEnum("split_status").notNull().default("pending"),
   splitError: text("split_error"),
+  // "purchase" mints a GameKey; "trial_chunk" never does. A trial chunk is a
+  // real settlement recorded here rather than in a separate ledger table —
+  // its `priceUnits` is the chunk price, not the game's, and it reuses every
+  // existing split/retry/HCS-announcement path unchanged. See
+  // services/games/trials.ts, which sums a buyer's `trial_chunk` rows for a
+  // game to derive their credit rather than storing a counter that could drift.
+  kind: saleKindEnum("kind").notNull().default("purchase"),
+  // How much of *this* purchase was paid for by trial credit already earned
+  // on this game. Always zero on a trial_chunk row. Recorded so credit can
+  // never be spent twice — see services/games/trials.ts#redeemTrialCredit.
+  creditAppliedUnits: bigint("credit_applied_units", { mode: "number" }).notNull().default(0),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
