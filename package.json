@@ -21,7 +21,8 @@
     "listings:retry": "tsx scripts/retry-announcements.ts",
     "builds:backfill-versions": "tsx scripts/backfill-build-versions.ts",
     "users:backfill-handles": "tsx scripts/backfill-handles.ts",
-    "reports:content": "tsx scripts/resolve-content-report.ts"
+    "reports:content": "tsx scripts/resolve-content-report.ts",
+    "catalog:clean": "tsx scripts/clean-catalog.ts"
   },
   "repository": {
     "type": "git",
