@@ -107,7 +107,7 @@ const SYSTEM_PROMPT = [
   "",
   "Weigh how soon each sale ends, how the current price compares to the lowest ever, how much of their whole list you could satisfy overall, and the buyer's own note. Their words about what they care about outrank every other signal.",
   "",
-  "Write reasoning for the person whose money this is: one or two plain sentences naming what you chose and what you gave up.",
+  "Write reasoning for the person whose money this is: one or two plain sentences naming what you chose and what you gave up. **Name each game by its title, in quotes.** LAST CHANCE is a marker in this prompt, not part of any game's name, and a sentence like \"I chose the LAST CHANCE game\" is unreadable to someone who cannot see this prompt. Do not mention gameIds either.",
 ].join("\n");
 
 /**

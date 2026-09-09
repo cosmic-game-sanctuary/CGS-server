@@ -138,10 +138,18 @@ const envSchema = z.object({
   // because nothing can pull the price away inside it. See
   // services/agent/timing.ts.
   //
-  // Configurable only so the behaviour is testable in less than an hour. A
-  // minute here compresses the whole thing without faking any of it: the agent
-  // really waits, really re-decides at the wire, and a wind-down really gives
-  // exactly as much notice as it needs to act. Leave it alone in production.
+  // Configurable so the behaviour is testable with short sales rather than
+  // hour-long ones. **Read the arithmetic before changing it**, because the
+  // obvious reading is backwards: the decision lands at `endsAt - buffer`, so
+  // the wait is the sale's remaining length *minus* this. Shrinking it moves
+  // the decision later, not sooner. It buys you nothing on its own; what it
+  // buys is the ability to use a sale that is minutes long, since a sale
+  // shorter than the buffer is already past its wire the moment it starts.
+  //
+  //   buffer 2m  + sale ending in 7m  -> decides in 5m
+  //   buffer 60m + sale ending in 65m -> decides in 5m
+  //
+  // Leave it alone in production.
   AGENT_PURCHASE_BUFFER_MS: z.coerce.number().int().positive().default(60 * 60 * 1000),
 
   // From console.groq.com. What the agent pays inference cost (not tinybar)
