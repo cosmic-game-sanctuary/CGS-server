@@ -4,7 +4,7 @@
   "description": "Backend for Cosmic Game Sanctuary \u2014 API, Hedera/ENS chain integration, and the wishlist agent.",
   "main": "index.js",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
+    "dev": "tsx watch --exclude \"storage/**\" --exclude \"logs/**\" --exclude \"tmp/**\" --exclude \"uploads/**\" --exclude \".cache/**\" src/index.ts",
     "build": "tsc",
     "start": "node dist/src/index.js",
     "typecheck": "tsc --noEmit",
