@@ -132,6 +132,13 @@ const envSchema = z.object({
   // this once drove with an HCS subscription, and this timer runs the sweep.
   AGENT_SWEEP_INTERVAL_MS: z.coerce.number().default(5000),
 
+  // How long a row may sit in `buying` before the sweep assumes the process
+  // that claimed it is gone and reclaims it. A real round finishes in
+  // seconds (a Mirror read or two, maybe one Groq call, maybe one Hedera
+  // transfer); this is generous headroom above that, not a target. See
+  // runAgentSweep's stale-claim pass and CLAUDE.md's gotchas table.
+  AGENT_STALE_CLAIM_MS: z.coerce.number().int().positive().default(5 * 60 * 1000),
+
   // **How long before a sale ends the agent decides, and how much notice a
   // studio must give when ending one early.** One constant, both uses, and
   // they have to stay equal: an agent that waits for the wire is only safe

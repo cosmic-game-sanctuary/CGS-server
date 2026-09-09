@@ -176,7 +176,7 @@ export async function evaluateAgent(agent: Agent): Promise<void> {
   // Node read, so the loser of a race spends nothing finding out it lost.
   const [claimed] = await db
     .update(wishlistAgents)
-    .set({ status: "buying" })
+    .set({ status: "buying", claimedAt: new Date() })
     .where(and(eq(wishlistAgents.id, agent.id), inArray(wishlistAgents.status, ["funded", "watching"])))
     .returning();
   if (!claimed) return;
@@ -579,7 +579,7 @@ export async function respondToDecision(
 ): Promise<{ outcome: "bought" | "declined"; alreadyResolved: boolean }> {
   const [claimed] = await db
     .update(wishlistAgents)
-    .set({ status: "buying" })
+    .set({ status: "buying", claimedAt: new Date() })
     .where(and(eq(wishlistAgents.id, agent.id), inArray(wishlistAgents.status, ["funded", "watching"])))
     .returning();
   if (!claimed) return { outcome: "declined", alreadyResolved: false };
@@ -667,7 +667,7 @@ async function resolveDecision(decision: Decision): Promise<void> {
 
   const [claimed] = await db
     .update(wishlistAgents)
-    .set({ status: "buying" })
+    .set({ status: "buying", claimedAt: new Date() })
     .where(and(eq(wishlistAgents.id, agent.id), inArray(wishlistAgents.status, ["funded", "watching"])))
     .returning();
   if (!claimed) return; // mid-evaluation elsewhere right now — the next sweep tick will retry
@@ -746,7 +746,41 @@ async function resolveDecision(decision: Decision): Promise<void> {
  * (index.ts), not per message, and touches nothing that scales with agent
  * count the way the old per-agent poll did.
  */
-export async function runAgentSweep(): Promise<{ anchored: number; expired: number; resolved: number }> {
+export async function runAgentSweep(): Promise<{
+  anchored: number;
+  expired: number;
+  resolved: number;
+  reclaimed: number;
+}> {
+  // A claim with no lease. `evaluateAgent`/`respondToDecision`/`resolveDecision`
+  // all release `buying` back to `watching` in a `finally`, which covers every
+  // in-process failure — but not the process itself dying mid-round (killed,
+  // crashed, redeployed). Nothing else ever claims from `buying`, so a row
+  // stranded there stops being evaluated forever: no error, no log line, just
+  // silence. Reclaimed here rather than trusted to self-heal, and done before
+  // anything else this tick so a reclaimed agent is eligible for the rest of
+  // this same sweep. Real rounds finish in seconds; `AGENT_STALE_CLAIM_MS`
+  // (default 5 minutes) is headroom, not a target.
+  const staleBefore = new Date(Date.now() - env.AGENT_STALE_CLAIM_MS);
+  const reclaimedRows = await db
+    .update(wishlistAgents)
+    .set({ status: "watching" })
+    .where(
+      and(
+        eq(wishlistAgents.status, "buying"),
+        isNotNull(wishlistAgents.claimedAt),
+        lt(wishlistAgents.claimedAt, staleBefore),
+      ),
+    )
+    .returning({ id: wishlistAgents.id, claimedAt: wishlistAgents.claimedAt });
+  for (const row of reclaimedRows) {
+    logger.error(
+      { agentId: row.id, claimedAt: row.claimedAt?.toISOString() },
+      "reclaimed an agent stranded in buying — its round's process likely died mid-round",
+    );
+  }
+  const reclaimed = reclaimedRows.length;
+
   let anchored = 0;
   const drafts = await db.query.wishlistAgents.findMany({ where: eq(wishlistAgents.status, "draft") });
   for (const agent of drafts) {
@@ -795,5 +829,5 @@ export async function runAgentSweep(): Promise<{ anchored: number; expired: numb
 
   const resolved = await resolveOverduePending();
 
-  return { anchored, expired, resolved };
+  return { anchored, expired, resolved, reclaimed };
 }

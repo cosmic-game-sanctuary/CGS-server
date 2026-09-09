@@ -462,6 +462,15 @@ export const wishlistAgents = pgTable("wishlist_agents", {
   // without one.
   ensLabel: text("ens_label"),
   ensTxHash: text("ens_tx_hash"),
+  // Set the instant a caller claims this row into `buying` (watcher.ts's
+  // conditional UPDATE), left alone otherwise. The claim's own `finally`
+  // releases it back to `watching` on every in-process failure, but nothing
+  // protects against the *process* dying mid-round — killing the server
+  // during a round leaves the row in `buying` forever, since the only two
+  // states `evaluateAgent` ever claims from are `funded`/`watching`. The
+  // sweep uses this to tell a live claim from an orphaned one and reclaim
+  // the latter. See runAgentSweep's stale-claim pass.
+  claimedAt: timestamp("claimed_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
