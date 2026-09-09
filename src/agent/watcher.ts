@@ -1,5 +1,5 @@
 import { TopicMessageQuery, Timestamp } from "@hiero-ledger/sdk";
-import { and, eq, inArray, isNotNull, isNull, lt, lte } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, lt, lte } from "drizzle-orm";
 import { db } from "../db/client.js";
 import {
   wishlistAgents,
@@ -21,6 +21,9 @@ import {
   needsJudgement,
   sanitizeVerdict,
   fallbackVerdict,
+  roundIsDue,
+  nextWire,
+  atWire,
   type EligibleWant,
   type Verdict,
 } from "../services/agent/decide.js";
@@ -56,11 +59,17 @@ type Decision = typeof agentDecisions.$inferSelect;
  * asks "is this game still worth buying right now", and the honest answer
  * might be no.
  *
- * **Stage 19 adds the decision layer.** Shapes A and B (planPurchases clears
- * the whole eligible set) are unchanged — deterministic, no model call, no
- * cost. Whenever it doesn't clear the set, a real model call decides what to
- * do with what's left: buy some now, hold others for a bounded wait, decline
- * the rest, or — in ask-first mode, when there's genuinely time — ask first.
+ * **Stage 19 adds the decision layer, and W9 moved when it runs.** A topic
+ * message no longer means "buy". It means "look again, and work out when you
+ * should decide". Most evaluations end by setting an alarm clock and spending
+ * nothing: money only moves in a round where something is at its wire, an hour
+ * before its sale ends, or where nothing eligible has a deadline to wait for.
+ * See decide.ts#roundIsDue for why, and timing.ts#wireFor for the hour.
+ *
+ * At such a round, `planPurchases` clearing the whole eligible set is still
+ * deterministic — no model call, no cost. Whenever it doesn't clear the set, a
+ * real model call decides what to do with what's left: buy some now, decline
+ * the rest, or — in ask-first mode, when there is genuinely time — ask first.
  * See services/agent/decide.ts for the rules the model's answer is checked
  * against before anything acts on it.
  */
@@ -159,25 +168,76 @@ async function handleMessage(
  * in isolation, rather than re-proven every time this logic is tested.
  */
 export async function evaluateAgent(agent: Agent): Promise<void> {
+  // The claim: exactly one caller can move a row from a resting state into
+  // `buying`. Whoever loses this race — another message arriving in the same
+  // instant, or the sweep firing this agent's scheduled round — gets zero rows
+  // back and does nothing, the same conditional-UPDATE pattern Stage 17
+  // verified under real concurrency. It is taken *first* now, before any Mirror
+  // Node read, so the loser of a race spends nothing finding out it lost.
+  const [claimed] = await db
+    .update(wishlistAgents)
+    .set({ status: "buying" })
+    .where(and(eq(wishlistAgents.id, agent.id), inArray(wishlistAgents.status, ["funded", "watching"])))
+    .returning();
+  if (!claimed) return;
+
+  try {
+    await runRound(claimed);
+  } finally {
+    // Always released back to watching — bought, waiting, asked, declined, or
+    // failed outright. A stuck `buying` row would silently stop this agent
+    // from ever being evaluated again.
+    await db.update(wishlistAgents).set({ status: "watching" }).where(eq(wishlistAgents.id, claimed.id));
+  }
+}
+
+/**
+ * One turn, with the agent already claimed by the caller.
+ *
+ * **Most turns end without spending anything, and that is the point.** A price
+ * event no longer means "buy": it means "look again, and work out when you
+ * should decide". Only a turn that finds something at its wire — or finds
+ * nothing with a deadline to wait for at all — goes on to allocate money. See
+ * decide.ts#roundIsDue.
+ */
+async function runRound(agent: Agent): Promise<void> {
   // Both halves. `pending` is never bought from — it is what tells the agent
   // that its money is spoken for, which is the difference between an
   // allocation and a reflex. See decide.ts#needsJudgement.
   const { eligible, pending } = await wantsFor(agent);
+
+  // "A pending question expires if the world moves" (§4). Anything reaching
+  // here means the eligible set may have changed since a question was written,
+  // so it no longer describes a live decision.
+  await supersedeAskedQuestions(agent.id);
+
   if (eligible.length === 0) {
     // Nothing is buyable any more, and the commonest way that happens is the
-    // one thing holding is genuinely exposed to: a studio ending a sale early.
-    //
-    // A held row always names a game that *was* eligible when it was written,
-    // so if nothing is eligible now it no longer describes anything real.
-    // Leaving it alone would leave a countdown running on the buyer's screen
-    // toward a deadline that stopped mattering, and leave the sweep to
-    // discover the same thing hours later.
-    await supersedeStalePending(agent.id);
+    // one thing waiting is genuinely exposed to: a studio ending a sale early.
+    // A schedule that names only games nobody can buy is a countdown running
+    // on the buyer's screen toward a deadline that stopped mattering.
+    await scheduleNextRound(agent, []);
+    return;
+  }
+
+  if (!roundIsDue(eligible)) {
+    // The deferral, and the whole reason this agent is worth having. Something
+    // it wants is cheap enough to buy right now and it is deliberately not
+    // buying it, because a sale is open until it ends and more of the world
+    // will be visible at the wire than is visible now.
+    await scheduleNextRound(agent, eligible);
     return;
   }
 
   const balance = await agentBalance(agent);
   const deterministic = planPurchases(eligible, balance);
+  if (deterministic.length === 0) {
+    // It wants things and can afford none of them. Not a decision and not
+    // worth a row every time a deadline passes, but the schedule still has to
+    // move on, or a later wire never fires.
+    await scheduleNextRound(agent, eligible);
+    return;
+  }
 
   // The agent pays; the GameKey belongs to whoever it is working for. Resolved
   // once per round rather than per purchase — it does not change mid-round,
@@ -187,64 +247,102 @@ export async function evaluateAgent(agent: Agent): Promise<void> {
   const buyerAccountId = buyerUser ? await resolveHederaAccount(buyerUser) : null;
   if (!buyerAccountId) {
     logger.error({ agentId: agent.id }, "agent can't buy — its own buyer has no resolvable Hedera account");
+    // Still reschedule. Returning bare would leave this agent with no alarm
+    // clock at all, so it would never look again even once the buyer's account
+    // exists — and a buyer who has never received anything is exactly the
+    // person whose account is about to.
+    await scheduleNextRound(agent, eligible);
     return;
   }
 
-  // The claim: exactly one caller can move a row from a resting state into
-  // `buying`. Whoever loses this race — another message arriving in the same
-  // instant, or the sweep resolving a hold on this same agent — gets zero
-  // rows back and does nothing, the same conditional-UPDATE pattern Stage 17
-  // verified under real concurrency. It stays claimed for the whole round,
-  // including a model call, not just while money moves — a hold or an ask
-  // still has to finish being decided by exactly one evaluation.
-  const [claimed] = await db
-    .update(wishlistAgents)
-    .set({ status: "buying" })
-    .where(and(eq(wishlistAgents.id, agent.id), inArray(wishlistAgents.status, ["funded", "watching"])))
-    .returning();
-  if (!claimed) return;
+  const lastChance = atWire(eligible);
+  const judged = needsJudgement(eligible, deterministic, pending, balance);
+  const verdict = judged
+    ? await getVerdict(agent, eligible, balance, deterministic)
+    : fallbackVerdict(eligible, deterministic); // Nothing is being traded off: buy it, no model call, no cost.
 
-  try {
-    // "A pending question expires if the world moves" (§4). Any new trigger
-    // reaching this far means the eligible set may have changed since a
-    // held/asked row was written, so it no longer describes a live decision —
-    // cancel it and let the fresh evaluation below replace it.
-    await supersedeStalePending(claimed.id);
+  const bought = await actOnVerdict(agent, buyerAccountId, eligible, verdict);
 
-    const judged = needsJudgement(eligible, deterministic, pending, balance);
-    const verdict = judged
-      ? await getVerdict(claimed, eligible, balance, deterministic)
-      : fallbackVerdict(eligible, deterministic); // Nothing is being traded off: buy it, no model call, no cost.
+  // One line per round, because until now the only thing an agent logged was a
+  // completed purchase — and the interesting rounds are the ones where it
+  // decides *not* to buy yet. Watching a deferral from outside the database is
+  // otherwise impossible.
+  logger.info(
+    {
+      agentId: agent.id,
+      eligible: eligible.map((w) => w.title),
+      lastChance: lastChance.map((w) => w.title),
+      alsoWanted: pending.map((w) => w.title),
+      balanceUnits: balance.toString(),
+      askedModel: judged,
+      thought: verdict.reasoning,
+      buying: verdict.buyNow.map((w) => w.title),
+      declining: verdict.decline.map((w) => w.title),
+      // Titles, not ids, so this lines up against `buying` at a glance. The
+      // two differ exactly when a settlement failed, which is the thing you
+      // would be reading this line to find out.
+      bought: eligible.filter((w) => bought.has(w.gameId)).map((w) => w.title),
+    },
+    judged ? "agent decided" : "agent bought without needing to think",
+  );
 
-    // One line per round, because until now the only thing an agent logged was
-    // a completed purchase — and the interesting rounds are the ones where it
-    // decides *not* to buy yet. Watching a hold appear is otherwise invisible
-    // from outside the database.
-    logger.info(
-      {
-        agentId: claimed.id,
-        eligible: eligible.map((w) => w.title),
-        alsoWanted: pending.map((w) => w.title),
-        balanceUnits: balance.toString(),
-        askedModel: judged,
-        thought: verdict.reasoning,
-        buying: verdict.buyNow.map((w) => w.title),
-        holding: verdict.hold.map((h) => h.want.title),
-        declining: verdict.decline.map((w) => w.title),
-      },
-      judged ? "agent decided" : "agent bought without needing to think",
-    );
-
-    await actOnVerdict(claimed, buyerAccountId, eligible, verdict);
-  } finally {
-    // Always released back to watching — bought, held, asked, declined, or
-    // failed outright. A stuck `buying` row would silently stop this agent
-    // from ever being evaluated again.
-    await db.update(wishlistAgents).set({ status: "watching" }).where(eq(wishlistAgents.id, claimed.id));
-  }
+  // What it bought is off the list; what is left may still have a wire ahead
+  // of it, and something has to be holding that alarm clock.
+  await scheduleNextRound(agent, eligible.filter((w) => !bought.has(w.gameId)));
 }
 
-async function supersedeStalePending(agentId: string): Promise<void> {
+/**
+ * The alarm clock: one `held` row per agent, naming what it is choosing between
+ * and when it will choose.
+ *
+ * **A schedule is not history**, which is why a superseded one is deleted
+ * rather than resolved. "I planned to decide at four, then the plan changed"
+ * is not something anyone wants a permanent row about, and a feed full of them
+ * would bury the decisions that did happen. The row that survives is the live
+ * one, and it is what the agent page renders as "It is waiting on purpose".
+ *
+ * Left untouched when nothing about it changed, so the countdown on screen does
+ * not restart every time an unrelated price moves.
+ */
+async function scheduleNextRound(agent: Agent, remaining: EligibleWant[]): Promise<void> {
+  const next = nextWire(remaining);
+  const live = await db.query.agentDecisions.findFirst({
+    where: and(
+      eq(agentDecisions.agentId, agent.id),
+      isNull(agentDecisions.resolvedAt),
+      eq(agentDecisions.kind, "held"),
+    ),
+    orderBy: desc(agentDecisions.createdAt),
+  });
+
+  const ids = remaining.map((w) => w.gameId).sort();
+  const unchanged =
+    live !== undefined &&
+    live.decideBy?.getTime() === next?.getTime() &&
+    live.consideredGameIds.length === ids.length &&
+    [...live.consideredGameIds].sort().every((id, i) => id === ids[i]);
+  if (unchanged) return;
+
+  if (live) {
+    await db.delete(agentDecisions).where(eq(agentDecisions.id, live.id));
+  }
+  if (!next) return; // nothing left with a deadline: no alarm to set
+
+  await db.insert(agentDecisions).values({
+    agentId: agent.id,
+    kind: "held",
+    consideredGameIds: ids,
+    chosenGameIds: ids,
+    reasoning: null,
+    decideBy: next,
+  });
+  logger.info(
+    { agentId: agent.id, decidesAt: next.toISOString(), choosingBetween: remaining.map((w) => w.title) },
+    "agent is waiting for the wire",
+  );
+}
+
+async function supersedeAskedQuestions(agentId: string): Promise<void> {
   const superseded = await db
     .update(agentDecisions)
     .set({ resolvedAt: new Date() })
@@ -252,12 +350,12 @@ async function supersedeStalePending(agentId: string): Promise<void> {
       and(
         eq(agentDecisions.agentId, agentId),
         isNull(agentDecisions.resolvedAt),
-        inArray(agentDecisions.kind, ["held", "asked"]),
+        eq(agentDecisions.kind, "asked"),
       ),
     )
     .returning({ id: agentDecisions.id });
   if (superseded.length > 0) {
-    logger.info({ agentId, superseded: superseded.map((s) => s.id) }, "a new price event superseded a pending agent decision");
+    logger.info({ agentId, superseded: superseded.map((s) => s.id) }, "a new price event superseded a pending agent question");
   }
 }
 
@@ -298,12 +396,14 @@ function tightestDeadline(wants: EligibleWant[]): Date | null {
   }, null);
 }
 
+/** Returns the game ids money actually moved for, so the caller can drop them
+ *  from the schedule it sets next. */
 async function actOnVerdict(
   agent: Agent,
   buyerAccountId: string,
   eligible: EligibleWant[],
   verdict: Verdict,
-): Promise<void> {
+): Promise<Set<string>> {
   const consideredIds = eligible.map((w) => w.gameId);
   // The model call this round cost at most one charge — attributed to
   // whichever row is written first, never repeated across several rows from
@@ -332,41 +432,24 @@ async function actOnVerdict(
         })
         .returning();
       await notifyAsked(agent, row!, verdict.buyNow, decideBy);
-      // Holds and declines are separate decisions from the same round — they
-      // proceed regardless of whether buyNow got escalated to a question.
-      await recordHolds(agent, consideredIds, verdict.hold, verdict.reasoning, takeCost);
+      // Declines are a separate decision from the same round — they proceed
+      // regardless of whether buyNow got escalated to a question.
       await recordDeclines(agent, consideredIds, verdict.decline, verdict.reasoning, takeCost);
-      return;
+      return new Set();
     }
-    // "If it doesn't fit, don't ask — decide." Falls through to buy now.
+    // "If it doesn't fit, don't ask — decide." Falls through to buy now. At a
+    // wire this is always the branch taken: `canAsk` needs 19 hours of runway
+    // and the wire is by definition one hour out, so an ask-first agent still
+    // decides for itself at the moment it matters rather than posting a
+    // question nobody can answer in time.
   }
 
-  if (verdict.buyNow.length > 0) {
-    await executeBuys(agent, buyerAccountId, consideredIds, verdict.buyNow, verdict.reasoning, takeCost());
-  }
-  await recordHolds(agent, consideredIds, verdict.hold, verdict.reasoning, takeCost);
+  const bought =
+    verdict.buyNow.length > 0
+      ? await executeBuys(agent, buyerAccountId, consideredIds, verdict.buyNow, verdict.reasoning, takeCost())
+      : new Set<string>();
   await recordDeclines(agent, consideredIds, verdict.decline, verdict.reasoning, takeCost);
-}
-
-async function recordHolds(
-  agent: Agent,
-  consideredIds: string[],
-  hold: Verdict["hold"],
-  reasoning: string | null,
-  takeCost: () => number | null,
-): Promise<void> {
-  for (const h of hold) {
-    const decideBy = decideByFor(h.want.promotionEndsAt, h.holdHours);
-    await db.insert(agentDecisions).values({
-      agentId: agent.id,
-      kind: "held",
-      consideredGameIds: consideredIds,
-      chosenGameIds: [h.want.gameId],
-      reasoning,
-      inferenceCostUnits: takeCost(),
-      decideBy,
-    });
-  }
+  return bought;
 }
 
 async function recordDeclines(
@@ -431,7 +514,7 @@ async function executeBuys(
   buyNow: EligibleWant[],
   reasoning: string | null,
   costUnits: number | null,
-): Promise<void> {
+): Promise<Set<string>> {
   const bought: EligibleWant[] = [];
   for (const want of buyNow) {
     try {
@@ -447,7 +530,7 @@ async function executeBuys(
       logger.error({ err, agentId: agent.id, gameId: want.gameId }, "agent purchase failed");
     }
   }
-  if (bought.length === 0) return;
+  if (bought.length === 0) return new Set();
 
   await db.insert(agentDecisions).values({
     agentId: agent.id,
@@ -477,6 +560,7 @@ async function executeBuys(
   }
 
   logger.info({ agentId: agent.id, bought: bought.map((w) => w.gameId) }, "agent bought");
+  return new Set(bought.map((w) => w.gameId));
 }
 
 /**
@@ -555,9 +639,10 @@ export async function respondToDecision(
 }
 
 /**
- * A hold or an ask-first question whose `decideBy` passed with nobody
- * resolving it first. Re-checked fresh rather than replayed from the
- * original round — "budget is never reserved," and neither is eligibility.
+ * A scheduled round whose wire arrived, or an ask-first question whose
+ * `decideBy` passed with nobody answering it. Re-checked fresh rather than
+ * replayed from the original round — "budget is never reserved," and neither
+ * is eligibility.
  */
 async function resolveOverduePending(): Promise<number> {
   const overdue = await db.query.agentDecisions.findMany({
@@ -588,6 +673,23 @@ async function resolveDecision(decision: Decision): Promise<void> {
   if (!claimed) return; // mid-evaluation elsewhere right now — the next sweep tick will retry
 
   try {
+    // **The wire has arrived.** A `held` row is this agent's alarm clock, not a
+    // stored decision, so nothing in it is replayed: the round is run again
+    // from scratch against prices, balance and ownership as they are *now*.
+    // That matters because everything the wait was for happened in between —
+    // another sale may have started, the buyer may have added a want, the
+    // wallet may have less in it. Deleted rather than resolved, for the reason
+    // in scheduleNextRound: a schedule is not history.
+    if (decision.kind === "held") {
+      const consumed = await db
+        .delete(agentDecisions)
+        .where(and(eq(agentDecisions.id, decision.id), isNull(agentDecisions.resolvedAt)))
+        .returning({ id: agentDecisions.id });
+      if (consumed.length === 0) return; // an earlier tick got there first
+      await runRound(claimed);
+      return;
+    }
+
     const [claimedDecision] = await db
       .update(agentDecisions)
       .set({ resolvedAt: new Date() })
@@ -595,10 +697,9 @@ async function resolveDecision(decision: Decision): Promise<void> {
       .returning();
     if (!claimedDecision) return; // a person, or an earlier tick, already resolved this
 
-    // `onTimeout` only governs an unanswered *question* (§4's ask-first
-    // clock). A plain hold always tries to buy at decideBy or explicitly
-    // declines — there was never a human waiting on it.
-    const timedOutToSkip = decision.kind === "asked" && agent.onTimeout === "skip";
+    // `onTimeout` governs an unanswered question (§4's ask-first clock), and
+    // by here that is the only kind of row left.
+    const timedOutToSkip = agent.onTimeout === "skip";
 
     let bought: EligibleWant[] = [];
     if (!timedOutToSkip) {
@@ -626,7 +727,7 @@ async function resolveDecision(decision: Decision): Promise<void> {
         chosenGameIds: decision.chosenGameIds,
         reasoning: timedOutToSkip
           ? "An ask-first question went unanswered past its deadline; onTimeout is skip."
-          : "No longer eligible or affordable by the time this hold's deadline arrived.",
+          : "No longer eligible or affordable by the time this deadline arrived.",
         resolvedAt: new Date(),
       });
     }
@@ -637,9 +738,11 @@ async function resolveDecision(decision: Decision): Promise<void> {
 
 /**
  * Three things a subscription cannot do on its own: anchor identity the first
- * time a wallet resolves, end agents whose expiry has passed, and resolve a
- * hold or question whose deadline has passed with nobody answering it. All
- * three are cheap, low-frequency checks — this runs on a slow timer
+ * time a wallet resolves, end agents whose expiry has passed, and fire a round
+ * whose scheduled moment has come. The third is what makes deciding at the
+ * wire possible at all — nothing on a public topic announces "an hour from
+ * now", so the clock has to be ours. All three are cheap, low-frequency checks
+ * against indexed columns — this runs on a slow timer
  * (index.ts), not per message, and touches nothing that scales with agent
  * count the way the old per-agent poll did.
  */

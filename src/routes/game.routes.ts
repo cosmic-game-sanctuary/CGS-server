@@ -1502,8 +1502,13 @@ gameRouter.patch(
         // fresh rather than cached.
         const balance = await agentBalance(agent);
         if (balance < BigInt(body.agentMaxUnits)) {
+          // Said in money, not in units. This is the one refusal here a person
+          // sees routinely — setting a ceiling before funding the agent — and
+          // "your agent's wallet holds 0" was both true and useless.
+          const held = toDisplayAmount(Number(balance), env.X402_ASSET);
+          const decimals = assetDecimals(env.X402_ASSET);
           throw Errors.validationFailed({
-            agentMaxUnits: `your agent's wallet holds ${balance}, which doesn't cover this want`,
+            agentMaxUnits: `your agent holds $${held.toFixed(decimals)}, so it cannot promise this much. Add money to it first.`,
           });
         }
       }

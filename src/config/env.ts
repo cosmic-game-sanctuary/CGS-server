@@ -126,11 +126,23 @@ const envSchema = z.object({
   // a default, and it stays "block" until a real provider is chosen.
   CSAM_MODE: z.enum(["block", "skip"]).default("block"),
 
-  // Drives runAgentSweep — anchoring identity and expiring agents, plus (since
-  // Stage 19) resolving holds and unanswered questions past their `decideBy`.
+  // Drives runAgentSweep — anchoring identity and expiring agents, plus firing
+  // agent rounds whose scheduled moment has come.
   // Renamed from AGENT_POLL_INTERVAL_MS: Stage 18 replaced the per-agent poll
   // this once drove with an HCS subscription, and this timer runs the sweep.
   AGENT_SWEEP_INTERVAL_MS: z.coerce.number().default(5000),
+
+  // **How long before a sale ends the agent decides, and how much notice a
+  // studio must give when ending one early.** One constant, both uses, and
+  // they have to stay equal: an agent that waits for the wire is only safe
+  // because nothing can pull the price away inside it. See
+  // services/agent/timing.ts.
+  //
+  // Configurable only so the behaviour is testable in less than an hour. A
+  // minute here compresses the whole thing without faking any of it: the agent
+  // really waits, really re-decides at the wire, and a wind-down really gives
+  // exactly as much notice as it needs to act. Leave it alone in production.
+  AGENT_PURCHASE_BUFFER_MS: z.coerce.number().int().positive().default(60 * 60 * 1000),
 
   // From console.groq.com. What the agent pays inference cost (not tinybar)
   // to reason about a contested or ambiguous purchase — see

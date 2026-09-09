@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { env } from "../../config/env.js";
 import { assetDecimals, toDisplayAmount } from "../../lib/display.js";
-import type { EligibleWant, PendingWant, RawVerdict } from "./decide.js";
+import { wireOf, type EligibleWant, type PendingWant, type RawVerdict } from "./decide.js";
 import logger from "../../utils/logger.utils.js";
 
 /**
@@ -18,24 +18,12 @@ const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 // What the model is required to return. `strict: true` plus this schema means
 // Groq itself refuses to emit anything that doesn't match — every field
 // listed in `required` because strict mode doesn't support optional
-// properties, so "not holding anything" is an empty `hold` array rather than
-// an absent field.
+// properties, so "buying nothing this round" is an empty `buyNow` array
+// rather than an absent field.
 const verdictJsonSchema = {
   type: "object",
   properties: {
-    buyNow: { type: "array", items: { type: "string" }, description: "gameIds to buy immediately" },
-    hold: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          gameId: { type: "string" },
-          holdHours: { type: "number", description: "how many hours to wait before reconsidering" },
-        },
-        required: ["gameId", "holdHours"],
-        additionalProperties: false,
-      },
-    },
+    buyNow: { type: "array", items: { type: "string" }, description: "gameIds to buy right now" },
     decline: { type: "array", items: { type: "string" }, description: "gameIds to pass on this round" },
     askFirst: {
       type: "boolean",
@@ -43,13 +31,12 @@ const verdictJsonSchema = {
     },
     reasoning: { type: "string", description: "one or two sentences, plain language, for the person funding this" },
   },
-  required: ["buyNow", "hold", "decline", "askFirst", "reasoning"],
+  required: ["buyNow", "decline", "askFirst", "reasoning"],
   additionalProperties: false,
 };
 
 export const rawVerdictSchema = z.object({
   buyNow: z.array(z.string()),
-  hold: z.array(z.object({ gameId: z.string(), holdHours: z.number() })),
   decline: z.array(z.string()),
   askFirst: z.boolean(),
   reasoning: z.string(),
@@ -70,7 +57,7 @@ function describePending(w: PendingWant): string {
   return `- ${parts.join(", ")}`;
 }
 
-function describeWant(w: EligibleWant): string {
+function describeWant(w: EligibleWant, now: Date): string {
   const usd = toDisplayAmount(w.currentPriceUnits, w.asset);
   const maxUsd = toDisplayAmount(w.agentMaxUnits, w.asset);
   const lowestUsd = toDisplayAmount(w.lowestEverUnits, w.asset);
@@ -82,25 +69,46 @@ function describeWant(w: EligibleWant): string {
     `your max $${maxUsd.toFixed(decimals)}`,
     `lowest ever $${lowestUsd.toFixed(decimals)}`,
   ];
-  if (w.promotionEndsAt) parts.push(`sale ends ${w.promotionEndsAt.toISOString()}`);
+
+  // The single most important fact in the whole prompt: whether passing on
+  // this one is reversible. Everything else is preference; this is the cost of
+  // being wrong. Stated as a phrase rather than a timestamp the model has to
+  // do arithmetic on against `now`.
+  const wire = wireOf(w);
+  if (!w.promotionEndsAt) {
+    parts.push("no sale running, this price has no end date");
+  } else if (wire && wire.getTime() <= now.getTime()) {
+    parts.push(`LAST CHANCE, sale ends ${w.promotionEndsAt.toISOString()} and this is the final round at this price`);
+  } else {
+    const hours = (wire!.getTime() - now.getTime()) / 3_600_000;
+    parts.push(`sale ends ${w.promotionEndsAt.toISOString()}, its own last-chance round is ${hours.toFixed(1)}h away`);
+  }
+
   if (w.note) parts.push(`buyer's note: "${w.note}"`);
   return `- ${parts.join(", ")}`;
 }
 
-const SYSTEM_PROMPT = `You allocate a fixed, real budget across a person's wishlisted games on their behalf. You are not a chatbot; you return exactly one JSON object matching the given schema and nothing else.
-
-Hard constraints — violating any of these makes your answer void and a deterministic fallback runs instead, so there is no reason to bend them:
-- Never include a gameId in buyNow whose total cost (summed with every other buyNow game) exceeds the stated balance.
-- Only use gameIds from the "Can buy now" list. Games under "Also wanted" are context, not things you can buy.
-- A gameId appears in at most one of buyNow, hold, or decline.
-- Only hold a game that has a stated sale end. A hold with no deadline is just a decline that wastes a round.
-- Set askFirst true only when you are genuinely torn between comparably good options and a person's answer would actually change what happens — not for every decision.
-
-**The decision you are making is when to spend, not only what to buy.** A sale stays open until it ends, so waiting costs nothing until then, and money spent now is money not available for anything else this person wants. If buying something now would leave you unable to afford another game on their list, that is a real trade-off and you should usually **hold** rather than take the first thing that happened to get cheap — set holdHours so it resolves shortly before that sale ends, and decide then, when you can see more of what is on offer. Deciding at the wire is the point of being an agent rather than a standing order.
-
-Buy now instead when: the sale ends soon and holding would risk losing it; nothing else on their list is competing for the money; the price is at or near the lowest this game has ever been and unlikely to be beaten; or the buyer's note makes this one clearly their priority.
-
-Weigh how soon each sale ends, how the current price compares to the lowest ever, how much of their list you could satisfy overall, and the buyer's own note — their words about what they care about outrank every other signal.`;
+const SYSTEM_PROMPT = [
+  "You allocate a fixed, real budget across a person's wishlisted games on their behalf. You are not a chatbot; you return exactly one JSON object matching the given schema and nothing else.",
+  "",
+  "Hard constraints. Violating any of these makes your answer void and a deterministic fallback runs instead, so there is no reason to bend them:",
+  "- Never include a gameId in buyNow whose total cost (summed with every other buyNow game) exceeds the stated balance.",
+  '- Only use gameIds from the "Can buy now" list. Games under "Also wanted" are context, not things you can buy.',
+  "- A gameId appears in at most one of buyNow and decline.",
+  "- Set askFirst true only when you are genuinely torn between comparably good options and a person's answer would actually change what happens. Not for every decision.",
+  "",
+  "**You are being asked at a scheduled moment, not at a random one.** This agent does not spend the instant something gets cheap. It waits, on purpose, until the last responsible moment before the soonest deadline it is watching, so that when it does choose it can see everything that arrived while it waited. That moment is now. Do not ask for more time; there is no mechanism to give it to you, and there will not be a better-informed round before the deadline below.",
+  "",
+  "**Read the marker on each game.** A game marked LAST CHANCE has a sale ending within the hour: this is the final round in which it can be had at this price, so declining it is a real and permanent decision, not a deferral. A game whose own last-chance round is still hours away will be put to you again, on its own, when that round arrives. Declining one of those costs almost nothing, because you get to decide about it later with better information, and by then this money may not be spoken for.",
+  "",
+  "That asymmetry is the heart of the call. When the budget cannot cover everything, the game at LAST CHANCE is usually the one to take, because it is the only one you cannot come back to. Spend on a game that still has time only when it is clearly the better game for this person: their note points at it, its price is far below its lowest ever, or the last-chance one is a poor fit for what they said they wanted.",
+  "",
+  "Decline freely when the money is better kept. An empty buyNow is a legitimate answer if nothing here is worth what it forecloses.",
+  "",
+  "Weigh how soon each sale ends, how the current price compares to the lowest ever, how much of their whole list you could satisfy overall, and the buyer's own note. Their words about what they care about outrank every other signal.",
+  "",
+  "Write reasoning for the person whose money this is: one or two plain sentences naming what you chose and what you gave up.",
+].join("\n");
 
 /**
  * One verdict, over one contested round. Throws on anything that isn't a
@@ -128,7 +136,8 @@ export async function callAgentModel(input: {
 
   const decimals = assetDecimals(input.asset);
   const balanceUsd = toDisplayAmount(Number(input.balanceUnits), input.asset);
-  const nowIso = new Date().toISOString();
+  const now = new Date();
+  const nowIso = now.toISOString();
   // Named without ids, so a model cannot reach for one of these in `buyNow`.
   const pendingBlock = input.pending.length
     ? [
@@ -145,7 +154,7 @@ export async function callAgentModel(input: {
     `Wallet balance: $${balanceUsd.toFixed(decimals)}.`,
     "",
     "Can buy now:",
-    ...input.eligible.map(describeWant),
+    ...input.eligible.map((want) => describeWant(want, now)),
   ].join("\n") + pendingBlock;
 
   const controller = new AbortController();
