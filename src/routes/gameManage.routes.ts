@@ -166,6 +166,30 @@ gameManageRouter.patch(
     }
     if (body.trialChunkMinutes !== undefined) fields.trialChunkMinutes = body.trialChunkMinutes;
 
+    // Re-check the trial against the price this request will leave the game at,
+    // *whichever* of the two is changing. The block above only guards a request
+    // that touches the trial fields; a bare price cut used to slip past it and
+    // leave a trial whose worst case exceeds the new price, so a buyer could
+    // spend more trialling than the game costs and get nothing back for the
+    // excess. Uses the values as they will be *after* this request applies.
+    const finalPriceUnits = body.priceUnits ?? game.priceUnits;
+    const finalChunkPrice =
+      "trialChunkPriceUnits" in fields ? fields.trialChunkPriceUnits : game.trialChunkPriceUnits;
+    const finalMaxChunks =
+      "trialMaxChunks" in fields ? fields.trialMaxChunks : game.trialMaxChunks;
+    if (
+      finalChunkPrice != null &&
+      finalMaxChunks != null &&
+      !trialConfigFits(finalPriceUnits, finalChunkPrice, finalMaxChunks)
+    ) {
+      throw Errors.validationFailed({
+        priceUnits:
+          "this price is below what the trial could cost " +
+          `(${finalMaxChunks} chunks x ${finalChunkPrice} units). ` +
+          "Lower the trial in the same request, or clear it.",
+      });
+    }
+
     let updated = game;
     if (Object.keys(fields).length > 0) {
       const [row] = await db
