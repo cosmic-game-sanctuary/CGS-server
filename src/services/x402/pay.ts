@@ -96,7 +96,23 @@ async function settle(
   // would no longer match the terms the challenge offered.
   if (authorization) headers.authorization = authorization;
 
-  const paid = await fetch(url, { headers });
+  // This is a loopback: the server calling its own gated route to settle. It
+  // had no timeout, so anything that wedged that second request — a pool with
+  // no client free, a settle handler stuck on a slow chain call — wedged the
+  // outer `/complete` too, and the browser sat on its overlay with the money
+  // already moved and nothing ever failing. 100s is past every honest case
+  // (an x402 verify + settle against the facilitator) and well short of
+  // "forever".
+  const paid = await fetch(url, { headers, signal: AbortSignal.timeout(100_000) }).catch((err) => {
+    if (err instanceof Error && err.name === "TimeoutError") {
+      throw new AppError(
+        504,
+        "PAYMENT_FAILED",
+        "Settlement did not come back in time. The transfer may still have gone through — check the Mirror Node before retrying.",
+      );
+    }
+    throw err;
+  });
   const body = (await paid.json()) as {
     error?: { code?: string; message?: string; details?: unknown };
   };
