@@ -37,6 +37,18 @@ import logger from "../utils/logger.utils.js";
 type Agent = typeof wishlistAgents.$inferSelect;
 type Decision = typeof agentDecisions.$inferSelect;
 
+/** One round's inference charge, and the settlement that paid it. */
+type Charge = { costUnits: number | null; txId: string | null };
+
+/** Executing a decision that was already paid for. The charge belongs to the
+ *  round that produced the verdict, not to the act of carrying it out. */
+const NO_CHARGE: Charge = { costUnits: null, txId: null };
+
+/** The two columns a charge writes, so they can never be written apart. */
+function spendOf(charge: Charge) {
+  return { inferenceCostUnits: charge.costUnits, inferenceTxId: charge.txId };
+}
+
 /**
  * The wishlist agent, rebuilt for 1:N — one agent per person, several
  * wanted games, one shared budget.
@@ -378,7 +390,7 @@ async function getVerdict(
       publicKeyHex: agent.agentPublicKeyHex,
     });
     const raw = rawVerdictSchema.parse(paid.verdict);
-    return sanitizeVerdict(raw, eligible, balance, deterministic, paid.costUnits);
+    return sanitizeVerdict(raw, eligible, balance, deterministic, paid.costUnits, paid.settlementTxId ?? null);
   } catch (err) {
     // Times out, errs, or the facilitator/route rejects it — rule 7: degrade
     // to the deterministic plan, never to stuck. The agent still does
@@ -408,11 +420,17 @@ async function actOnVerdict(
   // The model call this round cost at most one charge — attributed to
   // whichever row is written first, never repeated across several rows from
   // the same round. `null` throughout means no model was called at all.
-  let costLeft = verdict.costUnits;
-  const takeCost = () => {
-    const cost = costLeft;
-    costLeft = null;
-    return cost;
+  // Cost and its transaction travel together and are consumed once. Splitting
+  // them risked a row claiming a charge with no transaction beside it, which is
+  // the one thing this record exists to make impossible.
+  let chargeLeft: { costUnits: number | null; txId: string | null } = {
+    costUnits: verdict.costUnits,
+    txId: verdict.costTxId,
+  };
+  const takeCharge = () => {
+    const charge = chargeLeft;
+    chargeLeft = { costUnits: null, txId: null };
+    return charge;
   };
 
   if (agent.mode === "ask_first" && verdict.askFirst && verdict.buyNow.length > 0) {
@@ -427,14 +445,14 @@ async function actOnVerdict(
           consideredGameIds: consideredIds,
           chosenGameIds: verdict.buyNow.map((w) => w.gameId),
           reasoning: verdict.reasoning,
-          inferenceCostUnits: takeCost(),
+          ...spendOf(takeCharge()),
           decideBy,
         })
         .returning();
       await notifyAsked(agent, row!, verdict.buyNow, decideBy);
       // Declines are a separate decision from the same round — they proceed
       // regardless of whether buyNow got escalated to a question.
-      await recordDeclines(agent, consideredIds, verdict.decline, verdict.reasoning, takeCost);
+      await recordDeclines(agent, consideredIds, verdict.decline, verdict.reasoning, takeCharge);
       return new Set();
     }
     // "If it doesn't fit, don't ask — decide." Falls through to buy now. At a
@@ -446,9 +464,9 @@ async function actOnVerdict(
 
   const bought =
     verdict.buyNow.length > 0
-      ? await executeBuys(agent, buyerAccountId, consideredIds, verdict.buyNow, verdict.reasoning, takeCost())
+      ? await executeBuys(agent, buyerAccountId, consideredIds, verdict.buyNow, verdict.reasoning, takeCharge())
       : new Set<string>();
-  await recordDeclines(agent, consideredIds, verdict.decline, verdict.reasoning, takeCost);
+  await recordDeclines(agent, consideredIds, verdict.decline, verdict.reasoning, takeCharge);
   return bought;
 }
 
@@ -457,7 +475,7 @@ async function recordDeclines(
   consideredIds: string[],
   decline: EligibleWant[],
   reasoning: string | null,
-  takeCost: () => number | null,
+  takeCharge: () => Charge,
 ): Promise<void> {
   if (decline.length === 0) return;
   await db.insert(agentDecisions).values({
@@ -466,7 +484,7 @@ async function recordDeclines(
     consideredGameIds: consideredIds,
     chosenGameIds: decline.map((w) => w.gameId),
     reasoning,
-    inferenceCostUnits: takeCost(),
+    ...spendOf(takeCharge()),
     resolvedAt: new Date(),
   });
 }
@@ -513,7 +531,7 @@ async function executeBuys(
   consideredIds: string[],
   buyNow: EligibleWant[],
   reasoning: string | null,
-  costUnits: number | null,
+  charge: Charge,
 ): Promise<Set<string>> {
   const bought: EligibleWant[] = [];
   for (const want of buyNow) {
@@ -538,7 +556,7 @@ async function executeBuys(
     consideredGameIds: consideredIds,
     chosenGameIds: bought.map((w) => w.gameId),
     reasoning,
-    inferenceCostUnits: costUnits,
+    ...spendOf(charge),
     resolvedAt: new Date(),
   });
 
@@ -631,7 +649,7 @@ export async function respondToDecision(
       return { outcome: "declined", alreadyResolved: false };
     }
 
-    await executeBuys(claimed, buyerAccountId, decision.consideredGameIds, toBuy, null, null);
+    await executeBuys(claimed, buyerAccountId, decision.consideredGameIds, toBuy, null, NO_CHARGE);
     return { outcome: "bought", alreadyResolved: false };
   } finally {
     await db.update(wishlistAgents).set({ status: "watching" }).where(eq(wishlistAgents.id, claimed.id));
@@ -712,7 +730,7 @@ async function resolveDecision(decision: Decision): Promise<void> {
         const buyerUser = await db.query.users.findFirst({ where: eq(users.id, agent.buyerUserId) });
         const buyerAccountId = buyerUser ? await resolveHederaAccount(buyerUser) : null;
         if (buyerAccountId) {
-          await executeBuys(claimed, buyerAccountId, decision.chosenGameIds, bought, null, null);
+          await executeBuys(claimed, buyerAccountId, decision.chosenGameIds, bought, null, NO_CHARGE);
         } else {
           bought = [];
         }

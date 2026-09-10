@@ -293,6 +293,9 @@ export type Verdict = {
   reasoning: string | null;
   /** null for the deterministic fallback — nothing was actually inferred. */
   costUnits: number | null;
+  /** The settlement that paid for it, so the charge is checkable rather than
+   *  asserted. Null wherever `costUnits` is. */
+  costTxId: string | null;
 };
 
 /**
@@ -309,6 +312,7 @@ export function sanitizeVerdict(
   balanceUnits: bigint,
   deterministic: EligibleWant[],
   costUnits: number,
+  costTxId: string | null,
 ): Verdict {
   const byId = new Map(eligible.map((w) => [w.gameId, w]));
   const fellBack = () => fallbackVerdict(eligible, deterministic);
@@ -322,7 +326,7 @@ export function sanitizeVerdict(
     .map((id) => byId.get(id))
     .filter((w): w is EligibleWant => !!w && !claimed.has(w.gameId));
 
-  return { buyNow, decline, askFirst: raw.askFirst, reasoning: raw.reasoning, costUnits };
+  return { buyNow, decline, askFirst: raw.askFirst, reasoning: raw.reasoning, costUnits, costTxId };
 }
 
 /** No model call happened, or its answer didn't survive `sanitizeVerdict` —
@@ -336,5 +340,6 @@ export function fallbackVerdict(eligible: EligibleWant[], deterministic: Eligibl
     askFirst: false,
     reasoning: null,
     costUnits: null,
+    costTxId: null,
   };
 }

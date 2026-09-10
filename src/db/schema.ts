@@ -489,6 +489,13 @@ export const agentDecisions = pgTable("agent_decisions", {
   // explain). Populated once contention actually requires a model (Stage 19).
   reasoning: text("reasoning"),
   inferenceCostUnits: bigint("inference_cost_units", { mode: "number" }),
+  // The Hedera transaction that paid for that inference. Recorded because
+  // "the agent pays for its own reasoning over x402" is a claim until you can
+  // point at the transfer on a public explorer, and until now nothing did:
+  // `payForVerdict` returned a settlement id and every caller discarded it.
+  // Always written on the same row as `inferenceCostUnits` and never on any
+  // other, so a round's one charge has exactly one transaction beside it.
+  inferenceTxId: text("inference_tx_id"),
   // Set only while a hold or an ask-first question has not yet resolved.
   decideBy: timestamp("decide_by", { withTimezone: true }),
   // Null while a `held`/`asked` row is still live. Set the moment it stops
