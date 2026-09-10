@@ -19,12 +19,14 @@ import logger from "../../utils/logger.utils.js";
  * That keeps a local run working and makes the absence visible rather than
  * silent.
  *
- * **Current limitation, and it is Resend's, not ours.** With no verified domain
- * the sender is `onboarding@resend.dev`, and Resend will only deliver that to
- * the address the account was registered with. Everything below is correct and
- * tested; mail to anyone else is refused until a domain is verified, and that
- * refusal is logged with the recipient so it reads as configuration rather than
- * a bug.
+ * **The sender has to be on a verified domain.** `cgs.blackslate.me` was added
+ * on 2026-09-10 and its three DNS records are published and resolving; Resend
+ * verifies on its own schedule, usually within fifteen minutes. Until it does,
+ * a send is refused and logged with the recipient, which is exactly what
+ * happened before under `onboarding@resend.dev` for anyone but the account
+ * holder. Same failure mode, so nothing here has to branch on it. If mail is
+ * being refused, check the domain's status before reading any of the code
+ * below: it is almost always that and almost never this.
  */
 
 const resend = env.RESEND_API_KEY ? new Resend(env.RESEND_API_KEY) : null;
