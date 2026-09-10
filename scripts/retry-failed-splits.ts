@@ -6,24 +6,43 @@
 // rejected it, the operator was short, something went wrong. Retrying re-runs
 // the distribution from scratch.
 //
+// A **stranded pending** sale is the one this script used to miss entirely.
+// `split_status` starts at `pending` and is only moved once distribution has
+// run, so a process that dies in between leaves a row that is not `failed`,
+// never gets an error written to it, and is invisible to a retry that only
+// looks for failures. One sat that way from 2026-09-08 to 2026-09-10: money
+// received, team never paid, nothing reporting it. Age is what separates it
+// from a sale that is simply mid-distribution right now, the same lease
+// reasoning the agent's `claimed_at` uses.
+//
 // A **held** payout is a share belonging to someone who hasn't claimed their
 // invite, so there is no address to pay at all. That is not a failure and it
 // retries itself the moment they accept — settleHeldPayouts pays their EVM
 // alias directly, account or not, so a held row for someone who *has*
 // accepted only means the accept-time attempt itself failed. This script is
 // the backstop for that case.
-import { and, eq, inArray, isNull } from "drizzle-orm";
+import { and, eq, inArray, isNull, lt, or } from "drizzle-orm";
 import { db } from "../src/db/client.js";
 import { sales, games, pendingPayouts, studioMembers, users } from "../src/db/schema.js";
 import { distributeSplits, settleHeldPayouts } from "../src/services/games/fulfil.js";
 import { resolveHederaAccount } from "../src/services/users/repo.js";
 
-const failed = await db.query.sales.findMany({ where: eq(sales.splitStatus, "failed") });
+// Ten minutes. A real distribution is a handful of transfers and finishes in
+// seconds; anything still `pending` after this is not in flight, it is lost.
+const STRANDED_AFTER_MS = 10 * 60 * 1000;
+const strandedBefore = new Date(Date.now() - STRANDED_AFTER_MS);
+
+const failed = await db.query.sales.findMany({
+  where: or(
+    eq(sales.splitStatus, "failed"),
+    and(eq(sales.splitStatus, "pending"), lt(sales.createdAt, strandedBefore)),
+  ),
+});
 
 if (failed.length === 0) {
-  console.log("no failed splits to retry");
+  console.log("no failed or stranded splits to retry");
 } else {
-  console.log(`retrying ${failed.length} failed split(s)`);
+  console.log(`retrying ${failed.length} split(s)`);
 
   for (const sale of failed) {
     const game = await db.query.games.findFirst({ where: eq(games.id, sale.gameId) });
@@ -43,7 +62,7 @@ if (failed.length === 0) {
         .set({ splitStatus: held > 0 ? "partial" : "distributed", splitError: null })
         .where(eq(sales.id, sale.id));
       console.log(
-        `sale ${sale.id} (${game.slug}): ${held > 0 ? `partial, ${held} share(s) held` : "distributed"}`,
+        `sale ${sale.id} (${game.slug}, was ${sale.splitStatus}): ${held > 0 ? `partial, ${held} share(s) held` : "distributed"}`,
       );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
