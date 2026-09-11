@@ -1,7 +1,7 @@
 {
   "name": "cgs-server",
   "version": "1.0.0",
-  "description": "Backend for Cosmic Game Sanctuary \u2014 API, Hedera/ENS chain integration, and the wishlist agent.",
+  "description": "Backend for Cosmic Game Sanctuary — API, Hedera/ENS chain integration, and the wishlist agent.",
   "main": "index.js",
   "scripts": {
     "dev": "tsx watch --exclude \"storage/**\" --exclude \"logs/**\" --exclude \"tmp/**\" --exclude \"uploads/**\" --exclude \".cache/**\" src/index.ts",
@@ -22,7 +22,8 @@
     "builds:backfill-versions": "tsx scripts/backfill-build-versions.ts",
     "users:backfill-handles": "tsx scripts/backfill-handles.ts",
     "reports:content": "tsx scripts/resolve-content-report.ts",
-    "catalog:clean": "tsx scripts/clean-catalog.ts"
+    "catalog:clean": "tsx scripts/clean-catalog.ts",
+    "account:reset": "tsx scripts/reset-account.ts"
   },
   "repository": {
     "type": "git",
