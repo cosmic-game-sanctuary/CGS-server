@@ -92,6 +92,71 @@ export async function createAgent(buyerUserId: string, input: NewAgentInput) {
 }
 
 /**
+ * Give an existing agent a name.
+ *
+ * Naming is deliberately **not** part of creating one: choosing a name is not
+ * a decision anyone should be asked for before their agent exists, and it
+ * costs a slow Sepolia write that has no business sitting in the middle of
+ * setup. The field was therefore never offered anywhere, which is how an
+ * agent could never get a name at all — the route accepted `ensLabel` on
+ * create and nothing in the app ever sent it.
+ *
+ * Once claimed it stays claimed. The name is an ERC-1155 position in a
+ * registry we do not control the contents of after the fact, so "rename" is
+ * not a thing this can honestly offer: it would mint a second name and leave
+ * the first pointing at the same wallet, which is worse than refusing.
+ *
+ * Same subregistry, same availability check and same failure message a studio
+ * subname gets. One flat namespace, so a studio and an agent compete for the
+ * same label. See services/ens/registrar.ts.
+ */
+export async function nameAgent(agent: Agent, label: string): Promise<Agent> {
+  if (agent.ensLabel) {
+    throw new AppError(
+      409,
+      "AGENT_ALREADY_NAMED",
+      `This agent is already ${agent.ensLabel}. A name is claimed on chain and can't be swapped.`,
+    );
+  }
+  if (agent.status === "cancelled" || agent.status === "expired") {
+    throw new AppError(409, "AGENT_ALREADY_RETIRED", "This agent has ended. There is nothing to name.");
+  }
+
+  // Checked before anything is spent — a failure here should cost nothing.
+  const available = await isSubnameAvailable(env.ENS_SUBREGISTRY_ADDRESS as `0x${string}`, label);
+  if (!available) {
+    throw Errors.validationFailed({ ensLabel: `"${label}" is not available.` });
+  }
+
+  let ensTxHash: string;
+  try {
+    ensTxHash = await registerAgentSubname(
+      env.ENS_SUBREGISTRY_ADDRESS as `0x${string}`,
+      label,
+      agent.agentEvmAddress as `0x${string}`,
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.error({ err, ensLabel: label, agentId: agent.id }, "agent subname mint failed");
+    throw new AppError(
+      502,
+      "ENS_MINT_FAILED",
+      "The name could not be claimed on chain. Nothing was created, so you can try again.",
+      { reason: message },
+    );
+  }
+
+  // Written only after the mint lands, so the row never claims a name the
+  // chain does not agree with.
+  const [named] = await db
+    .update(wishlistAgents)
+    .set({ ensLabel: label, ensTxHash })
+    .where(eq(wishlistAgents.id, agent.id))
+    .returning();
+  return named!;
+}
+
+/**
  * The wallet's current balance in the settlement asset, live from the Mirror
  * Node — never cached, same rule as every other balance in this app. Null
  * means the wallet has not received anything yet, which is a normal state for

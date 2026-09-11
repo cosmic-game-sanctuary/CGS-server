@@ -24,3 +24,16 @@ export function toDisplayAmount(units: number, asset: string): number {
 export function ensFullName(label: string | null): string | null {
   return label ? `${label}.${env.ENS_PARENT_NAME}.eth` : null;
 }
+
+// Enough of an address to recognise, not enough to harvest. An invite link is
+// public — anyone holding it can read what it is an invite to — so the screen
+// that says "this one was sent to someone else" has to name that someone
+// without handing a scraper a live mailbox.
+export function maskEmail(email: string): string {
+  const at = email.lastIndexOf("@");
+  if (at <= 0) return "•••";
+  const local = email.slice(0, at);
+  const domain = email.slice(at + 1);
+  const head = local.slice(0, local.length > 2 ? 2 : 1);
+  return `${head}${"•".repeat(3)}@${domain}`;
+}

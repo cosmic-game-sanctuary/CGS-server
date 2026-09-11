@@ -53,16 +53,24 @@ export function emailSale(input: {
   slug: string;
   shareUnits: number | null;
   asset: string;
+  /**
+   * Who bought it: an agent's ENS name, or a person's handle. Null when the
+   * buyer is nobody we know or asked not to be named, and the line falls back
+   * to the honest "Someone" it always said.
+   */
+  buyer?: string | null;
 }): Promise<boolean> {
   const line =
     input.shareUnits === null
       ? `You are not on the splits for this one.`
       : `Your share, ${money(input.shareUnits, input.asset)}, is already in your wallet.`;
 
+  const who = input.buyer ? `${input.buyer} bought ${input.gameTitle}.` : `Someone bought ${input.gameTitle}.`;
+
   return sendMail({
     to: input.to,
     subject: `${input.gameTitle} sold`,
-    text: [`Someone bought ${input.gameTitle}.`, ``, line, ``, appUrl(`/game/${input.slug}`)].join("\n"),
+    text: [who, ``, line, ``, appUrl(`/game/${input.slug}`)].join("\n"),
   });
 }
 

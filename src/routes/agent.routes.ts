@@ -10,7 +10,7 @@ import { AppError, Errors } from "../lib/errors.js";
 import { param } from "../lib/params.js";
 import { assetDecimals, ensFullName, toDisplayAmount } from "../lib/display.js";
 import { env } from "../config/env.js";
-import { createAgent, agentBalance, retireAgent } from "../services/agent/wallet.js";
+import { createAgent, agentBalance, nameAgent, retireAgent } from "../services/agent/wallet.js";
 import { respondToDecision } from "../agent/watcher.js";
 
 /**
@@ -95,6 +95,13 @@ const updateAgentSchema = z
     onTimeout: z.enum(["buy", "skip"]).optional(),
     // Explicit null clears an expiry; omit to leave it as it is.
     expiresAt: z.string().datetime().nullable().optional(),
+    /**
+     * A name, claimed on chain now rather than at creation. Write-once: see
+     * services/agent/wallet.ts#nameAgent for why there is no rename. Not
+     * nullable for the same reason — clearing it would leave a name minted to
+     * this wallet that nothing in the app can find again.
+     */
+    ensLabel: z.string().min(1).max(63).optional(),
   })
   .refine((b) => Object.keys(b).length > 0, { message: "nothing to change" });
 
@@ -103,16 +110,25 @@ agentRouter.patch(
   requireAuth,
   validate(updateAgentSchema),
   asyncHandler(async (req, res) => {
-    const agent = await requireOwnAgent(req.auth!.id);
+    let agent = await requireOwnAgent(req.auth!.id);
     const body = req.body as z.infer<typeof updateAgentSchema>;
+
+    // First, and on its own, because it is the only field here that spends a
+    // chain transaction. If the mint fails nothing else has been written, so
+    // the settings changes in the same request are not half-applied.
+    if (body.ensLabel !== undefined) {
+      agent = await nameAgent(agent, body.ensLabel);
+    }
 
     const fields: Partial<typeof wishlistAgents.$inferInsert> = {};
     if (body.mode !== undefined) fields.mode = body.mode;
     if (body.onTimeout !== undefined) fields.onTimeout = body.onTimeout;
     if (body.expiresAt !== undefined) fields.expiresAt = body.expiresAt ? new Date(body.expiresAt) : null;
 
-    const [updated] = await db.update(wishlistAgents).set(fields).where(eq(wishlistAgents.id, agent.id)).returning();
-    res.json(serializeAgent(updated!, await agentBalance(updated!)));
+    const updated = Object.keys(fields).length
+      ? (await db.update(wishlistAgents).set(fields).where(eq(wishlistAgents.id, agent.id)).returning())[0]!
+      : agent;
+    res.json(serializeAgent(updated, await agentBalance(updated)));
   }),
 );
 

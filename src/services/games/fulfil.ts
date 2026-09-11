@@ -24,6 +24,7 @@ import { getAccountByEvmAddress } from "../hedera/mirror.js";
 import { env } from "../../config/env.js";
 import logger from "../../utils/logger.utils.js";
 import { emailPayoutHeld, emailPayoutSettled, emailSale } from "../email/messages.js";
+import { buyerIdentity } from "../users/profile.js";
 
 type Game = typeof games.$inferSelect;
 
@@ -57,6 +58,15 @@ export async function fulfilPurchase(
    * 0 for a trial_chunk (a chunk cannot redeem credit against itself) — see
    * services/games/trials.ts. */
   creditAppliedUnits = 0,
+  /**
+   * The account the money actually left, when that is not the account the
+   * GameKey goes to. An agent pays from its own wallet on behalf of whoever
+   * funded it, so `buyerAccountId` is already the *owner* by the time this is
+   * called — which would make the sale notification name the person and never
+   * the agent, losing the only half of it that is interesting. Defaults to the
+   * buyer, which is every ordinary purchase.
+   */
+  payerAccountId?: string,
 ) {
   // The sales row (and, for a real purchase, the gameKeys row), and the caller
   // waits for both. They are what says this person paid — everything below is
@@ -79,7 +89,7 @@ export async function fulfilPurchase(
   // Nothing awaits this, so nothing would catch it either. Every step inside
   // handles its own failure; this is the backstop that keeps an unexpected one
   // from taking the process down with it.
-  void settleOnChain(game, sale, key, buyerAccountId, settlementTxId).catch((err) =>
+  void settleOnChain(game, sale, key, buyerAccountId, settlementTxId, payerAccountId ?? buyerAccountId).catch((err) =>
     logger.error({ err, gameId: game.id, buyerAccountId, kind }, "fulfilment failed after settlement"),
   );
 }
@@ -135,6 +145,7 @@ async function settleOnChain(
   key: typeof gameKeys.$inferSelect | undefined,
   buyerAccountId: string,
   settlementTxId: string,
+  payerAccountId: string,
 ) {
   if (key) {
     try {
@@ -176,7 +187,7 @@ async function settleOnChain(
   // not a notification — the purchase (or the finished trial converting into
   // one) is the moment worth their attention.
   if (sale.kind === "purchase") {
-    await notifyStudio(game, sale.priceUnits).catch(() => {});
+    await notifyStudio(game, sale.priceUnits, payerAccountId).catch(() => {});
   }
 }
 
@@ -416,7 +427,7 @@ async function resolveAccountId(wallet: string): Promise<string | null> {
   return account?.account ?? null;
 }
 
-async function notifyStudio(game: Game, amountUnits: number) {
+async function notifyStudio(game: Game, amountUnits: number, payerAccountId: string) {
   const studio = await db.query.studios.findFirst({ where: eq(studios.id, game.studioId) });
   const members = await db.query.studioMembers.findMany({
     where: eq(studioMembers.studioId, game.studioId),
@@ -436,6 +447,13 @@ async function notifyStudio(game: Game, amountUnits: number) {
 
   const shareFor = (userId: string) => pctByHandle.get(handleByUser.get(userId) ?? "") ?? null;
 
+  // Who bought it. The one storefront where the buyer is always a resolvable
+  // on-chain identity was also the one telling its studios "Unknown bought
+  // your game", because the payload carried no buyer at all. Never fatal: a
+  // sale that cannot name its buyer is still a sale, and it falls back to the
+  // same "Someone" the email always used.
+  const buyer = await buyerIdentity(payerAccountId).catch(() => null);
+
   await db.insert(notifications).values(
     [...userIds].map((userId) => {
       const pct = shareFor(userId);
@@ -452,6 +470,12 @@ async function notifyStudio(game: Game, amountUnits: number) {
           // credited the work to other people still wants to know it sold.
           sharePct: pct,
           shareUnits: pct === null ? null : Math.floor((amountUnits * pct) / 100),
+          // `displayIdentity`'s order, resolved here rather than on the
+          // client: only this side can tell an agent's wallet from a person's.
+          buyerLabel: buyer?.label ?? null,
+          buyerEns: buyer?.ensName ?? null,
+          buyerKind: buyer?.kind ?? null,
+          buyerAccountId: payerAccountId,
         },
       };
     }),
@@ -472,6 +496,7 @@ async function notifyStudio(game: Game, amountUnits: number) {
       slug: game.slug,
       shareUnits: pct === null ? null : Math.floor((amountUnits * pct) / 100),
       asset: game.priceAsset,
+      buyer: buyer?.label ?? null,
     });
   }
 }

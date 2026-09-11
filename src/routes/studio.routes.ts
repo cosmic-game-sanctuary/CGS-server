@@ -2,7 +2,7 @@ import { Router } from "express";
 import { and, eq, or } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "../db/client.js";
-import { studios, studioMembers, games, users } from "../db/schema.js";
+import { studios, studioMembers, games, users, wishlistAgents } from "../db/schema.js";
 import { requireAuth, optionalAuth } from "../middleware/auth.middleware.js";
 import { validate } from "../middleware/validate.middleware.js";
 import { asyncHandler } from "../lib/asyncHandler.js";
@@ -132,7 +132,13 @@ studioRouter.post(
   }),
 );
 
-// Checked twice, deliberately: our own table first (cheap, catches almost
+// Answers for the **whole namespace**, not just studios, despite the path.
+// Studio and agent subnames are minted into one flat subregistry, so a label
+// either exists under `cgs-sanctuary.eth` or it does not, and there is one
+// answer to give. The path stays where it is because it is what the client
+// already calls; the agent naming field calls the same route.
+//
+// Checked twice, deliberately: our own tables first (cheap, catches almost
 // every real collision) and then live against the subregistry (source of
 // truth — a label minted by hand, outside this route, would only show up
 // here). See services/ens/registrar.ts#isSubnameAvailable for how the live
@@ -142,7 +148,11 @@ studioRouter.get(
   validate(z.object({ name: z.string().min(1).max(63) }), "query"),
   asyncHandler(async (req, res) => {
     const { name } = req.query as unknown as { name: string };
-    const takenLocally = await db.query.studios.findFirst({ where: eq(studios.ensSubname, name) });
+    const [studioHas, agentHas] = await Promise.all([
+      db.query.studios.findFirst({ where: eq(studios.ensSubname, name), columns: { id: true } }),
+      db.query.wishlistAgents.findFirst({ where: eq(wishlistAgents.ensLabel, name), columns: { id: true } }),
+    ]);
+    const takenLocally = studioHas !== undefined || agentHas !== undefined;
     const available = !takenLocally && (await isSubnameAvailable(env.ENS_SUBREGISTRY_ADDRESS as `0x${string}`, name));
     // `fullName` so the screen showing this can print the name being claimed
     // without being told the parent separately. It is the same value that
@@ -207,6 +217,15 @@ studioRouter.get(
       ens: ensFullName(studio.ensSubname),
       ownerAddress: owner?.evmAddress ?? null,
       memberCount: members.length,
+      // The one thing a viewer is allowed to know about *which* row is theirs
+      // without anyone's userId ever leaving this route. Without it, the
+      // client's only option was rendering the same manage-controls block on
+      // every row whenever the viewer could manage the team at all — which
+      // put "Remove" and "Hand over" on the viewer's own row, pointed at
+      // themselves. Null for a stranger, or someone on the team by a row this
+      // query didn't return (removed/left, which is `active: false`, or
+      // simply not a member here at all).
+      viewerMemberId: req.auth ? (members.find((m) => m.userId === req.auth!.id)?.id ?? null) : null,
       members: members.map((m) => ({
         id: m.id,
         handle: m.handle,

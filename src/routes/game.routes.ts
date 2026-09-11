@@ -954,7 +954,17 @@ gameRouter.get(
       // caller this challenge was built for — an agent's purchase never has
       // one (no bearer token on that request), so an agent can never redeem a
       // person's trial credit on their behalf without them asking.
-      await fulfilPurchase(game, buyerAccountId, settlement.transaction, paidUnits, "purchase", creditUnits);
+      // `settlement.payer` as well as the buyer: when an agent paid, those are
+      // two different accounts and the studio should hear the agent's name.
+      await fulfilPurchase(
+        game,
+        buyerAccountId,
+        settlement.transaction,
+        paidUnits,
+        "purchase",
+        creditUnits,
+        settlement.payer ?? buyerAccountId,
+      );
     }
 
     res.setHeader("payment-verified", "true");
@@ -1382,7 +1392,17 @@ gameRouter.post(
       .values({ gameId: game.id, userId: req.auth!.id, rating: req.body.rating, body: req.body.body })
       .returning();
 
-    res.status(201).json(review);
+    // The same shape the list route returns, through the same lookup. A bare
+    // row went back before, so a review posted from the page rendered with no
+    // name on it until something reloaded the list — the one review on screen
+    // that was definitely written by somebody was the only anonymous one.
+    const authors = await authorSummaries([review!.userId]);
+    res.status(201).json({
+      ...review,
+      author: authors.get(review!.userId)?.label ?? truncateAddress(req.auth!.evmAddress),
+      authorIsEns: false,
+      authorProfile: authors.get(review!.userId) ?? null,
+    });
   }),
 );
 

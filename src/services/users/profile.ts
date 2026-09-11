@@ -10,6 +10,7 @@ import {
   playSessions,
   gameKeys,
   likes,
+  wishlistAgents,
 } from "../../db/schema.js";
 import { truncateAddress } from "../../lib/address.js";
 import { ensFullName } from "../../lib/display.js";
@@ -69,6 +70,68 @@ export async function authorSummaries(userIds: string[]): Promise<Map<string, Au
     });
   }
   return out;
+}
+
+/**
+ * Who paid, by the Hedera account the money came from.
+ *
+ * A sale notification used to name nobody, so the studio saw "Unknown bought
+ * your game" — on the one storefront where the buyer is always a resolvable
+ * on-chain identity. Two kinds of buyer exist and the order matters:
+ *
+ *   An **agent** is matched first, because an agent's wallet is its own and
+ *   could never also be a person's. Its identity *is* an ENS name when it has
+ *   one, which is the whole reason naming an agent exists (see §12 of
+ *   docs/testing-round-2026-09-11.md and services/agent/wallet.ts#nameAgent).
+ *
+ *   A **person** is named by whatever they already show in public: display
+ *   name, then handle. Never the email, which is not public anywhere in this
+ *   file and is not about to start being.
+ *
+ * `libraryPublic: false` is a person saying they would rather not have their
+ * buying watched, so it suppresses the name here too and the sale reads
+ * "Someone". A studio being told who bought their game is nice; it is not
+ * worth overriding the one privacy switch we offer.
+ *
+ * Returns null when the account resolves to nobody we know, which is a real
+ * case: a GameKey can be bought by any account, including one that never
+ * signed in here.
+ */
+export type BuyerIdentity = {
+  kind: "agent" | "person";
+  /** ENS first, then display name or handle. Null when they asked for privacy. */
+  label: string | null;
+  ensName: string | null;
+  accountId: string;
+};
+
+export async function buyerIdentity(accountId: string): Promise<BuyerIdentity | null> {
+  const agent = await db.query.wishlistAgents.findFirst({
+    where: eq(wishlistAgents.agentAccountId, accountId),
+    columns: { ensLabel: true, agentEvmAddress: true },
+  });
+  if (agent) {
+    const ensName = ensFullName(agent.ensLabel);
+    return {
+      kind: "agent",
+      label: ensName ?? truncateAddress(agent.agentEvmAddress),
+      ensName,
+      accountId,
+    };
+  }
+
+  const person = await db.query.users.findFirst({
+    where: eq(users.hederaAccountId, accountId),
+    columns: { handle: true, displayName: true, libraryPublic: true },
+  });
+  if (!person) return null;
+
+  return {
+    kind: "person",
+    label: person.libraryPublic ? person.displayName || person.handle : null,
+    ensName: null,
+    accountId,
+  };
 }
 
 /** Every studio membership this person has accepted, with the studio attached. */

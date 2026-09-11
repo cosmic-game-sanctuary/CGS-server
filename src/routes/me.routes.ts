@@ -81,6 +81,14 @@ meRouter.get(
       ),
     });
     const memberStudioIds = allMemberships.map((m) => m.studioId);
+    // The role on the row, not a constant. `studio.role` and every entry in
+    // `studios[]` used to be hardcoded "owner" for the studio you founded and
+    // "member" for everything else, which made a promotion invisible: the one
+    // client check that reads this (`role === 'owner'` for "can manage") could
+    // never be true for a manager, so promoting someone changed nothing they
+    // could see or do. See services/studios/access.ts#canManageStudio, which
+    // is the rule this field is supposed to mirror.
+    const roleByStudio = new Map(allMemberships.map((m) => [m.studioId, m.role]));
     const relatedStudios = memberStudioIds.length
       ? await db.query.studios.findMany({ where: inArray(studios.id, memberStudioIds) })
       : [];
@@ -120,7 +128,7 @@ meRouter.get(
           id: memberStudio.id,
           name: memberStudio.name,
           slug: memberStudio.slug,
-          role: "member",
+          role: membership.role,
           handle: membership.handle,
         };
       }
@@ -160,7 +168,12 @@ meRouter.get(
           : []),
         ...relatedStudios
           .filter((st) => st.id !== ownedStudio?.id)
-          .map((st) => ({ id: st.id, name: st.name, slug: st.slug, role: "member" as const })),
+          .map((st) => ({
+            id: st.id,
+            name: st.name,
+            slug: st.slug,
+            role: roleByStudio.get(st.id) ?? ("member" as const),
+          })),
       ],
     });
   }),

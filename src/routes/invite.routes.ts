@@ -4,7 +4,8 @@ import { db } from "../db/client.js";
 import { studioMembers, studios, notifications, splits } from "../db/schema.js";
 import { requireAuth } from "../middleware/auth.middleware.js";
 import { asyncHandler } from "../lib/asyncHandler.js";
-import { Errors } from "../lib/errors.js";
+import { AppError, Errors } from "../lib/errors.js";
+import { maskEmail } from "../lib/display.js";
 import { param } from "../lib/params.js";
 import { settleHeldPayouts } from "../services/games/fulfil.js";
 import { resolveHederaAccount } from "../services/users/repo.js";
@@ -27,6 +28,10 @@ inviteRouter.get(
       handle: member.handle,
       role: member.role,
       accepted: member.acceptedAt !== null,
+      // Masked, never whole: this route needs no auth, so the full address
+      // would be readable by anyone who got hold of the link. Enough to
+      // recognise your own mailbox is enough for the only job it has here.
+      email: maskEmail(member.email),
       studio: { id: studio!.id, name: studio!.name, slug: studio!.slug },
     });
   }),
@@ -43,8 +48,32 @@ inviteRouter.post(
     });
     if (!member) throw Errors.notFound("Invite");
 
+    // The link is the only thing guarding a share of real money, and a link
+    // travels: forwarded, pasted into a group chat, left in a thread anyone
+    // can read. Until this check existed, whoever opened it first got the
+    // money — the route wrote the caller's identity onto the row without ever
+    // asking whether they were the person invited. Matching the address the
+    // invite was sent to is what makes the link an address rather than a
+    // bearer token.
+    //
+    // Someone who already accepted is let through regardless: the row is
+    // theirs, and a person who later changes the address on their account
+    // should not be locked out of a membership they already hold.
+    const alreadyTheirs = member.userId !== null && member.userId === req.auth!.id;
+    const sameAddress =
+      member.email.trim().toLowerCase() === req.auth!.email.trim().toLowerCase();
+
+    if (!alreadyTheirs && !sameAddress) {
+      throw new AppError(
+        403,
+        "INVITE_EMAIL_MISMATCH",
+        `This invite was sent to ${maskEmail(member.email)}. Sign in with that address to accept it.`,
+        { email: maskEmail(member.email) },
+      );
+    }
+
     if (member.acceptedAt) {
-      res.json(member);
+      res.json(accepted(member));
       return;
     }
 
@@ -95,8 +124,21 @@ inviteRouter.post(
       },
     });
 
-    res.json(updated);
+    res.json(accepted(updated));
   }),
 );
+
+// What the client is told about a claimed invite. Deliberately not the whole
+// row: `email` and `userId` are on it, and neither is anyone's business but
+// the person the invite belongs to. Matches WireAcceptedInvite exactly.
+function accepted(member: typeof studioMembers.$inferSelect) {
+  return {
+    id: member.id,
+    studioId: member.studioId,
+    handle: member.handle,
+    role: member.role,
+    acceptedAt: member.acceptedAt,
+  };
+}
 
 export default inviteRouter;
