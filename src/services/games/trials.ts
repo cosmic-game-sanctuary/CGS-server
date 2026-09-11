@@ -65,6 +65,18 @@ export type TrialStatus = {
   chunksLeft: number;
   spentUnits: number;
   creditUnits: number;
+  /**
+   * What buying the game would actually cost this account right now, credit
+   * already taken off.
+   *
+   * Sent rather than left as `price - credit` for the client to work out. The
+   * number that moves money is the one `/download` computes, and a second
+   * opinion assembled on the other side can only ever disagree with it — it
+   * did, in a way nobody noticed: the listing kept showing the full price
+   * after a trial because nothing there had been told the credit existed.
+   * Both now come from `resolvePurchasePrice`.
+   */
+  owedUnits: number;
 };
 
 /**
@@ -82,7 +94,14 @@ export async function trialStatusFor(game: Game, buyerAccountId: string | null):
   };
 
   if (!enabled || !buyerAccountId) {
-    return { ...base, chunksConsumed: 0, chunksLeft: game.trialMaxChunks ?? 0, spentUnits: 0, creditUnits: 0 };
+    return {
+      ...base,
+      chunksConsumed: 0,
+      chunksLeft: game.trialMaxChunks ?? 0,
+      spentUnits: 0,
+      creditUnits: 0,
+      owedUnits: game.priceUnits,
+    };
   }
 
   const chunks = await trialChunksFor(game.id, buyerAccountId);
@@ -98,6 +117,7 @@ export async function trialStatusFor(game: Game, buyerAccountId: string | null):
     chunksLeft: Math.max(0, game.trialMaxChunks! - chunks.length),
     spentUnits,
     creditUnits,
+    owedUnits: Math.max(0, game.priceUnits - creditUnits),
   };
 }
 

@@ -1172,6 +1172,7 @@ gameRouter.get(
       worstCaseUsd: toDisplayAmount(status.worstCaseUnits, game.priceAsset),
       spentUsd: toDisplayAmount(status.spentUnits, game.priceAsset),
       creditUsd: toDisplayAmount(status.creditUnits, game.priceAsset),
+      owedUsd: toDisplayAmount(status.owedUnits, game.priceAsset),
       asset: game.priceAsset,
       assetDecimals: assetDecimals(game.priceAsset),
     });

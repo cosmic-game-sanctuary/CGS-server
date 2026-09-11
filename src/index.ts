@@ -29,6 +29,10 @@ import logger from "./utils/logger.utils.js";
 
 const app: Express = express();
 
+// Load-bearing for the rate limiter and nothing else. See TRUST_PROXY in
+// config/env.ts for why this is a count rather than `true`.
+app.set("trust proxy", env.TRUST_PROXY);
+
 app.use(helmet());
 app.use(cors({ origin: env.CORS_ORIGIN.split(",").map((o) => o.trim()) }));
 // Raised from 1mb for cloud saves: a 512KB save plus JSON escaping does not fit

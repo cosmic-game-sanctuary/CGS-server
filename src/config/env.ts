@@ -65,6 +65,15 @@ const envSchema = z.object({
   NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
   CORS_ORIGIN: z.string().default("http://localhost:5173"),
 
+  // How many reverse proxies sit in front of this process. Zero locally, and
+  // whatever the host puts there once it is deployed. It only exists because
+  // the rate limiter buckets by `req.ip`: behind an unacknowledged proxy every
+  // request carries the *proxy's* address, so the whole site shares one bucket
+  // and the first busy user locks everyone else out. Left at 0 rather than
+  // guessing, since trusting a hop that isn't there lets a client set its own
+  // apparent address with a header and walk past the limit entirely.
+  TRUST_PROXY: z.coerce.number().int().min(0).default(0),
+
   DATABASE_URL: z.string(),
   DATABASE_URL_POOLED: z.string(),
 
