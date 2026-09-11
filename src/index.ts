@@ -81,12 +81,21 @@ if (env.DEV_FAUCET === "on") {
 // A minute is fine: a sale is a thing measured in days, and `endsAt` is
 // published, so anything reading the topic knows the deadline exactly rather
 // than inferring it from when we happened to notice.
+// Guarded the same way as the agent sweep below, and for the same reason: a
+// tick that starts a sale announces it on HCS, which is a network call, and a
+// minute is not a guarantee that the last one finished.
+let ticking = false;
 setInterval(() => {
+  if (ticking) return;
+  ticking = true;
   runPromotionTick()
     .then(({ started, ended }) => {
       if (started || ended) logger.info({ started, ended }, "promotions moved");
     })
-    .catch((err) => logger.error({ err }, "promotion tick crashed"));
+    .catch((err) => logger.error({ err }, "promotion tick crashed"))
+    .finally(() => {
+      ticking = false;
+    });
 }, 60_000);
 
 app.use(notFoundHandler);
@@ -100,11 +109,31 @@ app.listen(env.PORT, () => {
   // agent/watcher.ts for why this replaced a per-agent timer.
   startAgentListener().catch((err) => logger.error({ err }, "starting the agent listener failed"));
 
-  // The two things a subscription cannot do by itself: anchor an agent's
-  // identity the first time its wallet resolves, and end agents whose expiry
-  // has passed. Both are cheap and low-frequency, so a slow timer is enough —
-  // this does not scale with agent count the way the old poll did.
+  // Anchoring identity, expiring agents, and firing rounds whose scheduled
+  // moment has come.
+  //
+  // **One at a time.** This used to be a bare `setInterval`, which was fair
+  // when the sweep was three cheap queries that usually returned nothing. W9
+  // made it the decision engine: a due round now reads every want, asks the
+  // Mirror Node whether each is already owned, reads the agent's balance, and
+  // may call a model and buy something. Against a database ~300ms away that
+  // takes longer than the 5s interval, and `setInterval` does not care — it
+  // fires anyway, so runs pile up on each other without bound. Each one holds
+  // database connections and races the others for the same `buying` claim.
+  //
+  // The guard is the whole fix: if the last sweep has not finished, skip this
+  // tick rather than start a second one.
+  let sweeping = false;
   setInterval(() => {
-    runAgentSweep().catch((err) => logger.error({ err }, "agent sweep crashed"));
+    if (sweeping) {
+      logger.warn("skipping an agent sweep because the last one is still running");
+      return;
+    }
+    sweeping = true;
+    runAgentSweep()
+      .catch((err) => logger.error({ err }, "agent sweep crashed"))
+      .finally(() => {
+        sweeping = false;
+      });
   }, env.AGENT_SWEEP_INTERVAL_MS);
 });
