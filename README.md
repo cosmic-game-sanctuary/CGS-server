@@ -1,8 +1,11 @@
 # CGS-server
 
-Backend for [Cosmic Game Sanctuary](https://github.com/cosmic-game-sanctuary/CGS-docs) — a storefront for browser-playable indie games where payment and ownership settle on Hedera, so no payment processor decides what's sellable and no company decides what a buyer keeps owning. Built for ETHOnline 2026.
+The API, the chain integration, and the buying agent for
+**[Cosmic Game Sanctuary](https://github.com/cosmic-game-sanctuary/CGS-docs)** — an indie game store where an autonomous agent buys on your behalf, revenue splits pay a whole team in one atomic transaction, and trials are metered by the minute over x402. Payment and ownership settle on Hedera, so no card network decides what's sellable and no company decides what a buyer keeps owning.
 
-This repo is the API, the chain integration, and the wishlist agent. The storefront itself is [CGS-client](https://github.com/cosmic-game-sanctuary/CGS-client).
+📺 **[Four-minute demo](https://youtu.be/WyJehf7Vgb4)** · 📖 [How it all works](https://github.com/cosmic-game-sanctuary/CGS-docs/blob/main/ARCHITECTURE.md) · 🔌 [API contract](https://github.com/cosmic-game-sanctuary/CGS-docs/blob/main/INTEGRATION.md)
+
+Built for ETHOnline 2026. The storefront itself is [CGS-client](https://github.com/cosmic-game-sanctuary/CGS-client).
 
 ## Three claims a judge can check directly, not just read
 
