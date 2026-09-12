@@ -7,7 +7,8 @@
 # **The free plan sleeps after 15 minutes idle**, which matters more here than
 # a slow first request — this process also runs the HCS listings subscription,
 # the agent sweep and the promotion tick. Asleep, the agent stops watching for
-# price changes. `.github/workflows/keepalive.yml` is what prevents that.
+# price changes. An UptimeRobot check on /health is what prevents that —
+# see docs/DEPLOYMENT.md §8.6. Deliberately not a workflow in this repo.
 #
 # No disk: builds are refetched from their IPFS zip CID when this machine
 # doesn't have them (services/games/buildStore.ts#findBuild), so an ephemeral
