@@ -5,6 +5,7 @@ import { db } from "../db/client.js";
 import { studios, studioMembers, games, users, wishlistAgents } from "../db/schema.js";
 import { requireAuth, optionalAuth } from "../middleware/auth.middleware.js";
 import { validate } from "../middleware/validate.middleware.js";
+import { emailLimiter } from "../middleware/ratelimit.middleware.js";
 import { asyncHandler } from "../lib/asyncHandler.js";
 import { AppError, Errors } from "../lib/errors.js";
 import logger from "../utils/logger.utils.js";
@@ -251,6 +252,9 @@ const inviteMemberSchema = z.object({
 studioRouter.post(
   "/:id/members",
   requireAuth,
+  // After requireAuth so the limiter can key on the user rather than the IP.
+  // Mail is someone else's quota — see middleware/ratelimit.middleware.ts.
+  emailLimiter,
   validate(inviteMemberSchema),
   asyncHandler(async (req, res) => {
     const studio = await db.query.studios.findFirst({ where: eq(studios.id, param(req, "id")) });
@@ -332,6 +336,7 @@ studioRouter.patch(
 studioRouter.post(
   "/:id/members/:memberId/resend-invite",
   requireAuth,
+  emailLimiter,
   asyncHandler(async (req, res) => {
     const studioId = param(req, "id");
     if (!(await canManageStudio(studioId, req.auth!.id))) throw Errors.notOwner();

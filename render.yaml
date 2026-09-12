@@ -1,0 +1,96 @@
+# Render Blueprint for the CGS API.
+#
+# Free tier, deliberately. A judging window is a few days, not a month: 750
+# free instance-hours per workspace per calendar month is only a problem if
+# one service runs all month, and ~4 days of always-on is ~100 hours.
+#
+# **The free plan sleeps after 15 minutes idle**, which matters more here than
+# a slow first request — this process also runs the HCS listings subscription,
+# the agent sweep and the promotion tick. Asleep, the agent stops watching for
+# price changes. `.github/workflows/keepalive.yml` is what prevents that.
+#
+# No disk: builds are refetched from their IPFS zip CID when this machine
+# doesn't have them (services/games/buildStore.ts#findBuild), so an ephemeral
+# filesystem costs a slower first download and nothing else.
+services:
+  - type: web
+    name: cgs-server
+    runtime: node
+    plan: free
+    region: oregon
+    # `--include=dev` is load-bearing, and tested rather than assumed.
+    # NODE_ENV=production is set below and npm omits devDependencies when it
+    # sees that. Measured on this lockfile: `typescript` survives anyway (some
+    # dependency pulls it in transitively) but **`drizzle-kit` does not**, so
+    # without this flag `tsc` runs, the build looks fine, and `db:migrate`
+    # fails with "command not found" at the very end.
+    #
+    # Migrations run here rather than as a forgotten manual step: a deploy
+    # against a database without the schema boots fine and then 500s on every
+    # request, which is a worse failure than a build that stops. The prod
+    # database is separate from dev, so this only ever touches production.
+    buildCommand: npm ci --include=dev && npm run build && npm run db:migrate
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+
+      # One hop: Render's load balancer. The rate limiter keys on req.ip, and
+      # with this unset every request arrives carrying the proxy's address —
+      # so all users share one bucket and the limiter becomes a global outage
+      # switch rather than a per-caller one. Raise to 2 if a CDN is put in
+      # front of this.
+      - key: TRUST_PROXY
+        value: 1
+
+      # Refused at boot when NODE_ENV=production (config/env.ts), so this is
+      # belt and braces. The faucet moves real operator funds.
+      - key: DEV_FAUCET
+        value: "off"
+
+      - key: PORT
+        value: 10000
+
+      # Everything below is set in the Render dashboard, never in this file.
+      # `sync: false` means "prompt me, don't inherit and don't commit".
+      - { key: DATABASE_URL, sync: false }
+      - { key: DATABASE_URL_POOLED, sync: false }
+      - { key: APP_URL, sync: false }
+      - { key: CORS_ORIGIN, sync: false }
+      - { key: PRIVY_APP_ID, sync: false }
+      - { key: PRIVY_APP_SECRET, sync: false }
+      - { key: PRIVY_VERIFICATION_KEY, sync: false }
+      - { key: HEDERA_NETWORK, sync: false }
+      - { key: HEDERA_MIRROR_URL, sync: false }
+      - { key: HEDERA_OPERATOR_ID, sync: false }
+      - { key: HEDERA_OPERATOR_KEY, sync: false }
+      - { key: HCS_LISTINGS_TOPIC, sync: false }
+      - { key: HCS_SALES_TOPIC, sync: false }
+      - { key: HCS_AGENT_IDENTITY_TOPIC, sync: false }
+      - { key: X402_FACILITATOR_URL, sync: false }
+      - { key: X402_NETWORK, sync: false }
+      - { key: X402_ASSET, sync: false }
+      - { key: X402_ASSET_DECIMALS, sync: false }
+      - { key: X402_PAY_TO, sync: false }
+      - { key: SEPOLIA_RPC_URL, sync: false }
+      - { key: SEPOLIA_OPERATOR_KEY, sync: false }
+      - { key: ENS_PARENT_NAME, sync: false }
+      - { key: ENS_SUBREGISTRY_ADDRESS, sync: false }
+      - { key: ENS_VERIFIABLE_FACTORY, sync: false }
+      - { key: ENS_RESOLVER, sync: false }
+      - { key: ENS_ETH_REGISTRAR, sync: false }
+      - { key: ENS_USER_REGISTRY_IMPL, sync: false }
+      - { key: ENS_MOCK_USDC, sync: false }
+      - { key: PINATA_JWT, sync: false }
+      - { key: PINATA_GATEWAY, sync: false }
+      - { key: RESEND_API_KEY, sync: false }
+      - { key: RESEND_FROM, sync: false }
+      - { key: GROQ_API_KEY, sync: false }
+      - { key: GROQ_MODEL, sync: false }
+      - { key: CSAM_MODE, sync: false }
+
+      # Have defaults in config/env.ts and are fine unset. Listed so the
+      # dashboard shows them as knobs rather than hiding them:
+      # AGENT_SWEEP_INTERVAL_MS, AGENT_PURCHASE_BUFFER_MS,
+      # AGENT_STALE_CLAIM_MS, AGENT_INFERENCE_PRICE_UNITS, BUILD_INBOX.

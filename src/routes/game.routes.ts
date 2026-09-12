@@ -60,6 +60,7 @@ import {
   decodePaymentPayload,
 } from "../services/x402/server.js";
 import { fulfilPurchase } from "../services/games/fulfil.js";
+import { publishLimiter } from "../middleware/ratelimit.middleware.js";
 import { getAccountByEvmAddress } from "../services/hedera/mirror.js";
 import { preparePayment, completePayment, prepareTrialChunk, completeTrialChunk } from "../services/x402/pay.js";
 import { emailStudioInvite } from "../services/email/messages.js";
@@ -633,6 +634,11 @@ async function findOrInviteMember(studioId: string, email: string, handle: strin
 gameRouter.post(
   "/",
   requireAuth,
+  // Before multer, so a rate-limited caller is refused *before* 200MB is read
+  // into memory. Publishing pins to IPFS, creates a token on chain and can
+  // email every collaborator named by address, so it spends three different
+  // quotas per call.
+  publishLimiter,
   upload.fields([{ name: "build", maxCount: 1 }, { name: "media", maxCount: 8 }]),
   validate(publishGameSchema),
   asyncHandler(async (req, res) => {

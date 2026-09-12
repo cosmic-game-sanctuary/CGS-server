@@ -1,0 +1,76 @@
+# Keeps the free Render instance from spinning down.
+#
+# WHY THIS EXISTS. Render puts a free web service to sleep after 15 minutes
+# with no inbound traffic. For most apps that is a slow first request. Here it
+# is worse: this process also runs the HCS listings subscription, the agent
+# sweep and the promotion tick, so a sleeping server is an agent that has
+# stopped watching for price changes and will miss the wire it was waiting for.
+#
+# HOW IT KEEPS IT AWAKE. "Inbound traffic" is all Render measures, so an HTTP
+# request from anywhere resets the 15-minute idle timer. This hits /health,
+# which is cheap (one database ping, one Mirror Node ping) and already exists
+# for Render's own health checks.
+#
+# WHY EACH RUN LOOPS INSTEAD OF PINGING ONCE. GitHub's own docs say the
+# `schedule` event "can be delayed during periods of high loads", that high
+# load includes the start of every hour, and that queued jobs may be dropped
+# outright. A workflow that pinged once per trigger would go quiet for exactly
+# as long as GitHub was busy. So each run pings every 60s for ~10 minutes:
+# runs overlap, and two consecutive dropped triggers still leave no 15-minute
+# gap.
+#
+# COST. GitHub Actions minutes are unlimited on public repositories, which
+# this is. On a private repo this pattern would exhaust the free 2,000
+# minutes/month in under a day.
+#
+# Scheduled workflows only run from the default branch, and GitHub disables
+# them after 60 days of repository inactivity. Neither matters for a judging
+# window, both would matter later.
+name: keepalive
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+# Deliberately no `concurrency` group. Overlapping runs are the redundancy:
+# cancelling the in-flight one would hand a dropped trigger a real gap.
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Ping /health every 60s for ~10 minutes
+        env:
+          # Repository variable, not a secret: it is a public URL, and a
+          # secret would be masked in the logs where we want to read it.
+          # Settings → Secrets and variables → Actions → Variables.
+          HEALTH_URL: ${{ vars.HEALTH_URL }}
+        run: |
+          if [ -z "$HEALTH_URL" ]; then
+            echo "::error::HEALTH_URL repository variable is not set."
+            echo "Set it to https://<your-render-host>/health"
+            exit 1
+          fi
+
+          fails=0
+          for i in $(seq 1 10); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 45 "$HEALTH_URL" || echo "000")
+            echo "$(date -u +%H:%M:%S)  ping $i/10 -> $code"
+            # 000 is a timeout, which is what a cold start looks like: Render
+            # holds the connection while the instance boots. Not a failure on
+            # its own, and the next ping lands on a woken service.
+            [ "$code" = "200" ] || fails=$((fails + 1))
+            [ "$i" -lt 10 ] && sleep 60
+          done
+
+          # Never fail the job for a single bad ping — a red X every time
+          # Render restarts trains you to ignore the one that matters.
+          if [ "$fails" -ge 8 ]; then
+            echo "::error::$fails/10 pings failed. The service is probably down, not asleep."
+            exit 1
+          fi
+          if [ "$fails" -gt 0 ]; then
+            echo "::warning::$fails/10 pings did not return 200."
+          fi
