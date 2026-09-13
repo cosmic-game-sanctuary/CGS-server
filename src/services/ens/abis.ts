@@ -168,3 +168,82 @@ export const permissionedRegistryAbi = [
     outputs: [{ type: "uint256" }],
   },
 ] as const;
+
+/**
+ * ENSv2's Permissioned Resolver.
+ *
+ * `initialize` takes the admin, a role bitmap and an array of initial setter
+ * calls — deployed per account through the same `VerifiableFactory` the
+ * subregistry uses, so every name we issue can point at a resolver we control
+ * outright rather than a shared one we have no roles on.
+ *
+ * Record getters and setters key on the **namehash** (`bytes32`), the same as
+ * v1. Only the authorization surface (`authorizeTextRoles`) takes a
+ * DNS-encoded name, which is why both shapes appear here.
+ */
+export const permissionedResolverAbi = [
+  {
+    name: "initialize",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "admin", type: "address" },
+      { name: "roleBitmap", type: "uint256" },
+      { name: "setters", type: "bytes[]" },
+    ],
+    outputs: [],
+  },
+  {
+    name: "setAddr",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "node", type: "bytes32" },
+      { name: "a", type: "address" },
+    ],
+    outputs: [],
+  },
+  {
+    name: "addr",
+    type: "function",
+    stateMutability: "view",
+    inputs: [{ name: "node", type: "bytes32" }],
+    outputs: [{ type: "address" }],
+  },
+  {
+    name: "setText",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "node", type: "bytes32" },
+      { name: "key", type: "string" },
+      { name: "value", type: "string" },
+    ],
+    outputs: [],
+  },
+  {
+    name: "text",
+    type: "function",
+    stateMutability: "view",
+    inputs: [
+      { name: "node", type: "bytes32" },
+      { name: "key", type: "string" },
+    ],
+    outputs: [{ type: "string" }],
+  },
+] as const;
+
+/** `setResolver` on our own subregistry, so a name can be repointed after it
+ *  was issued rather than having to be registered again. */
+export const registrySetResolverAbi = [
+  {
+    name: "setResolver",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "tokenId", type: "uint256" },
+      { name: "resolver", type: "address" },
+    ],
+    outputs: [],
+  },
+] as const;

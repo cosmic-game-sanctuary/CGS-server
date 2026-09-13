@@ -61,6 +61,7 @@ import {
 } from "../services/x402/server.js";
 import { fulfilPurchase } from "../services/games/fulfil.js";
 import { publishLimiter } from "../middleware/ratelimit.middleware.js";
+import { publishAgentMandateInBackground } from "../services/agent/mandate.js";
 import { getAccountByEvmAddress } from "../services/hedera/mirror.js";
 import { preparePayment, completePayment, prepareTrialChunk, completeTrialChunk } from "../services/x402/pay.js";
 import { emailStudioInvite } from "../services/email/messages.js";
@@ -1544,6 +1545,18 @@ gameRouter.patch(
     if (body.agentNote !== undefined) fields.agentNote = body.agentNote;
 
     const [updated] = await db.update(wishlistItems).set(fields).where(eq(wishlistItems.id, item.id)).returning();
+
+    // The ceiling this agent publishes on its own ENS name is derived from
+    // these rows, so changing one makes the on-chain record stale. Republished
+    // in the background: it is four Sepolia writes and the buyer should not
+    // wait a minute to adjust their own wishlist. Only matters if `agentMaxUnits`
+    // actually moved — a note change cannot alter the ceiling.
+    if (fields.agentMaxUnits !== undefined) {
+      const agent = await db.query.wishlistAgents.findFirst({
+        where: eq(wishlistAgents.buyerUserId, req.auth!.id),
+      });
+      if (agent) publishAgentMandateInBackground(agent);
+    }
     res.json({
       gameId: game.id,
       agentMaxUnits: updated!.agentMaxUnits,

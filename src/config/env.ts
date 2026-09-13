@@ -231,6 +231,13 @@ const envSchema = z.object({
   // the subregistry we deployed and own, and the parent name registered
   // under it — both one-time setup, done by `scripts/setup-ens.ts` and
   // never redone. Every studio subname mints against this address.
+  // ENSv2's Permissioned Resolver implementation on Sepolia. We deploy our own
+  // UUPS proxy of this through the VerifiableFactory so records on our names
+  // are ours to write — see services/ens/registrar.ts#deployResolver.
+  ENS_PERMISSIONED_RESOLVER_IMPL: z
+    .string()
+    .default("0x9eae5c2730a7dd16bdd1dee6421a1b91e3b0365e"),
+
   ENS_SUBREGISTRY_ADDRESS: evmAddress,
 })
   // A route that moves real money out of the operator account on nothing but

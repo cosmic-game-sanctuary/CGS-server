@@ -12,6 +12,7 @@ import { assetDecimals, ensFullName, toDisplayAmount } from "../lib/display.js";
 import { env } from "../config/env.js";
 import { createAgent, agentBalance, nameAgent, retireAgent } from "../services/agent/wallet.js";
 import { respondToDecision } from "../agent/watcher.js";
+import { publishAgentMandateInBackground } from "../services/agent/mandate.js";
 
 /**
  * The one agent a person may have. Mounted under /api/me, matching
@@ -128,6 +129,14 @@ agentRouter.patch(
     const updated = Object.keys(fields).length
       ? (await db.update(wishlistAgents).set(fields).where(eq(wishlistAgents.id, agent.id)).returning())[0]!
       : agent;
+
+    // `cgs:mode` is part of what the name publishes, and naming an agent for
+    // the first time is the moment it has somewhere to publish to at all.
+    // Background, because chain writes take about a minute.
+    if (body.ensLabel !== undefined || body.mode !== undefined) {
+      publishAgentMandateInBackground(updated);
+    }
+
     res.json(serializeAgent(updated, await agentBalance(updated)));
   }),
 );

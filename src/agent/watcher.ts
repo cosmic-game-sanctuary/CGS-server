@@ -13,6 +13,7 @@ import client from "../services/hedera/client.js";
 import { getAccountByEvmAddress } from "../services/hedera/mirror.js";
 import { anchorAgentIdentity } from "../services/agent/identity.js";
 import { agentBalance, retireAgent } from "../services/agent/wallet.js";
+import { ceilingFromChain } from "../services/agent/mandate.js";
 import { resolveHederaAccount } from "../services/users/repo.js";
 import {
   eligibleWantsFor,
@@ -533,8 +534,30 @@ async function executeBuys(
   reasoning: string | null,
   charge: Charge,
 ): Promise<Set<string>> {
+  // The published ceiling, enforced.
+  //
+  // `cgs:maxSpend` on the agent's own ENS name says the most it will pay for
+  // any one game. Reading it back here is what makes that a rule rather than
+  // a claim: whatever the plan says, and whatever a model returned, nothing
+  // above the number we published on chain gets bought.
+  //
+  // **It can only ever refuse.** A null means no ceiling is being claimed
+  // publicly — the agent has no name, or Sepolia was briefly unreachable — and
+  // that leaves the existing behaviour exactly as it was. An ENS outage must
+  // not be able to stop a Hedera purchase the buyer already authorised, and an
+  // agent nobody named must not start behaving differently because this code
+  // exists.
+  const ceiling = await ceilingFromChain(agent);
+
   const bought: EligibleWant[] = [];
   for (const want of buyNow) {
+    if (ceiling !== null && want.currentPriceUnits > ceiling) {
+      logger.warn(
+        { agentId: agent.id, gameId: want.gameId, priceUnits: want.currentPriceUnits, ceilingUnits: ceiling },
+        "refusing a purchase above the ceiling published on this agent's ENS name",
+      );
+      continue;
+    }
     try {
       await payForGame(
         want.gameId,

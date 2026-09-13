@@ -43,3 +43,21 @@ export const STUDIO_BITMAP = ROLE_SET_RESOLVER | ROLE_RENEW;
 // permissions" (ENS's own stated bonus for this), not a studio's vanity name,
 // even though the actual role set an owner needs is the same either way.
 export const AGENT_BITMAP = STUDIO_BITMAP;
+
+/**
+ * Every role on a Permissioned Resolver.
+ *
+ * The resolver has its own role numbering, **separate from the registry's** —
+ * a fact learned the expensive way: initialising a resolver with
+ * `FULL_ADMIN_BITMAP` (which is the registry's set) deploys fine, lets
+ * `setAddr` through, and then reverts on `setText` with
+ * `Unauthorized(resource, 0x10, account)`. Bit 4 is the resolver's
+ * ROLE_SET_TEXT and simply isn't in the registry's bitmap.
+ *
+ * `0x1111…1111` is ENS's own documented "all roles" value: EAC lays roles out
+ * one per nibble, so a 1 in every nibble grants each of them. Using their
+ * constant rather than reconstructing it from individual bits, because the
+ * numbering is the resolver's business and not something to infer.
+ */
+export const ALL_RESOLVER_ROLES =
+  0x1111111111111111111111111111111111111111111111111111111111111111n;

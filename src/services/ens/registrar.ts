@@ -1,7 +1,25 @@
-import { decodeEventLog, encodeFunctionData, keccak256, toBytes, toHex, type Hex } from "viem";
+import {
+  decodeEventLog,
+  encodeAbiParameters,
+  encodeFunctionData,
+  keccak256,
+  namehash,
+  stringToHex,
+  toBytes,
+  toHex,
+  type Hex,
+} from "viem";
 import { publicClient, walletClient, ensAccount } from "./client.js";
-import { erc20Abi, ethRegistrarAbi, verifiableFactoryAbi, userRegistryInitAbi, permissionedRegistryAbi } from "./abis.js";
-import { FULL_ADMIN_BITMAP, STUDIO_BITMAP, AGENT_BITMAP } from "./roles.js";
+import {
+  erc20Abi,
+  ethRegistrarAbi,
+  verifiableFactoryAbi,
+  userRegistryInitAbi,
+  permissionedRegistryAbi,
+  permissionedResolverAbi,
+  registrySetResolverAbi,
+} from "./abis.js";
+import { FULL_ADMIN_BITMAP, STUDIO_BITMAP, AGENT_BITMAP, ALL_RESOLVER_ROLES } from "./roles.js";
 import { env } from "../../config/env.js";
 
 const ONE_YEAR = 365n * 24n * 60n * 60n;
@@ -188,7 +206,155 @@ export async function isSubnameAvailable(subregistryAddress: Hex, label: string)
   }
 }
 
-// Shared by studios and agents: mint "<label>.cgs-sanctuary.eth" under the
+/**
+ * Deploy a Permissioned Resolver we own, through ENS's own VerifiableFactory.
+ *
+ * **Why this exists.** The resolver a name points at decides who may write its
+ * records. ENSv2's model is one resolver instance per account, deployed as a
+ * UUPS proxy — so owning the resolver is what makes the records ours to set.
+ * Pointing names at a shared resolver instance nobody granted us roles on
+ * leaves every `setAddr`/`setText` reverting, which is exactly the state the
+ * names were in before this: registered, resolving to nothing.
+ *
+ * Salt matches ENS's own documented derivation — `keccak256("OwnedResolver",
+ * owner, version)` — so the address is deterministic and predictable from the
+ * operator address alone.
+ *
+ * One-time setup, same as `deploySubregistry`.
+ */
+export async function deployResolver(version = 0n): Promise<Hex> {
+  const salt = BigInt(
+    keccak256(
+      encodeAbiParameters(
+        [{ type: "bytes32" }, { type: "address" }, { type: "uint256" }],
+        [keccak256(stringToHex("OwnedResolver")), ensAccount.address, version],
+      ),
+    ),
+  );
+
+  const initData = encodeFunctionData({
+    abi: permissionedResolverAbi,
+    functionName: "initialize",
+    // The **resolver's** role set, not the registry's — see
+    // roles.ts#ALL_RESOLVER_ROLES for why that distinction bit once already.
+    // Every role to the operator, because this one resolver serves every name
+    // we issue. EAC still allows delegating a single record key later without
+    // handing over the rest.
+    args: [ensAccount.address, ALL_RESOLVER_ROLES, []],
+  });
+
+  const hash = await walletClient.writeContract({
+    address: env.ENS_VERIFIABLE_FACTORY as Hex,
+    abi: verifiableFactoryAbi,
+    functionName: "deployProxy",
+    args: [env.ENS_PERMISSIONED_RESOLVER_IMPL as Hex, salt, initData],
+  });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+
+  for (const log of receipt.logs) {
+    try {
+      const decoded = decodeEventLog({ abi: verifiableFactoryAbi, ...log });
+      if (decoded.eventName === "ProxyDeployed") return decoded.args.proxyAddress;
+    } catch {
+      continue;
+    }
+  }
+  throw new Error(`deployProxy succeeded (tx ${receipt.transactionHash}) but no ProxyDeployed log was found`);
+}
+
+/** The namehash a resolver keys its records on. */
+export function subnameNode(label: string): Hex {
+  return namehash(`${label}.${env.ENS_PARENT_NAME}.eth`);
+}
+
+/**
+ * Point an already-issued subname at a different resolver.
+ *
+ * Needed because names registered before we ran our own resolver are aimed at
+ * one we cannot write to. Repointing is cheaper and less destructive than
+ * re-registering: the name, its owner and its expiry are untouched.
+ */
+export async function setSubnameResolver(
+  subregistryAddress: Hex,
+  label: string,
+  resolverAddress: Hex,
+): Promise<Hex> {
+  const hash = await walletClient.writeContract({
+    address: subregistryAddress,
+    abi: registrySetResolverAbi,
+    functionName: "setResolver",
+    args: [subnameTokenId(label), resolverAddress],
+  });
+  await publicClient.waitForTransactionReceipt({ hash });
+  return hash;
+}
+
+/**
+ * Write the address a name resolves to.
+ *
+ * For an agent this is the agent's **own** wallet rather than the buyer's, so
+ * an autonomous spender resolves to the account that actually holds and spends
+ * the money. That separation is the entire reason an agent has a name.
+ */
+export async function setSubnameAddress(
+  resolverAddress: Hex,
+  label: string,
+  address: Hex,
+): Promise<Hex> {
+  const hash = await walletClient.writeContract({
+    address: resolverAddress,
+    abi: permissionedResolverAbi,
+    functionName: "setAddr",
+    args: [subnameNode(label), address],
+  });
+  await publicClient.waitForTransactionReceipt({ hash });
+  return hash;
+}
+
+/** Write one text record. Keys are namespaced `cgs:` so they never collide
+ *  with ENS's own conventional keys (avatar, url, com.twitter…). */
+export async function setSubnameText(
+  resolverAddress: Hex,
+  label: string,
+  key: string,
+  value: string,
+): Promise<Hex> {
+  const hash = await walletClient.writeContract({
+    address: resolverAddress,
+    abi: permissionedResolverAbi,
+    functionName: "setText",
+    args: [subnameNode(label), key, value],
+  });
+  await publicClient.waitForTransactionReceipt({ hash });
+  return hash;
+}
+
+/** Read an address record straight off the resolver. */
+export async function readSubnameAddress(resolverAddress: Hex, label: string): Promise<Hex | null> {
+  const addr = await publicClient.readContract({
+    address: resolverAddress,
+    abi: permissionedResolverAbi,
+    functionName: "addr",
+    args: [subnameNode(label)],
+  });
+  return addr === "0x0000000000000000000000000000000000000000" ? null : addr;
+}
+
+/** Read one text record straight off the resolver. */
+export async function readSubnameText(
+  resolverAddress: Hex,
+  label: string,
+  key: string,
+): Promise<string> {
+  return publicClient.readContract({
+    address: resolverAddress,
+    abi: permissionedResolverAbi,
+    functionName: "text",
+    args: [subnameNode(label), key],
+  });
+}
+
+// Shared by studios and agents: mint// Shared by studios and agents: mint "<label>.cgs-sanctuary.eth" under the
 // subregistry the platform owns. `bitmap` is the only thing that differs
 // between them and both grant the same limited scope today — enough for the
 // owner to point their own name somewhere, not enough to unregister or
