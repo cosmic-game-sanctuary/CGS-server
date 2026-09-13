@@ -65,6 +65,18 @@ const envSchema = z.object({
   NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
   CORS_ORIGIN: z.string().default("http://localhost:5173"),
 
+  // Set automatically by Render to this service's own public URL. Its presence
+  // is also how we detect "running on Render" — see the keepalive in index.ts.
+  // Absent everywhere else, which is the point: nothing below it should run
+  // locally.
+  RENDER_EXTERNAL_URL: z.string().url().optional(),
+
+  // Minutes between self-pings on a host that sleeps when idle. Render's free
+  // tier spins a web service down after 15 minutes without *inbound* traffic,
+  // so 10 leaves margin for a slow request without cutting it fine. Set to 0
+  // to turn the keepalive off entirely.
+  KEEPALIVE_MINUTES: z.coerce.number().int().min(0).default(10),
+
   // How many reverse proxies sit in front of this process. Zero locally, and
   // whatever the host puts there once it is deployed. It only exists because
   // the rate limiter buckets by `req.ip`: behind an unacknowledged proxy every

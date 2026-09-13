@@ -136,4 +136,46 @@ app.listen(env.PORT, () => {
         sweeping = false;
       });
   }, env.AGENT_SWEEP_INTERVAL_MS);
+
+  // Keepalive, and why a *server-side* one is the right shape here.
+  //
+  // Render's free tier spins a web service down after 15 minutes without
+  // **inbound** traffic. For most apps that only costs a slow first request.
+  // Here it costs the headline feature: this process holds the HCS listings
+  // subscription and runs the agent sweep, so a sleeping server is an agent
+  // that has stopped watching for price changes and will miss the wire it was
+  // waiting for. None of the timers above count as inbound traffic — they are
+  // internal, and Render never sees them.
+  //
+  // A request to our own public URL does count: it leaves the container, comes
+  // back through Render's router, and lands as ordinary inbound traffic.
+  //
+  // **What this does not do: wake a service that is already asleep.** Nothing
+  // running inside a stopped container can. It prevents sleep, it cannot undo
+  // it — so an external monitor is still worth having, both as the belt to
+  // this pair of braces and because it can alert when the service is genuinely
+  // down rather than merely idle.
+  //
+  // **Cost, deliberately:** never sleeping means ~730 instance-hours a month
+  // against a 750-hour free allowance, and a second free service would put the
+  // workspace over and suspend everything. That is an acceptable trade for a
+  // judging window measured in days, and a bad one to leave running for a
+  // month. `KEEPALIVE_MINUTES=0` turns it off.
+  if (env.RENDER_EXTERNAL_URL && env.KEEPALIVE_MINUTES > 0) {
+    const target = `${env.RENDER_EXTERNAL_URL.replace(/\/+$/, "")}/health`;
+    const everyMs = env.KEEPALIVE_MINUTES * 60_000;
+    logger.info({ target, everyMinutes: env.KEEPALIVE_MINUTES }, "keepalive armed");
+
+    setInterval(() => {
+      // Failures are genuinely uninteresting: a missed ping just means the
+      // idle timer keeps running, and the next one is minutes away. What is
+      // not acceptable is an unhandled rejection taking the process down to
+      // avoid a spin-down.
+      void fetch(target, { signal: AbortSignal.timeout(30_000) })
+        .then((res) => {
+          if (!res.ok) logger.warn({ status: res.status }, "keepalive ping was not ok");
+        })
+        .catch((err) => logger.warn({ err: String(err) }, "keepalive ping failed"));
+    }, everyMs);
+  }
 });

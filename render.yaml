@@ -67,6 +67,14 @@ services:
       - key: PORT
         value: 10000
 
+      # Minutes between self-pings, so the free instance never goes 15 minutes
+      # without inbound traffic and spins down. RENDER_EXTERNAL_URL is supplied
+      # by Render automatically and is what index.ts pings. Set to 0 to disable
+      # — worth doing if this ever needs to sit deployed for a full month,
+      # since never sleeping costs ~730 of the 750 free instance-hours.
+      - key: KEEPALIVE_MINUTES
+        value: 10
+
       # Everything below is set in the Render dashboard, never in this file.
       # `sync: false` means "prompt me, don't inherit and don't commit".
       - { key: DATABASE_URL, sync: false }
