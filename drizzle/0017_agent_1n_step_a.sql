@@ -18,12 +18,21 @@ CREATE TABLE "agent_decisions" (
 --> statement-breakpoint
 ALTER TABLE "wishlist_agents" DROP CONSTRAINT "wishlist_agents_target_game_id_games_id_fk";
 --> statement-breakpoint
+DROP INDEX IF EXISTS "wishlist_agents_target_lookup";--> statement-breakpoint
+DROP INDEX IF EXISTS "wishlist_agents_one_live_per_game";--> statement-breakpoint
+ALTER TABLE "wishlist_agents" ALTER COLUMN "status" DROP DEFAULT;--> statement-breakpoint
 ALTER TABLE "wishlist_agents" ALTER COLUMN "status" SET DATA TYPE text;--> statement-breakpoint
 ALTER TABLE "wishlist_agents" ALTER COLUMN "status" SET DEFAULT 'draft'::text;--> statement-breakpoint
 DROP TYPE "public"."agent_status";--> statement-breakpoint
 CREATE TYPE "public"."agent_status" AS ENUM('draft', 'funded', 'watching', 'buying', 'cancelled', 'expired', 'failed');--> statement-breakpoint
 ALTER TABLE "wishlist_agents" ALTER COLUMN "status" SET DEFAULT 'draft'::"public"."agent_status";--> statement-breakpoint
 ALTER TABLE "wishlist_agents" ALTER COLUMN "status" SET DATA TYPE "public"."agent_status" USING "status"::"public"."agent_status";--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "wishlist_agents_target_lookup" ON "wishlist_agents" ("target_game_id", "status", "trigger_price_units");--> statement-breakpoint
+-- Recreated against the enum's post-rework values. 'underfunded' existed when
+-- 0008 first made this index and no longer does — 'cancelled', 'expired' and
+-- 'failed' are the terminal states this constraint was always meant to
+-- exclude, matching the enum's own inline comments in schema.ts.
+CREATE UNIQUE INDEX IF NOT EXISTS "wishlist_agents_one_live_per_game" ON "wishlist_agents" ("buyer_user_id", "target_game_id") WHERE "status" IN ('draft','funded','watching','buying');--> statement-breakpoint
 ALTER TABLE "wishlist_agents" ALTER COLUMN "target_game_id" DROP NOT NULL;--> statement-breakpoint
 ALTER TABLE "wishlist_agents" ALTER COLUMN "trigger_price_units" DROP NOT NULL;--> statement-breakpoint
 ALTER TABLE "wishlist_agents" ALTER COLUMN "last_seen_sequence" DROP DEFAULT;--> statement-breakpoint

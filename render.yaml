@@ -30,7 +30,21 @@ services:
     # against a database without the schema boots fine and then 500s on every
     # request, which is a worse failure than a build that stops. The prod
     # database is separate from dev, so this only ever touches production.
-    buildCommand: npm ci --include=dev && npm run build && npm run db:migrate
+    #
+    # `npm run db:migrate:fresh`, not `db:migrate` (drizzle-kit's own CLI).
+    # Verified directly: replaying all 24 migrations against an empty database
+    # in one go — which is exactly what a first deploy does, and which no
+    # incremental dev deploy had ever done — hits a real Postgres restriction
+    # (migration 0008 adds an enum value and, two files later, something else
+    # uses the type; Postgres refuses a value added earlier in the *same*
+    # transaction). drizzle-kit's CLI wraps the whole batch in one transaction
+    # and, worse, hangs forever on this specific error instead of surfacing
+    # it. `scripts/migrate-fresh.ts` commits each file separately, matching
+    # how these migrations were actually applied historically, and reads the
+    # same journal and writes the same `drizzle.__drizzle_migrations`
+    # bookkeeping, so it's a drop-in replacement, not a fork. See
+    # `CLAUDE.md`'s gotchas table for the full story.
+    buildCommand: npm ci --include=dev && npm run build && npm run db:migrate:fresh
     startCommand: npm start
     healthCheckPath: /health
     envVars:
