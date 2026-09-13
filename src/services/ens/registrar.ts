@@ -1,4 +1,4 @@
-import { decodeEventLog, encodeFunctionData, keccak256, toHex, type Hex } from "viem";
+import { decodeEventLog, encodeFunctionData, keccak256, toBytes, toHex, type Hex } from "viem";
 import { publicClient, walletClient, ensAccount } from "./client.js";
 import { erc20Abi, ethRegistrarAbi, verifiableFactoryAbi, userRegistryInitAbi, permissionedRegistryAbi } from "./abis.js";
 import { FULL_ADMIN_BITMAP, STUDIO_BITMAP, AGENT_BITMAP } from "./roles.js";
@@ -125,6 +125,47 @@ export async function registerParentName(subregistryAddress: Hex): Promise<{ tok
   if (receipt.status !== "success") throw new Error(`register() reverted: ${registerHash}`);
 
   return { tokenId: 0n, txHash: registerHash }; // tokenId parsed from logs by the caller if needed
+}
+
+/**
+ * The token id the registry files a label under.
+ *
+ * `keccak256(label)` with the **low 32 bits cleared** — not the bare hash, and
+ * not a namehash. Those low bits are the registry's own version counter, so a
+ * name re-registered after expiry keeps a stable id while the counter moves.
+ * Derived by testing candidates against a name we knew was registered until
+ * `ownerOf` returned its real owner, rather than assumed from v1 conventions
+ * (a bare `keccak256(label)` returns the zero address, which reads exactly
+ * like "this name does not exist" and sent this investigation sideways once).
+ */
+export function subnameTokenId(label: string): bigint {
+  return BigInt(keccak256(toBytes(label))) & ~0xffffffffn;
+}
+
+/**
+ * Resolve a subname to the address that owns it, on chain.
+ *
+ * **This is the real resolution path for an ENSv2 subname, and it is
+ * deliberately not a v1 resolver call.** In v2 a name's subnames live in the
+ * registry that issued them, so the registry is the authority on who holds
+ * one. Asking it is a live `eth_call` against Sepolia every time — nothing is
+ * cached and nothing is read from our own database, which is the whole point:
+ * `ens_subname` in Postgres is a convenience, this is the fact.
+ *
+ * Returns null for a label nobody holds, so an unregistered name and a
+ * registered one are distinguishable rather than both reading as "no address".
+ */
+export async function resolveSubnameOwner(
+  subregistryAddress: Hex,
+  label: string,
+): Promise<Hex | null> {
+  const owner = await publicClient.readContract({
+    address: subregistryAddress,
+    abi: permissionedRegistryAbi,
+    functionName: "ownerOf",
+    args: [subnameTokenId(label)],
+  });
+  return owner === "0x0000000000000000000000000000000000000000" ? null : owner;
 }
 
 // Real availability, not a guess at a view function that may not exist: a

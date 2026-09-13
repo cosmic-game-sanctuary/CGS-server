@@ -143,6 +143,17 @@ export const userRegistryInitAbi = [
 // (a studio's handle) under itself.
 export const permissionedRegistryAbi = [
   {
+    // Who holds a subname, straight from the registry. This is what makes a
+    // name *resolve* rather than merely exist: ENSv2 keeps ownership in the
+    // registry that issued the name, so this is the authoritative answer for
+    // anything minted under our parent — no v1 resolver in the path.
+    name: "ownerOf",
+    type: "function",
+    stateMutability: "view",
+    inputs: [{ name: "tokenId", type: "uint256" }],
+    outputs: [{ type: "address" }],
+  },
+  {
     name: "register",
     type: "function",
     stateMutability: "nonpayable",

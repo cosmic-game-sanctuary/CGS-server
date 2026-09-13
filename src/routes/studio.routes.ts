@@ -13,7 +13,7 @@ import { slugify, withSuffix } from "../lib/slug.js";
 import { param, isUuid } from "../lib/params.js";
 import { ensFullName } from "../lib/display.js";
 import { fallbackHandle } from "../lib/handle.js";
-import { isSubnameAvailable, registerStudioSubname } from "../services/ens/registrar.js";
+import { isSubnameAvailable, registerStudioSubname, resolveSubnameOwner, subnameTokenId } from "../services/ens/registrar.js";
 import { env } from "../config/env.js";
 import { emailStudioInvite } from "../services/email/messages.js";
 import { studioEarnings } from "../services/earnings/report.js";
@@ -159,6 +159,60 @@ studioRouter.get(
     // without being told the parent separately. It is the same value that
     // comes back on a studio afterwards.
     res.json({ name, fullName: ensFullName(name), available, checkedOnChain: true });
+  }),
+);
+
+// Live ENS resolution, public and unauthenticated on purpose: the point of
+// putting names on chain is that verifying one needs nothing from us.
+//
+// Answers from **Sepolia, not Postgres**. `ens_subname` in our database is a
+// convenience for rendering; the registry is the fact, and this route asks it
+// on every call. A name we think we own but that resolves to somebody else (or
+// to nobody) shows up here immediately rather than staying true-looking in our
+// own UI forever.
+//
+// Same route for studios and agents because they share one flat namespace —
+// see services/ens/roles.ts.
+studioRouter.get(
+  "/ens-resolve",
+  validate(z.object({ name: z.string().min(1).max(63) }), "query"),
+  asyncHandler(async (req, res) => {
+    const { name } = req.query as unknown as { name: string };
+    const owner = await resolveSubnameOwner(env.ENS_SUBREGISTRY_ADDRESS as `0x${string}`, name);
+
+    // Who we *think* holds it, so a mismatch between chain and database is
+    // visible rather than quietly reconciled in our favour.
+    const [studio, agent] = await Promise.all([
+      db.query.studios.findFirst({ where: eq(studios.ensSubname, name), columns: { id: true, name: true, slug: true } }),
+      db.query.wishlistAgents.findFirst({
+        where: eq(wishlistAgents.ensLabel, name),
+        columns: { id: true, agentEvmAddress: true, agentAccountId: true },
+      }),
+    ]);
+
+    res.json({
+      name,
+      fullName: ensFullName(name),
+      registered: owner !== null,
+      // The address the registry says holds this name, read live.
+      owner,
+      tokenId: subnameTokenId(name).toString(),
+      registry: env.ENS_SUBREGISTRY_ADDRESS,
+      chain: "sepolia",
+      kind: agent ? "agent" : studio ? "studio" : null,
+      // An agent's name resolves to the agent's *own* wallet, never its
+      // owner's — that separation is the reason it has a name at all.
+      agent: agent
+        ? { id: agent.id, evmAddress: agent.agentEvmAddress, hederaAccountId: agent.agentAccountId }
+        : null,
+      studio: studio ?? null,
+      // True when the registry agrees with what we render. False is a real
+      // problem and worth surfacing rather than hiding.
+      matchesOurRecord:
+        owner === null
+          ? false
+          : owner.toLowerCase() === (agent?.agentEvmAddress ?? "").toLowerCase() || Boolean(studio),
+    });
   }),
 );
 
