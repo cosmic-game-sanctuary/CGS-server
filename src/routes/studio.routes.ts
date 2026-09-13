@@ -5,7 +5,7 @@ import { db } from "../db/client.js";
 import { studios, studioMembers, games, users, wishlistAgents } from "../db/schema.js";
 import { requireAuth, optionalAuth } from "../middleware/auth.middleware.js";
 import { validate } from "../middleware/validate.middleware.js";
-import { emailLimiter } from "../middleware/ratelimit.middleware.js";
+import { emailLimiter, chainReadLimiter } from "../middleware/ratelimit.middleware.js";
 import { asyncHandler } from "../lib/asyncHandler.js";
 import { AppError, Errors } from "../lib/errors.js";
 import logger from "../utils/logger.utils.js";
@@ -175,10 +175,23 @@ studioRouter.get(
 // see services/ens/roles.ts.
 studioRouter.get(
   "/ens-resolve",
+  // One Sepolia call per request, on a free public RPC the agent also uses.
+  chainReadLimiter,
   validate(z.object({ name: z.string().min(1).max(63) }), "query"),
   asyncHandler(async (req, res) => {
     const { name } = req.query as unknown as { name: string };
-    const owner = await resolveSubnameOwner(env.ENS_SUBREGISTRY_ADDRESS as `0x${string}`, name);
+
+    // An unreachable RPC is upstream being down, not a bad request. Saying so
+    // with a 503 is more useful than a bare 500, and it keeps "we could not
+    // check" clearly distinct from "this name is not registered" — those mean
+    // opposite things to anyone verifying a claim.
+    let owner: `0x${string}` | null;
+    try {
+      owner = await resolveSubnameOwner(env.ENS_SUBREGISTRY_ADDRESS as `0x${string}`, name);
+    } catch (err) {
+      logger.warn({ err, name }, "ENS resolution failed — Sepolia unreachable?");
+      throw new AppError(503, "CHAIN_UNREACHABLE", "Could not reach Sepolia to resolve that name. Try again shortly.");
+    }
 
     // Who we *think* holds it, so a mismatch between chain and database is
     // visible rather than quietly reconciled in our favour.

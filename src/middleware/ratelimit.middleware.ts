@@ -118,4 +118,26 @@ export const publishLimiter = rateLimit({
   handler: refuse("Too many publishes in one hour. Give it a few minutes."),
 });
 
+/**
+ * Routes that make an on-chain call per request.
+ *
+ * `GET /api/studios/ens-resolve` is public and unauthenticated on purpose —
+ * verifying a name should need nothing from us — but every call is a live
+ * `eth_call` against Sepolia through a free public RPC. The general ceiling of
+ * 1000 per 15 minutes is far too generous for that: hammering it burns the RPC
+ * quota the **agent** depends on for its own reads and writes, so abuse of a
+ * read-only convenience route could stop agents resolving their own mandates.
+ *
+ * Thirty a minute is more than anyone clicking through names will ever
+ * produce, and nowhere near enough to exhaust an upstream provider.
+ */
+export const chainReadLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 30,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  ipv6Subnet: 56,
+  handler: refuse("That's a lot of lookups. Wait a moment and try again."),
+});
+
 export default generalLimiter;
