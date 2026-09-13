@@ -38,26 +38,80 @@ export const FULL_ADMIN_BITMAP =
 // spirit as GameKey treasury staying with the operator rather than the studio.
 export const STUDIO_BITMAP = ROLE_SET_RESOLVER | ROLE_RENEW;
 
-// Identical scope to a studio's, under a different name for clarity at the
-// call site — an agent's subname is "each with their own identity and
-// permissions" (ENS's own stated bonus for this), not a studio's vanity name,
-// even though the actual role set an owner needs is the same either way.
-export const AGENT_BITMAP = STUDIO_BITMAP;
+/**
+ * What an agent gets on its own subname: **renewal only, deliberately not
+ * `ROLE_SET_RESOLVER`.**
+ *
+ * This used to equal `STUDIO_BITMAP`, and that was wrong in a way that
+ * undermined the whole point of publishing a mandate. An agent's spending
+ * ceiling lives in the text records its name resolves to, so an agent holding
+ * `ROLE_SET_RESOLVER` could point its name at a resolver of its own and state
+ * any ceiling it liked. A limit the constrained party can rewrite is not a
+ * limit, and anyone reading the name's roles could see that for themselves.
+ *
+ * A studio keeps `ROLE_SET_RESOLVER` because a studio name is an identity its
+ * owner genuinely owns and nothing enforceable hangs off its records. An agent
+ * name carries a permission, so the account being permitted must not be able
+ * to move where that permission is read from. The asymmetry is the point, not
+ * an oversight.
+ */
+export const AGENT_BITMAP = ROLE_RENEW;
 
 /**
- * Every role on a Permissioned Resolver.
+ * The **resolver's** own role numbering — separate from the registry's, and a
+ * distinction that has already cost one debugging session: initialising a
+ * resolver with `FULL_ADMIN_BITMAP` (the registry's set) deploys fine, lets an
+ * address write through, then reverts on the first text record with
+ * `Unauthorized(resource, 0x10, account)`, because bit 4 is the resolver's
+ * `ROLE_SET_TEXT` and simply is not in the registry's bitmap.
  *
- * The resolver has its own role numbering, **separate from the registry's** —
- * a fact learned the expensive way: initialising a resolver with
- * `FULL_ADMIN_BITMAP` (which is the registry's set) deploys fine, lets
- * `setAddr` through, and then reverts on `setText` with
- * `Unauthorized(resource, 0x10, account)`. Bit 4 is the resolver's
- * ROLE_SET_TEXT and simply isn't in the registry's bitmap.
+ * Values from the Permissioned Resolver docs for the ETHOnline hackathon
+ * deployment. Each role also has an admin counterpart at `role << 128`, which
+ * is what permits granting or revoking that role to somebody else later.
+ */
+export const RESOLVER_ROLE_SET_ADDRESS = 1n << 0n;
+export const RESOLVER_ROLE_SET_TEXT = 1n << 4n;
+export const RESOLVER_ROLE_SET_CONTENTHASH = 1n << 8n;
+export const RESOLVER_ROLE_SET_ABI = 1n << 12n;
+export const RESOLVER_ROLE_SET_INTERFACE = 1n << 16n;
+export const RESOLVER_ROLE_SET_NAME = 1n << 20n;
+export const RESOLVER_ROLE_SET_DATA = 1n << 24n;
+export const RESOLVER_ROLE_LINK = 1n << 28n;
+export const RESOLVER_ROLE_CAN_NAME = 1n << 120n;
+export const RESOLVER_ROLE_UPGRADE = 1n << 124n;
+
+const RESOLVER_REGULAR_ROLES =
+  RESOLVER_ROLE_SET_ADDRESS |
+  RESOLVER_ROLE_SET_TEXT |
+  RESOLVER_ROLE_SET_CONTENTHASH |
+  RESOLVER_ROLE_SET_ABI |
+  RESOLVER_ROLE_SET_INTERFACE |
+  RESOLVER_ROLE_SET_NAME |
+  RESOLVER_ROLE_SET_DATA |
+  RESOLVER_ROLE_LINK |
+  RESOLVER_ROLE_CAN_NAME |
+  RESOLVER_ROLE_UPGRADE;
+
+/**
+ * Every resolver role plus its admin counterpart, granted to the operator on
+ * `ROOT_RESOURCE` at deploy time.
  *
- * `0x1111…1111` is ENS's own documented "all roles" value: EAC lays roles out
- * one per nibble, so a 1 in every nibble grants each of them. Using their
- * constant rather than reconstructing it from individual bits, because the
- * numbering is the resolver's business and not something to infer.
+ * The admin half matters beyond completeness: it is what lets the operator
+ * later hand one specific text key to one account via `grantSetterRoles`
+ * without surrendering anything else.
  */
 export const ALL_RESOLVER_ROLES =
+  RESOLVER_REGULAR_ROLES | (RESOLVER_REGULAR_ROLES << 128n);
+
+/**
+ * ENS's own documented "every role" value, used for the grants passed to both
+ * `UserRegistryImpl.initialize` and `PermissionedResolverImpl.initialize`.
+ *
+ * EAC lays roles out one per nibble, so a 1 in every nibble grants each of
+ * them — including roles a given contract does not define and any added later.
+ * Their constant is used verbatim rather than reconstructed from the named
+ * bits above, because the numbering belongs to the contract rather than to us,
+ * and a reconstruction silently stops being "all" the moment ENS adds a role.
+ */
+export const ALL_ROLES =
   0x1111111111111111111111111111111111111111111111111111111111111111n;

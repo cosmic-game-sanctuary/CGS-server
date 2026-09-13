@@ -126,14 +126,30 @@ export const verifiableFactoryAbi = [
 
 // UserRegistry's initializer — encoded as the `data` param to deployProxy,
 // never called directly (the factory calls it on our behalf during deploy).
+/**
+ * `UserRegistryImpl.initialize`, as deployed for the ETHOnline hackathon.
+ *
+ * Takes a list of `{account, roleBitmap}` grants applied to `ROOT_RESOURCE` —
+ * not the beta's flat `(address admin, uint256 roleBitmap)`. Passing the old
+ * shape encodes to a different selector and reverts inside the proxy's
+ * delegatecall, which surfaces only as a bare "execution reverted".
+ *
+ * Unlike the resolver's initializer there is no trailing `calls` array.
+ */
 export const userRegistryInitAbi = [
   {
     name: "initialize",
     type: "function",
     stateMutability: "nonpayable",
     inputs: [
-      { name: "rootAccount", type: "address" },
-      { name: "roleBitmap", type: "uint256" },
+      {
+        name: "grants",
+        type: "tuple[]",
+        components: [
+          { name: "account", type: "address" },
+          { name: "roleBitmap", type: "uint256" },
+        ],
+      },
     ],
     outputs: [],
   },
@@ -181,45 +197,75 @@ export const permissionedRegistryAbi = [
  * v1. Only the authorization surface (`authorizeTextRoles`) takes a
  * DNS-encoded name, which is why both shapes appear here.
  */
+/**
+ * ENSv2's **Permissioned Resolver**, as deployed for the ETHOnline hackathon.
+ *
+ * **Setters take a DNS-encoded name (`bytes`), not a namehash.** That is the
+ * single biggest difference from both v1 and from the earlier v2 beta, and it
+ * is not cosmetic: the resolver derives the node from the name itself, so the
+ * node argument that still appears in the *read* profiles is ignored. Use
+ * `viem/ens`'s `packetToBytes` to produce the encoding rather than hand-rolling
+ * length-prefixed labels.
+ *
+ * Addresses are ENSIP-9 multichain: `setAddress(name, coinType, bytes)` with
+ * coin type 60 for Ethereum and the address as raw 20 bytes, rather than v1's
+ * `setAddr(bytes32, address)`.
+ *
+ * `initialize` takes a list of `Grant` structs (an account plus a role bitmap,
+ * applied to `ROOT_RESOURCE`) and a multicall batch executed with role checks
+ * skipped — not the beta's flat `(admin, roleBitmap, bytes[])`.
+ */
 export const permissionedResolverAbi = [
   {
     name: "initialize",
     type: "function",
     stateMutability: "nonpayable",
     inputs: [
-      { name: "admin", type: "address" },
-      { name: "roleBitmap", type: "uint256" },
-      { name: "setters", type: "bytes[]" },
+      {
+        name: "grants",
+        type: "tuple[]",
+        components: [
+          { name: "account", type: "address" },
+          { name: "roleBitmap", type: "uint256" },
+        ],
+      },
+      { name: "calls", type: "bytes[]" },
     ],
     outputs: [],
   },
   {
-    name: "setAddr",
+    name: "setAddress",
     type: "function",
     stateMutability: "nonpayable",
     inputs: [
-      { name: "node", type: "bytes32" },
-      { name: "a", type: "address" },
+      { name: "name", type: "bytes" },
+      { name: "coinType", type: "uint256" },
+      { name: "addressBytes", type: "bytes" },
     ],
     outputs: [],
-  },
-  {
-    name: "addr",
-    type: "function",
-    stateMutability: "view",
-    inputs: [{ name: "node", type: "bytes32" }],
-    outputs: [{ type: "address" }],
   },
   {
     name: "setText",
     type: "function",
     stateMutability: "nonpayable",
     inputs: [
-      { name: "node", type: "bytes32" },
+      { name: "name", type: "bytes" },
       { name: "key", type: "string" },
       { name: "value", type: "string" },
     ],
     outputs: [],
+  },
+  // Read profiles. Passed as the `data` argument to `resolve(name, data)`
+  // rather than called directly — the resolver has no standalone getters.
+  {
+    name: "addr",
+    type: "function",
+    stateMutability: "view",
+    inputs: [
+      { name: "node", type: "bytes32" },
+      { name: "coinType", type: "uint256" },
+    ],
+    outputs: [{ type: "bytes" }],
   },
   {
     name: "text",
@@ -230,6 +276,39 @@ export const permissionedResolverAbi = [
       { name: "key", type: "string" },
     ],
     outputs: [{ type: "string" }],
+  },
+  {
+    name: "resolve",
+    type: "function",
+    stateMutability: "view",
+    inputs: [
+      { name: "name", type: "bytes" },
+      { name: "data", type: "bytes" },
+    ],
+    outputs: [{ type: "bytes" }],
+  },
+  // Delegate exactly one text key (or coin type) to another account. `setter`
+  // is ABI-encoded calldata of the setter being authorised; only its selector
+  // and the keyed argument are read.
+  {
+    name: "grantSetterRoles",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "setter", type: "bytes" },
+      { name: "account", type: "address" },
+    ],
+    outputs: [{ type: "bool" }],
+  },
+  {
+    name: "hasRootRoles",
+    type: "function",
+    stateMutability: "view",
+    inputs: [
+      { name: "roleBitmap", type: "uint256" },
+      { name: "account", type: "address" },
+    ],
+    outputs: [{ type: "bool" }],
   },
 ] as const;
 
@@ -245,5 +324,33 @@ export const registrySetResolverAbi = [
       { name: "resolver", type: "address" },
     ],
     outputs: [],
+  },
+] as const;
+
+
+/** EAC role management, shared by registries and resolvers. Needed to revoke a
+ *  role that was granted at registration time — see `roles.ts#AGENT_BITMAP`. */
+export const eacAbi = [
+  {
+    name: "revokeRoles",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "resource", type: "uint256" },
+      { name: "roleBitmap", type: "uint256" },
+      { name: "account", type: "address" },
+    ],
+    outputs: [{ type: "bool" }],
+  },
+  {
+    name: "hasRoles",
+    type: "function",
+    stateMutability: "view",
+    inputs: [
+      { name: "resource", type: "uint256" },
+      { name: "roleBitmap", type: "uint256" },
+      { name: "account", type: "address" },
+    ],
+    outputs: [{ type: "bool" }],
   },
 ] as const;

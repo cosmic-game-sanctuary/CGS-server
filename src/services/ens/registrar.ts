@@ -1,5 +1,6 @@
 import {
   decodeEventLog,
+  decodeFunctionResult,
   encodeAbiParameters,
   encodeFunctionData,
   keccak256,
@@ -9,6 +10,7 @@ import {
   toHex,
   type Hex,
 } from "viem";
+import { packetToBytes } from "viem/ens";
 import { publicClient, walletClient, ensAccount } from "./client.js";
 import {
   erc20Abi,
@@ -18,8 +20,9 @@ import {
   permissionedRegistryAbi,
   permissionedResolverAbi,
   registrySetResolverAbi,
+  eacAbi,
 } from "./abis.js";
-import { FULL_ADMIN_BITMAP, STUDIO_BITMAP, AGENT_BITMAP, ALL_RESOLVER_ROLES } from "./roles.js";
+import { STUDIO_BITMAP, AGENT_BITMAP, ALL_ROLES } from "./roles.js";
 import { env } from "../../config/env.js";
 
 const ONE_YEAR = 365n * 24n * 60n * 60n;
@@ -56,7 +59,7 @@ export async function deploySubregistry(): Promise<Hex> {
   const initData = encodeFunctionData({
     abi: userRegistryInitAbi,
     functionName: "initialize",
-    args: [ensAccount.address, FULL_ADMIN_BITMAP],
+    args: [[{ account: ensAccount.address, roleBitmap: ALL_ROLES }]],
   });
 
   const salt = BigInt(keccak256(toHex(`cgs-subregistry:${env.ENS_PARENT_NAME}`)));
@@ -235,12 +238,18 @@ export async function deployResolver(version = 0n): Promise<Hex> {
   const initData = encodeFunctionData({
     abi: permissionedResolverAbi,
     functionName: "initialize",
-    // The **resolver's** role set, not the registry's — see
-    // roles.ts#ALL_RESOLVER_ROLES for why that distinction bit once already.
-    // Every role to the operator, because this one resolver serves every name
-    // we issue. EAC still allows delegating a single record key later without
-    // handing over the rest.
-    args: [ensAccount.address, ALL_RESOLVER_ROLES, []],
+    // `initialize(grants, calls)`: a list of {account, roleBitmap} applied to
+    // ROOT_RESOURCE, plus a multicall run with role checks skipped. Not the
+    // beta's flat (admin, roleBitmap, bytes[]) — passing that shape here
+    // reverts on decode.
+    //
+    // Only the operator is granted anything. **No subname owner ever holds a
+    // role on this resolver**, which is what makes a published mandate one the
+    // named account cannot rewrite. Resolver roles are not per-name (a role
+    // holder can write that record type on *every* name the instance serves),
+    // so granting an agent any write role here would hand it every other
+    // agent's records too.
+    args: [[{ account: ensAccount.address, roleBitmap: ALL_ROLES }], []],
   });
 
   const hash = await walletClient.writeContract({
@@ -290,6 +299,22 @@ export async function setSubnameResolver(
 }
 
 /**
+ * The DNS wire encoding of a full subname, which is what every v2 setter takes
+ * in place of a namehash.
+ *
+ * `alice.cgs-sanctuary.eth` becomes `\x05alice\x0dcgs-sanctuary\x03eth\x00`.
+ * The resolver derives the node from this itself, which is why the node
+ * argument still present in the read profiles is documented as ignored.
+ */
+export function subnameDnsName(label: string): Hex {
+  return toHex(packetToBytes(`${label}.${env.ENS_PARENT_NAME}.eth`));
+}
+
+/** Ethereum's ENSIP-9 coin type. Addresses are written as raw bytes, not as an
+ *  `address`, because the same setter serves every chain. */
+const COIN_TYPE_ETH = 60n;
+
+/**
  * Write the address a name resolves to.
  *
  * For an agent this is the agent's **own** wallet rather than the buyer's, so
@@ -304,8 +329,8 @@ export async function setSubnameAddress(
   const hash = await walletClient.writeContract({
     address: resolverAddress,
     abi: permissionedResolverAbi,
-    functionName: "setAddr",
-    args: [subnameNode(label), address],
+    functionName: "setAddress",
+    args: [subnameDnsName(label), COIN_TYPE_ETH, address],
   });
   await publicClient.waitForTransactionReceipt({ hash });
   return hash;
@@ -323,34 +348,119 @@ export async function setSubnameText(
     address: resolverAddress,
     abi: permissionedResolverAbi,
     functionName: "setText",
-    args: [subnameNode(label), key, value],
+    args: [subnameDnsName(label), key, value],
   });
   await publicClient.waitForTransactionReceipt({ hash });
   return hash;
 }
 
-/** Read an address record straight off the resolver. */
-export async function readSubnameAddress(resolverAddress: Hex, label: string): Promise<Hex | null> {
-  const addr = await publicClient.readContract({
+/**
+ * Read a record back the way the rest of the world reads it: through the
+ * resolver's `resolve(name, data)` entry point, exactly as the Universal
+ * Resolver would call it.
+ *
+ * Deliberately not a direct getter — the v2 resolver has none, because a name's
+ * values live in a numbered record the name is linked to rather than under the
+ * name itself. Going through `resolve` means what we read back is what any
+ * client resolving the name would get, rather than an internal view only we
+ * can see.
+ */
+async function resolveProfile(
+  resolverAddress: Hex,
+  label: string,
+  data: Hex,
+): Promise<Hex> {
+  return publicClient.readContract({
     address: resolverAddress,
     abi: permissionedResolverAbi,
-    functionName: "addr",
-    args: [subnameNode(label)],
+    functionName: "resolve",
+    args: [subnameDnsName(label), data],
   });
-  return addr === "0x0000000000000000000000000000000000000000" ? null : addr;
 }
 
-/** Read one text record straight off the resolver. */
+/** Read an address record, as a resolving client would see it. */
+export async function readSubnameAddress(resolverAddress: Hex, label: string): Promise<Hex | null> {
+  const result = await resolveProfile(
+    resolverAddress,
+    label,
+    encodeFunctionData({
+      abi: permissionedResolverAbi,
+      functionName: "addr",
+      args: [subnameNode(label), COIN_TYPE_ETH],
+    }),
+  );
+  // A single-output function decodes to the value itself, not a one-element
+  // tuple — destructuring it yields the string's first character ("0"), which
+  // reads convincingly like a zero address rather than like a decode bug.
+  const raw = decodeFunctionResult({
+    abi: permissionedResolverAbi,
+    functionName: "addr",
+    data: result,
+  }) as unknown as Hex;
+  // 20 zero bytes, an empty return, or "0x" all mean the same thing: no record.
+  if (!raw || raw === "0x" || /^0x0*$/.test(raw)) return null;
+  return raw as Hex;
+}
+
+/** Read one text record, as a resolving client would see it. */
 export async function readSubnameText(
   resolverAddress: Hex,
   label: string,
   key: string,
 ): Promise<string> {
-  return publicClient.readContract({
-    address: resolverAddress,
+  const result = await resolveProfile(
+    resolverAddress,
+    label,
+    encodeFunctionData({
+      abi: permissionedResolverAbi,
+      functionName: "text",
+      args: [subnameNode(label), key],
+    }),
+  );
+  return decodeFunctionResult({
     abi: permissionedResolverAbi,
     functionName: "text",
-    args: [subnameNode(label), key],
+    data: result,
+  }) as unknown as string;
+}
+
+/**
+ * Take a role away from an account on a name that has already been registered.
+ *
+ * Needed because the agents registered before `AGENT_BITMAP` was corrected
+ * still hold `ROLE_SET_RESOLVER` from their original registration, and a
+ * bitmap change only affects names registered after it. Revoking is not
+ * destructive: the name, its owner and its expiry are untouched, and the
+ * account keeps every other role it was granted.
+ */
+export async function revokeSubnameRole(
+  subregistryAddress: Hex,
+  label: string,
+  roleBitmap: bigint,
+  account: Hex,
+): Promise<Hex> {
+  const hash = await walletClient.writeContract({
+    address: subregistryAddress,
+    abi: eacAbi,
+    functionName: "revokeRoles",
+    args: [subnameTokenId(label), roleBitmap, account],
+  });
+  await publicClient.waitForTransactionReceipt({ hash });
+  return hash;
+}
+
+/** Whether an account currently holds every role in `roleBitmap` on a name. */
+export async function subnameHasRole(
+  subregistryAddress: Hex,
+  label: string,
+  roleBitmap: bigint,
+  account: Hex,
+): Promise<boolean> {
+  return publicClient.readContract({
+    address: subregistryAddress,
+    abi: eacAbi,
+    functionName: "hasRoles",
+    args: [subnameTokenId(label), roleBitmap, account],
   });
 }
 

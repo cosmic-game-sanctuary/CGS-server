@@ -223,7 +223,7 @@ const envSchema = z.object({
   ENS_ETH_REGISTRAR: evmAddress,
   ENS_VERIFIABLE_FACTORY: evmAddress,
   ENS_USER_REGISTRY_IMPL: evmAddress,
-  ENS_RESOLVER: evmAddress,
+  ENS_RESOLVER: z.string().default(""),
   ENS_MOCK_USDC: evmAddress,
   // chosen once, at first registration — see docs/stage-7.md for why this
   // specific label.
@@ -234,11 +234,16 @@ const envSchema = z.object({
   // ENSv2's Permissioned Resolver implementation on Sepolia. We deploy our own
   // UUPS proxy of this through the VerifiableFactory so records on our names
   // are ours to write — see services/ens/registrar.ts#deployResolver.
+  // The registry holding .eth names on the hackathon deployment — where our
+  // parent name lives, and so what `setSubregistry` is called on.
+  ENS_ETH_REGISTRY: evmAddress.default("0x1d78834d97c1d7b1a38c1dedbd1a287cfed3971e"),
+  ENS_ROOT_REGISTRY: evmAddress.default("0xe7f0d5724f8337e3aa9a9910540341ff4273fed9"),
+  ENS_UNIVERSAL_RESOLVER: evmAddress.default("0xfea8d4b7fcce0b8765c793d6695eac384aaa458f"),
   ENS_PERMISSIONED_RESOLVER_IMPL: z
     .string()
-    .default("0x9eae5c2730a7dd16bdd1dee6421a1b91e3b0365e"),
+    .default("0xa9d3814ab151bf6e37a427432795371a8361614e"),
 
-  ENS_SUBREGISTRY_ADDRESS: evmAddress,
+  ENS_SUBREGISTRY_ADDRESS: z.string().default(""),
 })
   // A route that moves real money out of the operator account on nothing but
   // a valid login has no business existing in production. Making it a boot
