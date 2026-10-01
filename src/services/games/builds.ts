@@ -1,11 +1,12 @@
+import { readFile } from "node:fs/promises";
 import { desc, eq } from "drizzle-orm";
 import { db } from "../../db/client.js";
 import { gameBuilds, games } from "../../db/schema.js";
 import { AppError } from "../../lib/errors.js";
 import { unpackBuild } from "../ipfs/unpack.js";
-import { pinDirectory, pinFile } from "../ipfs/pinata.js";
+import { pinDirectory, pinFileFromPath } from "../ipfs/pinata.js";
 import { checkImages } from "../moderation/csam.js";
-import { saveBuild } from "./buildStore.js";
+import { saveBuildFromDisk } from "./buildStore.js";
 
 /**
  * Getting a zip from a developer's machine into something we can serve, prove
@@ -26,46 +27,69 @@ export type BuildArtifacts = {
   /** The same bytes as a zip. Delivery — Pinata's gateway refuses HTML. */
   buildZipCid: string;
   buildSizeKb: number;
-  /** Kept so the caller can store it locally without re-reading the upload. */
-  zip: Buffer;
+  /**
+   * Where the uploaded zip currently lives on disk — commitBuild copies this
+   * straight into permanent storage. Kept as a path rather than a Buffer so
+   * the zip's bytes are never held in heap for the whole request; the only
+   * time they're read is the one pin call below.
+   */
+  zipPath: string;
 };
 
 /**
  * Unpack, moderate, pin. Nothing is pinned until the check passes, which is
  * what "fails closed" has to mean — see services/moderation/csam.ts.
  *
- * `extraImages` exists so the publish route can put its screenshots through
- * the same single check as the build's own images, before either is pinned.
+ * `extraImagePaths` exists so the publish route can put its screenshots
+ * through the same single check as the build's own images, before either is
+ * pinned.
  */
 export async function ingestBuild(
-  zip: Buffer,
+  zipPath: string,
   nameHint: string,
-  extraImages: Buffer[] = [],
+  extraImagePaths: string[] = [],
 ): Promise<BuildArtifacts> {
-  const files = await unpackBuild(zip);
+  // Streamed straight from disk — the zip's bytes never need to be a Buffer
+  // just to pin it. Doing this before reading the buffer for unpacking (below)
+  // means the only thing resident during this call is a stream's worth of
+  // chunks, not the whole zip twice over.
+  const buildZipCid = await pinFileFromPath(zipPath, `${nameHint}-build.zip`, "application/zip");
 
-  const images = [
-    ...extraImages,
-    ...files.filter((f) => IMAGE_MIME.test(f.mimeType ?? "")).map((f) => f.buffer),
-  ];
-  const csam = await checkImages(images);
-  if (!csam.pass) {
-    throw new AppError(422, "MODERATION_BLOCKED", "This upload can't be accepted yet.", {
-      reason: csam.reason,
-    });
+  // JSZip has to read the central directory at the end of the file before it
+  // knows what entries exist, which needs the whole compressed zip as one
+  // buffer regardless — there's no streaming that part. This is the only
+  // buffer of it this function ever holds.
+  const zipBuffer = await readFile(zipPath);
+
+  // unpackBuild streams each entry straight to a temp file rather than
+  // collecting buffers, so `files` below carries disk paths, not bytes — the
+  // decompressed build is never all in memory at once. `cleanup` must run
+  // either way, which is what the try/finally is for.
+  const { files, cleanup } = await unpackBuild(zipBuffer);
+  try {
+    const imagePaths = [
+      ...extraImagePaths,
+      ...files.filter((f) => IMAGE_MIME.test(f.mimeType)).map((f) => f.diskPath),
+    ];
+    const images = await Promise.all(imagePaths.map((p) => readFile(p)));
+    const csam = await checkImages(images);
+    if (!csam.pass) {
+      throw new AppError(422, "MODERATION_BLOCKED", "This upload can't be accepted yet.", {
+        reason: csam.reason,
+      });
+    }
+
+    const buildCid = await pinDirectory(files);
+
+    return {
+      buildCid,
+      buildZipCid,
+      buildSizeKb: Math.round(files.reduce((sum, f) => sum + f.size, 0) / 1024),
+      zipPath,
+    };
+  } finally {
+    await cleanup();
   }
-
-  const [buildCid, buildZipCid] = await Promise.all([
-    pinDirectory(files),
-    pinFile(zip, `${nameHint}-build.zip`, "application/zip"),
-  ]);
-
-  return {
-    buildCid,
-    buildZipCid,
-    buildSizeKb: Math.round(files.reduce((sum, f) => sum + f.buffer.length, 0) / 1024),
-    zip,
-  };
 }
 
 /** The version number a new build for this game should carry. 1 if it's the first. */
@@ -122,7 +146,7 @@ export async function commitBuild(
   // Overwrites the served copy, on purpose: owners get the patch. The previous
   // version is not lost — its CID is in the row above, and `findBuild` pulls
   // any zip back from IPFS on demand.
-  await saveBuild(gameId, artifacts.zip);
+  await saveBuildFromDisk(gameId, artifacts.zipPath);
 
   return row!;
 }

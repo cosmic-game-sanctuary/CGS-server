@@ -1,4 +1,4 @@
-import { mkdir, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import logger from "../../utils/logger.utils.js";
 import { gatewayUrl } from "../ipfs/pinata.js";
@@ -49,6 +49,17 @@ export async function saveBuild(gameId: string, zip: Buffer): Promise<void> {
   await mkdir(ROOT, { recursive: true });
   await writeFile(zipPath(gameId), zip);
   logger.info({ gameId, bytes: zip.length }, "build stored for serving");
+}
+
+/**
+ * Same as `saveBuild`, but for a zip that's already on this disk rather than
+ * in memory — a plain file copy, so a fresh publish never needs its upload
+ * held as a Buffer just to get it into permanent storage.
+ */
+export async function saveBuildFromDisk(gameId: string, srcPath: string): Promise<void> {
+  await mkdir(ROOT, { recursive: true });
+  await copyFile(srcPath, zipPath(gameId));
+  logger.info({ gameId }, "build stored for serving");
 }
 
 /** The file to send, or null if it isn't on this disk. */

@@ -1,3 +1,6 @@
+import { randomUUID } from "node:crypto";
+import { readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { Router, type Request } from "express";
 import { and, desc, asc, eq, or, ilike, inArray, isNotNull, lt, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -75,7 +78,20 @@ import {
 } from "../services/games/trials.js";
 
 const gameRouter = Router({ caseSensitive: true, strict: true });
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
+// Disk, not memory: `memoryStorage` buffered the whole multipart body as one
+// Buffer before any handler ran, so a 200MB upload was 200MB of RSS before
+// unpacking had even started — and that, not the decompressed build, used to
+// be the first thing to OOM-kill a 512MB instance. Each upload gets its own
+// temp file, deleted by the route once it's done with it. 80MB is what the
+// budget in services/ipfs/unpack.ts leaves room for, and an oversized upload
+// now gets a 413 from multer rather than an OOM kill.
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, tmpdir()),
+    filename: (_req, file, cb) => cb(null, `cgs-upload-${randomUUID()}-${file.fieldname}`),
+  }),
+  limits: { fileSize: 80 * 1024 * 1024 },
+});
 
 // ratings are averaged in JS rather than in SQL — the catalog is a few dozen
 // rows at hackathon scale, and this avoids depending on drizzle's aggregate
@@ -645,118 +661,125 @@ gameRouter.post(
   asyncHandler(async (req, res) => {
     const body = req.body as z.infer<typeof publishGameSchema>;
     const files = req.files as { [field: string]: Express.Multer.File[] } | undefined;
+    // Multer wrote these straight to disk rather than into memory; whatever
+    // happens below, they need deleting when the request is done with them.
+    const uploadedPaths = [...(files?.build ?? []), ...(files?.media ?? [])].map((f) => f.path);
 
-    const studio = await db.query.studios.findFirst({ where: eq(studios.id, body.studioId) });
-    if (!studio) throw Errors.notFound("Studio");
-    if (studio.ownerUserId !== req.auth!.id) throw Errors.notOwner();
+    try {
+      const studio = await db.query.studios.findFirst({ where: eq(studios.id, body.studioId) });
+      if (!studio) throw Errors.notFound("Studio");
+      if (studio.ownerUserId !== req.auth!.id) throw Errors.notOwner();
 
-    const totalPct = body.splits.reduce((sum, s) => sum + s.pct, 0);
-    if (totalPct !== 100) {
-      throw Errors.validationFailed({ splits: `must total 100, got ${totalPct}` });
-    }
-    if (!files?.build?.[0]) {
-      throw Errors.validationFailed({ build: "a build file is required" });
-    }
-    const mediaFiles = files.media ?? [];
-    if (body.coverMediaIndex !== undefined && !mediaFiles[body.coverMediaIndex]) {
-      throw Errors.validationFailed({ coverMediaIndex: "out of range for the uploaded media" });
-    }
+      const totalPct = body.splits.reduce((sum, s) => sum + s.pct, 0);
+      if (totalPct !== 100) {
+        throw Errors.validationFailed({ splits: `must total 100, got ${totalPct}` });
+      }
+      if (!files?.build?.[0]) {
+        throw Errors.validationFailed({ build: "a build file is required" });
+      }
+      const mediaFiles = files.media ?? [];
+      if (body.coverMediaIndex !== undefined && !mediaFiles[body.coverMediaIndex]) {
+        throw Errors.validationFailed({ coverMediaIndex: "out of range for the uploaded media" });
+      }
 
-    let slug = slugify(body.title);
-    if (await db.query.games.findFirst({ where: eq(games.slug, slug) })) slug = withSuffix(slug);
+      let slug = slugify(body.title);
+      if (await db.query.games.findFirst({ where: eq(games.slug, slug) })) slug = withSuffix(slug);
 
-    // Unpack, moderate, pin — one function, and the same one every later build
-    // version goes through (services/games/builds.ts). It fails closed: nothing
-    // is pinned and nothing is inserted until the check passes, and the
-    // screenshots go through that same single check, which is why they are
-    // handed in here rather than checked separately afterwards.
-    const artifacts = await ingestBuild(
-      files.build[0]!.buffer,
-      slug,
-      mediaFiles.map((f) => f.buffer),
-    );
-
-    const mediaCids = await Promise.all(
-      mediaFiles.map((f) => pinFile(f.buffer, f.originalname, f.mimetype)),
-    );
-    const coverCid = body.coverMediaIndex !== undefined ? mediaCids[body.coverMediaIndex] : undefined;
-
-    const [game] = await db
-      .insert(games)
-      .values({
-        studioId: studio.id,
+      // Unpack, moderate, pin — one function, and the same one every later build
+      // version goes through (services/games/builds.ts). It fails closed: nothing
+      // is pinned and nothing is inserted until the check passes, and the
+      // screenshots go through that same single check, which is why they are
+      // handed in here rather than checked separately afterwards.
+      const artifacts = await ingestBuild(
+        files.build[0]!.path,
         slug,
-        title: body.title,
-        tagline: body.tagline,
-        description: body.description,
-        tags: body.tags,
-        coverCid,
-        coverSeed: Math.floor(Math.random() * 1_000_000),
-        buildCid: artifacts.buildCid,
-        buildZipCid: artifacts.buildZipCid,
-        buildSizeKb: artifacts.buildSizeKb,
-        priceUnits: body.priceUnits,
-        priceAsset: body.priceAsset,
-        status: "draft",
-      })
-      .returning();
+        mediaFiles.map((f) => f.path),
+      );
 
-    // Version 1, recorded the same way version 2 will be: a row in the build
-    // history, the mirror of it on `games`, and the zip kept where it can
-    // actually be served. See services/games/builds.ts.
-    await commitBuild(game!.id, artifacts, { label: body.buildLabel });
+      const mediaCids = await Promise.all(
+        mediaFiles.map(async (f) => pinFile(await readFile(f.path), f.originalname, f.mimetype)),
+      );
+      const coverCid = body.coverMediaIndex !== undefined ? mediaCids[body.coverMediaIndex] : undefined;
 
-    // Resolve each share to whoever it belongs to, creating the studio
-    // membership for anyone named only by email. That row *is* the invite —
-    // /invite/:id takes a studio_members id — so publishing with a teammate
-    // added by email is what sends them one, with no separate call.
-    const resolved = await resolveSplitRecipients(studio.id, body.splits);
+      const [game] = await db
+        .insert(games)
+        .values({
+          studioId: studio.id,
+          slug,
+          title: body.title,
+          tagline: body.tagline,
+          description: body.description,
+          tags: body.tags,
+          coverCid,
+          coverSeed: Math.floor(Math.random() * 1_000_000),
+          buildCid: artifacts.buildCid,
+          buildZipCid: artifacts.buildZipCid,
+          buildSizeKb: artifacts.buildSizeKb,
+          priceUnits: body.priceUnits,
+          priceAsset: body.priceAsset,
+          status: "draft",
+        })
+        .returning();
 
-    // Someone named only by email now has a membership row, and that row is
-    // the invite. Telling them is the half that was missing: the share is
-    // theirs from the first sale whether or not they ever accept, so the
-    // message is a fact rather than a request.
-    for (const share of resolved) {
-      if (!share.invited) continue;
-      void emailStudioInvite({
-        to: share.invited.email,
-        handle: share.invited.handle,
-        studioName: studio.name,
-        inviteId: share.invited.id,
-        gameTitle: body.title,
-        pct: share.pct,
-      });
-    }
+      // Version 1, recorded the same way version 2 will be: a row in the build
+      // history, the mirror of it on `games`, and the zip kept where it can
+      // actually be served. See services/games/builds.ts.
+      await commitBuild(game!.id, artifacts, { label: body.buildLabel });
 
-    await db.insert(splits).values(
-      resolved.map((s) => ({
-        gameId: game!.id,
-        wallet: s.wallet,
-        studioMemberId: s.studioMemberId,
-        userId: s.userId,
-        handle: s.handle,
-        role: s.role,
-        pct: s.pct,
-      })),
-    );
+      // Resolve each share to whoever it belongs to, creating the studio
+      // membership for anyone named only by email. That row *is* the invite —
+      // /invite/:id takes a studio_members id — so publishing with a teammate
+      // added by email is what sends them one, with no separate call.
+      const resolved = await resolveSplitRecipients(studio.id, body.splits);
 
-    if (mediaCids.length > 0) {
-      await db.insert(gameMedia).values(
-        mediaCids.map((cid, i) => ({
+      // Someone named only by email now has a membership row, and that row is
+      // the invite. Telling them is the half that was missing: the share is
+      // theirs from the first sale whether or not they ever accept, so the
+      // message is a fact rather than a request.
+      for (const share of resolved) {
+        if (!share.invited) continue;
+        void emailStudioInvite({
+          to: share.invited.email,
+          handle: share.invited.handle,
+          studioName: studio.name,
+          inviteId: share.invited.id,
+          gameTitle: body.title,
+          pct: share.pct,
+        });
+      }
+
+      await db.insert(splits).values(
+        resolved.map((s) => ({
           gameId: game!.id,
-          kind: (mediaFiles[i]!.mimetype.startsWith("video/") ? "video" : "image") as "video" | "image",
-          cid,
-          position: i,
+          wallet: s.wallet,
+          studioMemberId: s.studioMemberId,
+          userId: s.userId,
+          handle: s.handle,
+          role: s.role,
+          pct: s.pct,
         })),
       );
+
+      if (mediaCids.length > 0) {
+        await db.insert(gameMedia).values(
+          mediaCids.map((cid, i) => ({
+            gameId: game!.id,
+            kind: (mediaFiles[i]!.mimetype.startsWith("video/") ? "video" : "image") as "video" | "image",
+            cid,
+            position: i,
+          })),
+        );
+      }
+
+      // The invites created by this upload come back with the draft, because
+      // there is no mail server here and the publish screen has to be able to
+      // show what each person would have received.
+      const invited = resolved.map((s) => s.invited).filter((i) => i !== undefined);
+
+      res.status(201).json({ ...game, invited });
+    } finally {
+      await Promise.allSettled(uploadedPaths.map((p) => rm(p, { force: true })));
     }
-
-    // The invites created by this upload come back with the draft, because
-    // there is no mail server here and the publish screen has to be able to
-    // show what each person would have received.
-    const invited = resolved.map((s) => s.invited).filter((i) => i !== undefined);
-
-    res.status(201).json({ ...game, invited });
   }),
 );
 

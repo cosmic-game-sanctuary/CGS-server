@@ -1,6 +1,10 @@
+import { createWriteStream } from "node:fs";
+import { mkdtemp, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { pipeline } from "node:stream/promises";
 import JSZip from "jszip";
 import { Errors } from "../../lib/errors.js";
-import type { PinFile } from "./pinata.js";
 
 const MIME_BY_EXT: Record<string, string> = {
   html: "text/html",
@@ -18,18 +22,57 @@ const MIME_BY_EXT: Record<string, string> = {
   data: "application/octet-stream",
 };
 
-function mimeFor(path: string): string {
-  const ext = path.split(".").pop()?.toLowerCase() ?? "";
+function mimeFor(buildPath: string): string {
+  const ext = buildPath.split(".").pop()?.toLowerCase() ?? "";
   return MIME_BY_EXT[ext] ?? "application/octet-stream";
 }
 
-// unpacks an uploaded build zip into the flat file list Pinata's directory
-// upload wants. Requires index.html at the effective root — without it
-// there's nothing to boot in an iframe. Matches the frontend's own local
-// preview behaviour: a build zipped as one wrapper folder (a common export
-// habit) gets that one folder stripped so index.html still lands at the
-// CID root, not a level down from it.
-export async function unpackBuild(zipBuffer: Buffer): Promise<PinFile[]> {
+/**
+ * How much decompressed build content one publish may write to disk.
+ *
+ * This used to be a heap budget: every decompressed entry was collected into
+ * a JS array, so the whole build sat in memory at once, and that — not the
+ * compressed zip — is what OOM-killed a 512MB instance past ~90MB. Streaming
+ * each entry straight to a temp file (below) means decompressed bytes never
+ * accumulate in the heap; only one entry's stream chunks are live at a time.
+ * So this is a disk budget now. Render's actual ephemeral-disk ceiling on the
+ * free tier hasn't been measured — raise this only after confirming headroom
+ * there, not just in RAM.
+ */
+const MAX_UNPACKED_BYTES = 250 * 1024 * 1024;
+
+export type UnpackedFile = {
+  /** Where the decompressed bytes live right now — a temp file, not the build's own path. */
+  diskPath: string;
+  /** The path inside the build, e.g. "assets/sprite.png" — what Pinata sees as the filename. */
+  buildPath: string;
+  mimeType: string;
+  size: number;
+};
+
+export type UnpackedBuild = {
+  files: UnpackedFile[];
+  /** Deletes the temp directory. Always call this, success or failure. */
+  cleanup: () => Promise<void>;
+};
+
+/**
+ * Unpacks a build zip into a temp directory, one entry at a time, streaming
+ * each straight to disk. Requires index.html at the effective root — without
+ * it there's nothing to boot in an iframe. Matches the frontend's own local
+ * preview behaviour: a build zipped as one wrapper folder (a common export
+ * habit) gets that one folder stripped so index.html still lands at the
+ * directory CID's root, not a level down from it.
+ *
+ * Takes the zip as a buffer rather than a path: JSZip has to read the central
+ * directory at the end of the file before it knows what entries exist, which
+ * needs random access into the whole compressed zip regardless — there's no
+ * avoiding holding that once. The caller already has it in memory to pin the
+ * zip itself, so handing over the same buffer costs nothing extra; reading it
+ * a second time from disk here would risk both copies being live at once
+ * depending on when GC runs.
+ */
+export async function unpackBuild(zipBuffer: Buffer): Promise<UnpackedBuild> {
   const zip = await JSZip.loadAsync(zipBuffer);
 
   const entries = Object.values(zip.files).filter(
@@ -47,16 +90,41 @@ export async function unpackBuild(zipBuffer: Buffer): Promise<PinFile[]> {
   const singleWrapper = allNested && topLevelFolders.size === 1;
   const stripPrefix = singleWrapper ? `${[...topLevelFolders][0]}/` : "";
 
-  const files: PinFile[] = [];
-  for (const entry of entries) {
-    const path = stripPrefix ? entry.name.slice(stripPrefix.length) : entry.name;
-    const buffer = await entry.async("nodebuffer");
-    files.push({ path, buffer, mimeType: mimeFor(path) });
-  }
+  const tempDir = await mkdtemp(path.join(tmpdir(), "cgs-build-"));
+  const cleanup = () => rm(tempDir, { recursive: true, force: true });
 
-  if (!files.some((f) => f.path === "index.html")) {
-    throw Errors.validationFailed({ build: "no index.html at the build's root" });
-  }
+  try {
+    const files: UnpackedFile[] = [];
+    let unpackedBytes = 0;
 
-  return files;
+    for (const [index, entry] of entries.entries()) {
+      const buildPath = stripPrefix ? entry.name.slice(stripPrefix.length) : entry.name;
+      const diskPath = path.join(tempDir, String(index));
+
+      await pipeline(entry.nodeStream("nodebuffer"), createWriteStream(diskPath));
+      const { size } = await stat(diskPath);
+
+      // Checked against bytes actually written, not the zip's own metadata —
+      // this doesn't depend on JSZip's internal entry shape, only on what
+      // landed on disk. Worst case this writes one oversized entry before
+      // refusing, which costs disk, not heap.
+      unpackedBytes += size;
+      if (unpackedBytes > MAX_UNPACKED_BYTES) {
+        throw Errors.validationFailed({
+          build: `this build unpacks to over ${Math.round(MAX_UNPACKED_BYTES / 1024 / 1024)}MB, which is more than this server can process at once. Try exporting with compression enabled, or trimming unused assets.`,
+        });
+      }
+
+      files.push({ diskPath, buildPath, mimeType: mimeFor(buildPath), size });
+    }
+
+    if (!files.some((f) => f.buildPath === "index.html")) {
+      throw Errors.validationFailed({ build: "no index.html at the build's root" });
+    }
+
+    return { files, cleanup };
+  } catch (err) {
+    await cleanup();
+    throw err;
+  }
 }
