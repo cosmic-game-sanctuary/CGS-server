@@ -110,6 +110,25 @@ const envSchema = z.object({
   // default to rejecting the alias auto-creation an address would trigger.
   X402_PAY_TO: hederaAccountId,
 
+  // Arc, being built alongside the Hedera config above until Stages 4-6 take
+  // over its callers. Optional so a checkout that predates the port still boots;
+  // services/arc/client.ts names exactly what is missing the first time it is
+  // used. Becomes required in the stage that removes the Hedera block.
+  ARC_NETWORK: z.enum(["testnet", "mainnet"]).default("testnet"),
+  // One URL, or several comma-separated: the first is tried first and the rest
+  // take over when it errors or rate-limits. viem ships testnet RPCs but none
+  // for mainnet, so mainnet must set this.
+  ARC_RPC_URL: z
+    .string()
+    .optional()
+    .refine((v) => !v || v.split(",").every((u) => URL.canParse(u.trim())), "must be one or more comma-separated URLs"),
+  ARC_OPERATOR_KEY: z
+    .string()
+    .regex(/^0x[a-fA-F0-9]{64}$/, "must be a raw 32-byte private key")
+    .optional(),
+  ARC_GAME_REGISTRY: evmAddress.optional(),
+  ARC_GAME_KEY: evmAddress.optional(),
+
   HCS_LISTINGS_TOPIC: z.string().optional(),
   HCS_SALES_TOPIC: z.string().optional(),
   HCS_AGENT_IDENTITY_TOPIC: z.string().optional(),

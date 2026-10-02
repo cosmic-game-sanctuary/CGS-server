@@ -26,7 +26,8 @@
     "reports:content": "tsx scripts/resolve-content-report.ts",
     "catalog:clean": "tsx scripts/clean-catalog.ts",
     "account:reset": "tsx scripts/reset-account.ts",
-    "ens:migrate": "tsx scripts/ens-hackathon-migrate.ts"
+    "ens:migrate": "tsx scripts/ens-hackathon-migrate.ts",
+    "arc:check": "tsx scripts/arc-chain-check.ts"
   },
   "repository": {
     "type": "git",
