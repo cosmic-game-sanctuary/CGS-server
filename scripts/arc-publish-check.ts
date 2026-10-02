@@ -60,6 +60,12 @@ const check = (name: string, ok: boolean, detail?: unknown) => {
 const fmt = (w: bigint) => `${formatUnits(w, 18)} USDC`;
 const client = publicClient();
 
+// What each on-chain step of Stage 5 actually costs the platform, measured from
+// receipts rather than estimated. Printed at the end; these are the numbers the
+// cost model in docs/arc-port.md is checked against.
+const costs: { label: string; hash: string | null }[] = [];
+const bill = (label: string, hash: string | null | undefined) => costs.push({ label, hash: hash ?? null });
+
 // ── a studio with three people on the splits ────────────────────────────────
 // Three fresh addresses, so every payee starts with nothing at all — which is
 // the case that matters for claiming.
@@ -120,6 +126,8 @@ console.log(`   vault ${published.vault}`);
 console.log(`   deploy ${published.vaultTxHash}`);
 console.log(`   listing ${published.listingTxHash}`);
 
+bill("deploy a game's vault", published.vaultTxHash);
+bill("list it on GameRegistry", published.listingTxHash);
 check("a vault was deployed", published.vault !== undefined && published.vault !== null);
 check("the factory records it against this game", (await existingVault(gameId)) === published.vault);
 
@@ -188,15 +196,18 @@ console.log("\n== a price change, a delisting and a relisting ==");
 const { changePrice } = await import("../src/services/games/listing.js");
 const priced = await db.query.games.findFirst({ where: eq(games.id, game!.id) });
 const changed = await changePrice(priced!, 250_000, null);
+bill("change the price", changed.change.chainTxHash);
 check("a price change is recorded on chain", changed.announced);
 check("and the row carries the transaction that recorded it", changed.change.chainTxHash !== null);
 
 const { announce } = await import("../src/services/games/listing.js");
 const delisted = await announce({ ...priced!, priceUnits: 250_000 }, "delisted");
+bill("delist", delisted);
 check("a delisting is recorded on chain", delisted !== null);
 check("and the registry now reports the game as delisted", (await getListing(gameId)).delisted);
 
 const relisted = await announce({ ...priced!, priceUnits: 250_000 }, "relisted");
+bill("relist", relisted);
 check("a relisting is recorded on chain", relisted !== null);
 check("and the registry reports it listed again", !(await getListing(gameId)).delisted);
 
@@ -204,6 +215,7 @@ const demanded = await announce({ ...priced!, priceUnits: 250_000 }, "demand", {
   wishlistCount: 137,
   milestone: 100,
 });
+bill("publish a demand milestone", demanded);
 check("a demand milestone is published too", demanded !== null);
 
 // Restore the price, so the sale below is for the amount the vault expects.
@@ -285,6 +297,7 @@ let totalPaid = 0n;
 for (const p of payees) {
   const expectedWei = afterSale.payees.find((v) => getAddress(v.address) === getAddress(p.account.address))!.claimableWei;
   const result = await claimFromVault(p.account.address, game!.id);
+  if (p === payees[0]) bill("release one payee's share (claimFor)", result.txHash);
   const balance = await client.getBalance({ address: p.account.address });
   totalPaid += balance;
   console.log(`   ${p.handle.padEnd(9)} claimed ${fmt(balance)}  ${result.txHash}`);
@@ -322,6 +335,21 @@ check(
   final.payees.reduce((sum, p) => sum + p.claimedWei + p.claimableWei, 0n) === final.totalReceivedWei,
 );
 check("the vault's remaining balance is exactly what is still owed", (await client.getBalance({ address: published.vault })) === stillOwed);
+
+console.log("\n== measured cost, paid by the platform ==");
+let total = 0n;
+for (const { label, hash } of costs) {
+  if (!hash) {
+    console.log(`   ${label.padEnd(36)} (nothing sent — already done)`);
+    continue;
+  }
+  const r = await client.getTransactionReceipt({ hash: hash as `0x${string}` });
+  const cost = r.gasUsed * r.effectiveGasPrice;
+  total += cost;
+  console.log(`   ${label.padEnd(36)} ${formatUnits(cost, 18).slice(0, 10)} USDC`);
+}
+console.log(`   ${"—".repeat(36)} ${formatUnits(total, 18).slice(0, 10)} USDC`);
+console.log("   (a buyer pays none of this, and Circle pays the settlement gas)");
 
 console.log(`\ngame id ${game!.id} — left in the database on purpose`);
 console.log(`vault ${published.vault}`);
