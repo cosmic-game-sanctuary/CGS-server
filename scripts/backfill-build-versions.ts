@@ -45,7 +45,7 @@ async function main() {
       buildSizeKb: game.buildSizeKb,
       // Published before the topic carried build messages, so there is no
       // announcement to point at. Null is the truthful answer.
-      hcsTxId: null,
+      chainTxHash: null,
       createdAt: game.publishedAt ?? game.createdAt,
     });
     await db.update(games).set({ buildVersion: 1 }).where(eq(games.id, game.id));

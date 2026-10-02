@@ -1,14 +1,12 @@
 import { Router } from "express";
-import { eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../db/client.js";
-import { studioMembers, studios, notifications, splits } from "../db/schema.js";
+import { studioMembers, studios, notifications, splits, games } from "../db/schema.js";
 import { requireAuth } from "../middleware/auth.middleware.js";
 import { asyncHandler } from "../lib/asyncHandler.js";
 import { AppError, Errors } from "../lib/errors.js";
 import { maskEmail } from "../lib/display.js";
 import { param } from "../lib/params.js";
-import { settleHeldPayouts } from "../services/games/fulfil.js";
-import { resolveHederaAccount } from "../services/users/repo.js";
 import logger from "../utils/logger.utils.js";
 
 const inviteRouter = Router({ caseSensitive: true, strict: true });
@@ -83,34 +81,41 @@ inviteRouter.post(
       .where(eq(studioMembers.id, member.id))
       .returning();
 
-    // Their address is known from this moment, so every split they were named
-    // on stops being a placeholder. Backfilled across all of them, not just
-    // this studio's — a member row is per studio, but the share is theirs.
-    await db
-      .update(splits)
-      .set({ wallet: req.auth!.evmAddress, userId: req.auth!.id })
-      .where(eq(splits.studioMemberId, member.id));
+    // Link every share of theirs to the account they just made, across all
+    // studios — a member row is per studio, but the share is theirs.
+    //
+    // **The address is only rewritten on games that are still drafts.** A
+    // published game's split lives in a deployed vault that names a specific
+    // address, and that address cannot be changed by anyone, us included. If
+    // they were invited at one email and signed in with another, their new
+    // address is not the one the contract pays, and overwriting the row would
+    // make this dashboard claim a destination the chain disagrees with. The
+    // share is not lost either way: it accrues at the address pre-generated for
+    // the invited email, which is theirs the moment they sign in with it.
+    const theirs = await db.query.splits.findMany({
+      where: eq(splits.studioMemberId, member.id),
+      columns: { id: true, gameId: true },
+    });
+    if (theirs.length > 0) {
+      await db.update(splits).set({ userId: req.auth!.id }).where(eq(splits.studioMemberId, member.id));
 
-    // Anything that sold while they hadn't claimed it was held rather than
-    // paid. This is where they get it — and it doesn't wait on them having a
-    // Hedera account already: `settleHeldPayouts` pays their EVM alias
-    // directly when no account resolves, which creates the account as a side
-    // effect of this very payment. `resolveHederaAccount` is still tried
-    // first purely because it's cheap and caches a real answer for every
-    // other route that needs one later; nothing here is gated on it
-    // succeeding. Deliberately not awaited into the response: it is one
-    // transfer per sale and the screen shouldn't wait, and a failure leaves
-    // the row `failed` for `npm run splits:retry`.
-    void resolveHederaAccount({
-      id: req.auth!.id,
-      evmAddress: req.auth!.evmAddress,
-      hederaAccountId: req.auth!.hederaAccountId,
-    })
-      .then((accountId) => settleHeldPayouts(member.id, { accountId, evmAddress: req.auth!.evmAddress }))
-      .then((settled) => {
-        if (settled > 0) logger.info({ memberId: member.id, settled }, "settled held payouts on invite accept");
-      })
-      .catch((err) => logger.error({ err, memberId: member.id }, "settling held payouts failed"));
+      const drafts = await db.query.games.findMany({
+        where: and(inArray(games.id, [...new Set(theirs.map((t) => t.gameId))]), eq(games.status, "draft")),
+        columns: { id: true },
+      });
+      const draftSplitIds = theirs.filter((t) => drafts.some((d) => d.id === t.gameId)).map((t) => t.id);
+      if (draftSplitIds.length > 0) {
+        await db.update(splits).set({ wallet: req.auth!.evmAddress }).where(inArray(splits.id, draftSplitIds));
+      }
+
+      const published = theirs.length - draftSplitIds.length;
+      if (published > 0) {
+        logger.info(
+          { memberId: member.id, published },
+          "left the payout address alone on already-published games — their vaults are immutable",
+        );
+      }
+    }
 
     const studio = await db.query.studios.findFirst({ where: eq(studios.id, member.studioId) });
     await db.insert(notifications).values({

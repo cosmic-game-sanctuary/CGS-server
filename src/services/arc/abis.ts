@@ -58,6 +58,17 @@ export const gameRegistryAbi = [
   },
   {
     type: "function",
+    name: "announceDemand",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "gameId", type: "bytes32" },
+      { name: "wishlistCount", type: "uint32" },
+      { name: "milestone", type: "uint32" },
+    ],
+    outputs: [],
+  },
+  {
+    type: "function",
     name: "vaultOf",
     stateMutability: "view",
     inputs: [{ name: "", type: "bytes32" }],
@@ -118,6 +129,15 @@ export const gameRegistryAbi = [
     inputs: [
       { name: "gameId", type: "bytes32", indexed: true },
       { name: "priceUnits", type: "uint256", indexed: false },
+    ],
+  },
+  {
+    type: "event",
+    name: "Demand",
+    inputs: [
+      { name: "gameId", type: "bytes32", indexed: true },
+      { name: "wishlistCount", type: "uint32", indexed: false },
+      { name: "milestone", type: "uint32", indexed: false },
     ],
   },
   { type: "error", name: "NotOperator", inputs: [] },
@@ -226,6 +246,16 @@ export const splitVaultAbi = [
     inputs: [],
     outputs: [],
   },
+  // Anyone may call this, and the money still goes only to `payee`. It is how
+  // a developer whose first earnings are in the vault gets paid at all: gas on
+  // Arc is USDC, so they cannot afford the transaction `claim()` would need.
+  {
+    type: "function",
+    name: "claimFor",
+    stateMutability: "nonpayable",
+    inputs: [{ name: "payee", type: "address" }],
+    outputs: [],
+  },
   {
     type: "function",
     name: "payeeCount",
@@ -290,6 +320,49 @@ export const splitVaultAbi = [
       { name: "amount", type: "uint256", indexed: false },
     ],
   },
+  { type: "error", name: "NothingOwed", inputs: [] },
+  { type: "error", name: "TransferFailed", inputs: [] },
+  { type: "error", name: "ZeroAddress", inputs: [] },
+] as const;
+
+export const vaultFactoryAbi = [
+  {
+    type: "function",
+    name: "deploy",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "gameId", type: "bytes32" },
+      { name: "recipients", type: "address[]" },
+      { name: "bps", type: "uint16[]" },
+      { name: "platform", type: "address" },
+      { name: "platformBps", type: "uint16" },
+    ],
+    outputs: [{ name: "vault", type: "address" }],
+  },
+  {
+    type: "function",
+    name: "vaultOf",
+    stateMutability: "view",
+    inputs: [{ name: "", type: "bytes32" }],
+    outputs: [{ type: "address" }],
+  },
+  {
+    type: "event",
+    name: "VaultDeployed",
+    inputs: [
+      { name: "gameId", type: "bytes32", indexed: true },
+      { name: "vault", type: "address", indexed: false },
+      { name: "payees", type: "address[]", indexed: false },
+      { name: "bps", type: "uint16[]", indexed: false },
+    ],
+  },
+  // SplitVault's constructor reverts bubble up through the factory, so the
+  // factory's callers need to be able to name them too.
+  { type: "error", name: "ZeroAddress", inputs: [] },
+  { type: "error", name: "LengthMismatch", inputs: [] },
+  { type: "error", name: "DuplicateRecipient", inputs: [] },
+  { type: "error", name: "BpsOverflow", inputs: [] },
+  { type: "error", name: "BpsMismatch", inputs: [] },
 ] as const;
 
 export const erc20Abi = [

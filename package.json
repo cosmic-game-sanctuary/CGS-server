@@ -14,7 +14,6 @@
     "ens:setup": "tsx scripts/ens-resolver-setup.ts",
     "db:studio": "drizzle-kit studio",
     "topics:create": "tsx scripts/create-hcs-topics.ts",
-    "splits:retry": "tsx scripts/retry-failed-splits.ts",
     "seed:dev": "tsx scripts/seed-dev.ts",
     "seed:wipe": "tsx scripts/seed-dev.ts --wipe",
     "builds:backfill": "tsx scripts/backfill-build-zips.ts",
@@ -30,7 +29,8 @@
     "arc:check": "tsx scripts/arc-chain-check.ts",
     "arc:check:eip3009": "tsx scripts/arc-eip3009-check.ts",
     "arc:check:x402": "tsx scripts/arc-x402-check.ts",
-    "arc:check:purchase": "tsx scripts/arc-purchase-check.ts"
+    "arc:check:purchase": "tsx scripts/arc-purchase-check.ts",
+    "arc:check:publish": "tsx scripts/arc-publish-check.ts"
   },
   "repository": {
     "type": "git",

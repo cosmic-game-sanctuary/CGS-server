@@ -162,7 +162,7 @@ export async function activatePromotion(promotion: Promotion): Promise<Promotion
 
   const [withTx] = await db
     .update(gamePromotions)
-    .set({ hcsStartTxId: result.change.hcsTxId, updatedAt: new Date() })
+    .set({ hcsStartTxId: result.change.chainTxHash, updatedAt: new Date() })
     .where(eq(gamePromotions.id, claimed.id))
     .returning();
 
@@ -217,7 +217,7 @@ export async function endPromotion(
 
   const [withTx] = await db
     .update(gamePromotions)
-    .set({ hcsEndTxId: result.change.hcsTxId, updatedAt: new Date() })
+    .set({ hcsEndTxId: result.change.chainTxHash, updatedAt: new Date() })
     .where(eq(gamePromotions.id, claimed.id))
     .returning();
 

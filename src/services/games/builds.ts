@@ -114,7 +114,7 @@ export async function nextVersion(gameId: string): Promise<number> {
 export async function commitBuild(
   gameId: string,
   artifacts: BuildArtifacts,
-  meta: { label?: string | null; notes?: string | null; hcsTxId?: string | null } = {},
+  meta: { label?: string | null; notes?: string | null; chainTxHash?: string | null } = {},
 ) {
   const version = await nextVersion(gameId);
 
@@ -128,7 +128,7 @@ export async function commitBuild(
       buildCid: artifacts.buildCid,
       buildZipCid: artifacts.buildZipCid,
       buildSizeKb: artifacts.buildSizeKb,
-      hcsTxId: meta.hcsTxId ?? null,
+      chainTxHash: meta.chainTxHash ?? null,
     })
     .returning();
 
@@ -163,7 +163,7 @@ export async function listBuilds(gameId: string) {
     notes: b.notes,
     buildCid: b.buildCid,
     buildSizeKb: b.buildSizeKb,
-    hcsTxId: b.hcsTxId,
+    chainTxHash: b.chainTxHash,
     createdAt: b.createdAt,
   }));
 }

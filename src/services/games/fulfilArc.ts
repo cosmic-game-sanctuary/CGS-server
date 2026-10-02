@@ -5,7 +5,7 @@ import { games, gameKeys, sales } from "../../db/schema.js";
 import { keyAddress } from "../arc/client.js";
 import { mintKey, ownsGame } from "../arc/keys.js";
 import { gameIdFor } from "../arc/registry.js";
-import { notifyStudio } from "./fulfil.js";
+import { notifyStudio } from "./saleNotice.js";
 import logger from "../../utils/logger.utils.js";
 
 type Game = typeof games.$inferSelect;

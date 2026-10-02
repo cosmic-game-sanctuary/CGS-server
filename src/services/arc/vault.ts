@@ -1,6 +1,6 @@
-import type { Address, ContractFunctionParameters } from "viem";
+import type { Address, ContractFunctionParameters, Hex } from "viem";
 import { splitVaultAbi } from "./abis.js";
-import { publicClient, weiToUnits } from "./client.js";
+import { confirm, feeOverrides, operator, publicClient, walletClient, weiToUnits, withGasHeadroom } from "./client.js";
 
 export type VaultPayee = {
   address: Address;
@@ -62,4 +62,41 @@ export async function getVaultState(vault: Address): Promise<VaultState> {
   });
 
   return { vault, totalReceivedWei, remainderPayee, payees };
+}
+
+/**
+ * Release a payee's share, with the platform paying the gas.
+ *
+ * Needed because gas on Arc is USDC: a developer whose first earnings are still
+ * in the vault holds nothing, so they cannot afford the transaction that would
+ * release them. The money goes to `payee` and nowhere else — the contract takes
+ * no destination argument — so this costs us a fraction of a cent and gives us
+ * no power over the money. `claimFor` is open to anyone, so a developer who
+ * would rather not involve us can pay their own gas or have anyone else do it.
+ *
+ * Simulated first, which turns "nothing to claim" into the contract's own
+ * `NothingOwed` before any gas is spent.
+ */
+export async function claimFor(vault: Address, payee: Address): Promise<{ txHash: Hex; amountWei: bigint }> {
+  const client = publicClient();
+
+  const amountWei = await client.readContract({
+    address: vault,
+    abi: splitVaultAbi,
+    functionName: "claimable",
+    args: [payee],
+  });
+
+  const { request } = await client.simulateContract({
+    account: operator(),
+    address: vault,
+    abi: splitVaultAbi,
+    functionName: "claimFor",
+    args: [payee],
+    ...(await feeOverrides()),
+  });
+
+  const txHash = await walletClient().writeContract(await withGasHeadroom(request));
+  await confirm(txHash);
+  return { txHash, amountWei };
 }

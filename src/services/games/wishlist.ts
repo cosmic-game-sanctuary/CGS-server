@@ -93,11 +93,11 @@ export async function announceDemandIfMilestone(game: Game): Promise<number | nu
   const reached = MILESTONES.filter((m) => m <= count).pop() ?? 0;
   if (reached <= game.demandMilestone) return null;
 
-  const hcsTxId = await announce(game, "demand", { wishlistCount: count, milestone: reached });
+  const chainTxHash = await announce(game, "demand", { wishlistCount: count, milestone: reached });
   // Recorded even when the announcement failed, so a topic outage does not turn
   // into the same milestone being retried on every subsequent save.
   await db.update(games).set({ demandMilestone: reached }).where(eq(games.id, game.id));
-  logger.info({ gameId: game.id, count, milestone: reached, hcsTxId }, "wishlist demand announced");
+  logger.info({ gameId: game.id, count, milestone: reached, chainTxHash }, "wishlist demand announced");
   return reached;
 }
 

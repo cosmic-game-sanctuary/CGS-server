@@ -35,6 +35,9 @@ export type ListingEvent = { blockNumber: bigint; logIndex: number; txHash: Hex 
   | { kind: "build_updated"; gameId: Hex; version: number; buildCid: string }
   | { kind: "delisted"; gameId: Hex }
   | { kind: "relisted"; gameId: Hex; priceUnits: bigint }
+  // Not price-bearing. A reader deciding whether to buy must not treat this as
+  // an offer — it says how many people want the game, not what it costs.
+  | { kind: "demand"; gameId: Hex; wishlistCount: number; milestone: number }
 );
 
 const looksLikeRangeLimit = (err: unknown) =>
@@ -73,6 +76,8 @@ async function listingWindow(fromBlock: bigint, toBlock: bigint): Promise<Listin
         return { ...at, kind: "delisted", ...l.args };
       case "Relisted":
         return { ...at, kind: "relisted", ...l.args };
+      case "Demand":
+        return { ...at, kind: "demand", ...l.args };
     }
   });
 }

@@ -21,7 +21,8 @@ type RegistryWrite =
   | { fn: "setPrice"; args: readonly [Hex, bigint, bigint, bigint] }
   | { fn: "updateBuild"; args: readonly [Hex, number, string] }
   | { fn: "delist"; args: readonly [Hex] }
-  | { fn: "relist"; args: readonly [Hex, bigint] };
+  | { fn: "relist"; args: readonly [Hex, bigint] }
+  | { fn: "announceDemand"; args: readonly [Hex, number, number] };
 
 // Simulated first so a rejected call (wrong operator, already published) fails
 // with the contract's own error name instead of a bare revert after gas.
@@ -61,6 +62,11 @@ export const delistListing = (gameId: Hex) => write({ fn: "delist", args: [gameI
 
 export const relistListing = (gameId: Hex, priceUnits: bigint) =>
   write({ fn: "relist", args: [gameId, priceUnits] });
+
+// How many people are waiting, published once per threshold crossed. Public
+// because the count is the one thing a storefront normally keeps to itself.
+export const announceDemand = (gameId: Hex, wishlistCount: number, milestone: number) =>
+  write({ fn: "announceDemand", args: [gameId, wishlistCount, milestone] });
 
 const ZERO: Address = "0x0000000000000000000000000000000000000000";
 

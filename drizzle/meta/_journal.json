@@ -176,6 +176,20 @@
       "when": 1790936225708,
       "tag": "0023_light_mother_askani",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1790950963039,
+      "tag": "0024_busy_black_panther",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1790950992548,
+      "tag": "0025_sour_phantom_reporter",
+      "breakpoints": true
     }
   ]
 }

@@ -103,6 +103,41 @@ export function keyAddress(): Address {
   return env.ARC_GAME_KEY as Address;
 }
 
+/**
+ * Arc's block explorer, for the network we are on.
+ *
+ * Returned to the client alongside anything checkable, because "here is the
+ * transaction" is worth nothing without "and here is where to look it up". This
+ * is what replaces the `topicId` the HCS build handed back for the same reason.
+ */
+export function explorerUrl(): string {
+  return env.ARC_NETWORK === "mainnet" ? "https://explorer.arc.io" : "https://explorer.testnet.arc.io";
+}
+
+export const explorerTxUrl = (hash: string) => `${explorerUrl()}/tx/${hash}`;
+export const explorerAddressUrl = (address: string) => `${explorerUrl()}/address/${address}`;
+
+export function vaultFactoryAddress(): Address {
+  if (!env.ARC_VAULT_FACTORY) {
+    throw new ArcConfigError("ARC_VAULT_FACTORY", "The deployed VaultFactory — publishing a game needs it to create the game's vault.");
+  }
+  return env.ARC_VAULT_FACTORY as Address;
+}
+
+/**
+ * Where the platform's own share of every sale is paid.
+ *
+ * Defaults to the operator, which is wrong for production and right for now:
+ * the operator is a hot key that pays gas, and revenue should not accumulate on
+ * one. Set `ARC_PLATFORM_PAYOUT` to separate them. It is baked into each
+ * vault at publish and immutable thereafter, so changing it later only affects
+ * games published after the change — which is the correct behaviour, not a
+ * limitation.
+ */
+export function platformPayoutAddress(): Address {
+  return (env.ARC_PLATFORM_PAYOUT as Address | undefined) ?? operator().address;
+}
+
 // eth_estimateGas sizes a transaction against the state as it is right now. A
 // write that is estimated while its siblings are still in flight (three
 // purchases landing together) can be sized too tight and run out of gas on

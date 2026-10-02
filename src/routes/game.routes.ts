@@ -74,7 +74,9 @@ import {
   complete as completeArcPayment,
 } from "../services/arc/x402/browserPay.js";
 import { emailStudioInvite } from "../services/email/messages.js";
-import { createGameToken } from "../services/hedera/hts.js";
+import { addressForEmail } from "../services/privy/wallets.js";
+import { publishOnChain } from "../services/games/publishArc.js";
+import { explorerAddressUrl, registryAddress } from "../services/arc/client.js";
 import {
   trialEnabled,
   trialStatusFor,
@@ -506,10 +508,12 @@ function serializeGame(
 //   wallet         — an address or 0.0.x. You, or anyone who has signed in.
 //   studioMemberId — someone already on the studio, picked from the roster.
 //   email          — someone new. The row is created here and the invite is
-//                    that row; their share is held until they claim it.
+//                    that row, and a payout address is pre-generated for them
+//                    so their share accrues in the vault from the first sale
+//                    whether or not they ever accept.
 //
 // Requiring a wallet was the single thing stopping the splits editor from
-// doing what it exists for. See services/games/fulfil.ts#distributeSplits.
+// doing what it exists for. See services/privy/wallets.ts.
 const splitSchema = z
   .object({
     wallet: z.string().min(1).optional(),
@@ -572,8 +576,16 @@ type ResolvedSplit = {
  *
  * The wallet is looked up rather than trusted from the client wherever we can
  * know it: a member who has accepted has a user, and that user has an address.
- * A member who hasn't gets `wallet: null`, which is what makes their share
- * held rather than unpublishable.
+ *
+ * A member who *hasn't* accepted used to get `wallet: null`, and their share was
+ * held by us until they did. That cannot survive the move to Arc, where a game's
+ * split is a contract deployed at publish and a contract names addresses rather
+ * than people — an unnamed payee would mean either an unpublishable game or us
+ * holding someone's money, and the second is the thing this project exists not
+ * to do. So an invited collaborator gets a real address before they have ever
+ * signed in: Privy pre-generates an embedded wallet for their email, and they
+ * take control of it the first time they log in with that email. See
+ * services/privy/wallets.ts.
  */
 async function resolveSplitRecipients(
   studioId: string,
@@ -611,9 +623,15 @@ async function resolveSplitRecipients(
       ? await db.query.users.findFirst({ where: eq(users.id, member.userId) })
       : null;
 
+    // Pre-generated rather than left null, so the vault deployed at publish can
+    // name this person. Failing here fails the whole draft save on purpose: a
+    // split row with no address is a game that cannot be published, and finding
+    // that out now is better than at publish.
+    const wallet = user?.evmAddress ?? (await addressForEmail(member.email));
+
     out.push({
       ...base,
-      wallet: user?.evmAddress ?? null,
+      wallet,
       studioMemberId: member.id,
       userId: member.userId,
       invited: member.createdHere ? { id: member.id, email: member.email, handle: member.handle } : undefined,
@@ -803,23 +821,26 @@ gameRouter.post(
     const totalPct = gameSplits.reduce((sum, s) => sum + s.pct, 0);
     if (totalPct !== 100) throw Errors.splitsLocked(`splits total ${totalPct}, not 100 — this shouldn't happen`);
 
-    const symbol = game.slug.replace(/-/g, "").slice(0, 5).toUpperCase();
-    const tokenId = await createGameToken(game.title, symbol);
+    // The vault and the listing, in that order, before anything local changes —
+    // see services/games/publishArc.ts for why this way round. No per-game
+    // token is created any more: GameKey is one collection for every game, and
+    // a key is minted when someone buys rather than at publish.
+    const onChain = await publishOnChain(game);
 
     const [published] = await db
       .update(games)
-      .set({ status: "published", publishedAt: new Date(), htsTokenId: tokenId })
+      .set({
+        status: "published",
+        publishedAt: new Date(),
+        vaultAddress: onChain.vault,
+      })
       .where(eq(games.id, game.id))
       .returning();
 
-    // The listing *is* this message — see services/games/listing.ts. Sent
-    // through the same helper every later change uses, so a publish and a price
-    // change put the same shape on the topic.
-    const hcsTxId = await announce(published!, "listed");
-    if (hcsTxId) {
+    if (onChain.listingTxHash) {
       await db
         .update(gameBuilds)
-        .set({ hcsTxId })
+        .set({ chainTxHash: onChain.listingTxHash })
         .where(and(eq(gameBuilds.gameId, game.id), eq(gameBuilds.version, published!.buildVersion)));
     }
 
@@ -1560,7 +1581,10 @@ gameRouter.get(
       gameId: game.id,
       wishlistCount: await wishlistCount(game.id),
       announcedMilestone: game.demandMilestone,
-      topicId: env.HCS_LISTINGS_TOPIC ?? null,
+      // Where to check it. The count is published to GameRegistry as a `Demand`
+      // event, so anyone can read it without asking us.
+      registry: registryAddress(),
+      explorerUrl: explorerAddressUrl(registryAddress()),
     });
   }),
 );

@@ -216,7 +216,17 @@ for (let i = 0; i < 30 && held.length === 0; i++) {
 }
 check("a GameKey reached the buyer", held.length === 1, held.length);
 check("the key names this game", held[0]?.gameId === gameIdFor(game!.id), held[0]?.gameId);
-const keyRows = await db.query.gameKeys.findMany({ where: eq(gameKeys.gameId, game!.id) });
+// Polled rather than read once: the chain read above can see the key the moment
+// `mintKey` returns, while the row that records it is still being written. The
+// row trailing the chain by a few hundred milliseconds is correct behaviour —
+// the chain is what the mint actually changed — so the test waits for it rather
+// than asserting the two are updated atomically, which they are not and should
+// not be.
+let keyRows = await db.query.gameKeys.findMany({ where: eq(gameKeys.gameId, game!.id) });
+for (let i = 0; i < 20 && keyRows[0]?.mintStatus === "pending"; i++) {
+  await new Promise((r) => setTimeout(r, 500));
+  keyRows = await db.query.gameKeys.findMany({ where: eq(gameKeys.gameId, game!.id) });
+}
 check("the key row is confirmed, not left pending", keyRows[0]?.mintStatus === "confirmed", keyRows[0]?.mintStatus);
 
 // --- 4. paying twice ---------------------------------------------------------

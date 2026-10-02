@@ -1,4 +1,4 @@
-import { and, eq, inArray, desc } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { db } from "../../db/client.js";
 import {
   games,
@@ -6,13 +6,13 @@ import {
   splits,
   studios,
   studioMembers,
-  pendingPayouts,
   playSessions,
   reviews,
   likes,
 } from "../../db/schema.js";
 import { assetDecimals, toDisplayAmount } from "../../lib/display.js";
 import { env } from "../../config/env.js";
+import { claimsFor, type GameClaim } from "./claims.js";
 
 /**
  * What was earned, and what is still owed.
@@ -36,12 +36,14 @@ function money(units: number, asset: string) {
 }
 
 /**
- * A person's share of one sale, worked out the same way the payout does.
+ * A person's share of one sale, by the same arithmetic the vault uses: floor
+ * each percentage, then give the rounding remainder to the largest share.
  *
- * Deliberately mirrors distributeSplits: floor the percentage, then give the
- * rounding remainder to the largest share. If this drifted from that, the
- * dashboard would quietly disagree with the transfers people actually
- * received, which is worse than having no dashboard.
+ * Only used for games with no vault, and for the per-studio breakdown where
+ * there is no single payee to ask the chain about. Wherever a vault exists its
+ * own `owed()` overrides this — see claims.ts — because the contract is what
+ * actually pays and a dashboard that quietly disagrees with it is worse than
+ * no dashboard.
  */
 function shareOfSale(priceUnits: number, rows: { id: string; pct: number }[], splitId: string): number {
   const shares = rows.map((r) => ({ id: r.id, amount: Math.floor((priceUnits * r.pct) / 100) }));
@@ -79,7 +81,7 @@ export type GameEarnings = {
  * this as "your studio's earnings" would hide money from exactly the people
  * the splits feature exists for.
  */
-export async function personalEarnings(userId: string) {
+export async function personalEarnings(userId: string, evmAddress?: string) {
   const memberships = await db.query.studioMembers.findMany({
     where: eq(studioMembers.userId, userId),
     columns: { id: true, studioId: true },
@@ -98,7 +100,7 @@ export async function personalEarnings(userId: string) {
   const all = [...mine, ...byUser.filter((b) => !mine.some((m) => m.id === b.id))];
 
   if (all.length === 0) {
-    return { totals: emptyTotals(), games: [] as GameEarnings[], held: [], failed: [] };
+    return { totals: emptyTotals(), games: [] as GameEarnings[], claims: [] as GameClaim[] };
   }
 
   const gameIds = [...new Set(all.map((s) => s.gameId))];
@@ -147,7 +149,16 @@ export async function personalEarnings(userId: string) {
     };
   });
 
-  const { held, failed } = await owedTo(all.map((s) => s.id));
+  // The contract's own numbers, which are the ones that pay. `earned` above is
+  // computed from our sales rows and is what the dashboard has always shown;
+  // these come from the vault and are what the payee can actually withdraw and
+  // check on the explorer. Where a game has a vault, the vault is the truth.
+  const claims = evmAddress ? await claimsFor(evmAddress, gameIds) : [];
+  const claimByGame = new Map(claims.map((c) => [c.gameId, c]));
+  for (const game of perGame) {
+    const claim = claimByGame.get(game.gameId);
+    if (claim && game.yours) game.yours.earned = claim.earned;
+  }
 
   return {
     totals: {
@@ -155,13 +166,16 @@ export async function personalEarnings(userId: string) {
       gross: money(grossUnits, asset),
       sales: saleCount,
       games: perGame.length,
-      held: money(held.reduce((sum, h) => sum + h.amountUnits, 0), asset),
-      failed: money(failed.reduce((sum, h) => sum + h.amountUnits, 0), asset),
+      // What is in the vaults with this person's name on it, waiting to be
+      // taken out. There is no "held" or "failed" any more: money never passes
+      // through us, so there is no state where we owe someone a transfer we
+      // could not make.
+      claimable: money(claims.reduce((sum, c) => sum + c.claimable.units, 0), asset),
+      claimed: money(claims.reduce((sum, c) => sum + c.claimed.units, 0), asset),
       asset,
     },
     games: perGame.sort((a, b) => (b.yours?.earned.units ?? 0) - (a.yours?.earned.units ?? 0)),
-    held,
-    failed,
+    claims,
   };
 }
 
@@ -215,6 +229,10 @@ export async function studioEarnings(studioId: string) {
   // Who earned what, across the whole studio. Keyed by handle because that is
   // the identity on a split and the only one a collaborator without an account
   // has at all.
+  // `claimed` used to mean "has an address, so their share can be paid". Every
+  // payee has an address now — one is pre-generated when they are invited — so
+  // it is true for every row and kept only so the shape does not change under
+  // the frontend. See services/privy/wallets.ts.
   const people = new Map<string, { handle: string; role: string; earnedUnits: number; games: number; claimed: boolean }>();
   for (const game of gameRows) {
     const gameSplits = splitsByGame.get(game.id) ?? [];
@@ -232,8 +250,6 @@ export async function studioEarnings(studioId: string) {
     }
   }
 
-  const { held, failed } = await owedTo(allSplits.map((s) => s.id));
-
   return {
     studio: { id: studio.id, name: studio.name, slug: studio.slug },
     totals: {
@@ -241,51 +257,12 @@ export async function studioEarnings(studioId: string) {
       sales: saleCount,
       games: gameRows.length,
       published: gameRows.filter((g) => g.status === "published").length,
-      held: money(held.reduce((sum, h) => sum + h.amountUnits, 0), asset),
-      failed: money(failed.reduce((sum, h) => sum + h.amountUnits, 0), asset),
       asset,
     },
     games: perGame.sort((a, b) => b.gross.units - a.gross.units),
     people: [...people.values()]
       .map((p) => ({ ...p, earned: money(p.earnedUnits, asset) }))
       .sort((a, b) => b.earnedUnits - a.earnedUnits),
-    held,
-    failed,
-  };
-}
-
-/** Held and failed payouts against a set of splits, with enough to explain them. */
-async function owedTo(splitIds: string[]) {
-  if (splitIds.length === 0) return { held: [], failed: [] };
-
-  const rows = await db.query.pendingPayouts.findMany({
-    where: and(inArray(pendingPayouts.splitId, splitIds), inArray(pendingPayouts.status, ["held", "failed"])),
-    orderBy: desc(pendingPayouts.createdAt),
-  });
-  if (rows.length === 0) return { held: [], failed: [] };
-
-  const gameRows = await db.query.games.findMany({
-    where: inArray(games.id, [...new Set(rows.map((r) => r.gameId))]),
-    columns: { id: true, title: true, slug: true },
-  });
-  const titleById = new Map(gameRows.map((g) => [g.id, g]));
-
-  const shaped = rows.map((r) => ({
-    id: r.id,
-    gameId: r.gameId,
-    gameTitle: titleById.get(r.gameId)?.title ?? null,
-    gameSlug: titleById.get(r.gameId)?.slug ?? null,
-    amount: money(r.amountUnits, r.asset),
-    amountUnits: r.amountUnits,
-    asset: r.asset,
-    reason: r.reason,
-    since: r.createdAt,
-    status: r.status,
-  }));
-
-  return {
-    held: shaped.filter((r) => r.status === "held"),
-    failed: shaped.filter((r) => r.status === "failed"),
   };
 }
 
@@ -317,7 +294,7 @@ function emptyTotals() {
   const asset = env.X402_ASSET;
   return {
     earned: money(0, asset), gross: money(0, asset), sales: 0, games: 0,
-    held: money(0, asset), failed: money(0, asset), asset,
+    claimable: money(0, asset), claimed: money(0, asset), asset,
   };
 }
 

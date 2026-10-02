@@ -22,7 +22,7 @@ import { announce } from "../src/services/games/listing.js";
  */
 async function main() {
   const pending = await db.query.gamePriceChanges.findMany({
-    where: isNull(gamePriceChanges.hcsTxId),
+    where: isNull(gamePriceChanges.chainTxHash),
   });
 
   if (pending.length === 0) {
@@ -47,13 +47,13 @@ async function main() {
       continue;
     }
 
-    const hcsTxId = await announce(game, "price_changed", { fromUnits: change.fromUnits });
-    if (!hcsTxId) {
+    const chainTxHash = await announce(game, "price_changed", { fromUnits: change.fromUnits });
+    if (!chainTxHash) {
       console.log(`  fail  ${game.slug} — still can't reach the topic`);
       continue;
     }
-    await db.update(gamePriceChanges).set({ hcsTxId }).where(eq(gamePriceChanges.id, change.id));
-    console.log(`  ok    ${game.slug} ${change.fromUnits} -> ${change.toUnits}  ${hcsTxId}`);
+    await db.update(gamePriceChanges).set({ chainTxHash }).where(eq(gamePriceChanges.id, change.id));
+    console.log(`  ok    ${game.slug} ${change.fromUnits} -> ${change.toUnits}  ${chainTxHash}`);
     sent += 1;
   }
 

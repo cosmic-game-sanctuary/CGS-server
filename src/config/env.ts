@@ -128,6 +128,10 @@ const envSchema = z.object({
     .optional(),
   ARC_GAME_REGISTRY: evmAddress.optional(),
   ARC_GAME_KEY: evmAddress.optional(),
+  ARC_VAULT_FACTORY: evmAddress.optional(),
+  // Where the platform's cut lands. Defaults to the operator — see
+  // services/arc/client.ts#platformPayoutAddress for why that is a stopgap.
+  ARC_PLATFORM_PAYOUT: evmAddress.optional(),
 
   // Circle's Facilitator Service — it verifies each buyer authorization, screens
   // both parties, submits the USDC transfer and pays the settlement gas. One

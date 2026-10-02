@@ -20,14 +20,15 @@ import {
   transactionFor,
   USDC_ADDRESS,
 } from "../services/wallet/withdraw.js";
-import { settleHeldPayoutsForUser } from "../services/games/fulfil.js";
 import { personalEarnings } from "../services/earnings/report.js";
+import { claimFromVault, NothingToClaim } from "../services/earnings/claims.js";
 import { wishlistFor } from "../services/games/wishlist.js";
 import logger from "../utils/logger.utils.js";
 import { fallbackHandle, isReservedHandle, normaliseHandle } from "../lib/handle.js";
 import { gatewayUrl, pinFile, unpinByCid } from "../services/ipfs/pinata.js";
 import { checkImages } from "../services/moderation/csam.js";
 import { AppError } from "../lib/errors.js";
+import { param } from "../lib/params.js";
 
 const meRouter = Router({ caseSensitive: true, strict: true });
 
@@ -263,7 +264,10 @@ meRouter.get(
   "/earnings",
   requireAuth,
   asyncHandler(async (req, res) => {
-    res.json(await personalEarnings(req.auth!.id));
+    // The address matters: the claimable figures are read from each game's
+    // vault rather than from our own tables, so they are the numbers the
+    // contract will actually pay.
+    res.json(await personalEarnings(req.auth!.id, req.auth!.evmAddress));
   }),
 );
 
@@ -459,7 +463,34 @@ meRouter.get(
 // services/wallet/withdraw.ts.
 //
 // A developer's share of sales is not withdrawn here at all — it accrues in the
-// game's SplitVault and they call `claim()` on it themselves.
+// game's SplitVault and comes out through POST /api/me/claim/:gameId below.
+
+// --- claiming your share of a game's sales ---------------------------------
+//
+// Separate from withdrawing on purpose, because they are different money in
+// different places. A withdrawal moves what is already in your own wallet. A
+// claim moves what a game's vault is holding for you, and no part of it was ever
+// ours: the sale credited the vault directly and the vault decided your share.
+//
+// We pay the gas, through `SplitVault.claimFor`. That is not generosity, it is
+// necessity — gas on Arc is USDC, so a developer whose first earnings are still
+// in the vault cannot afford the transaction that releases them. `claimFor`
+// sends only to the payee, so paying for it buys us no say over the money, and
+// it is callable by anyone, so a developer who would rather not involve us can
+// call `claim()` from their own wallet instead.
+
+meRouter.post(
+  "/claim/:gameId",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    try {
+      res.json(await claimFromVault(req.auth!.evmAddress, param(req, "gameId")));
+    } catch (err) {
+      if (err instanceof NothingToClaim) throw new AppError(409, "NOTHING_TO_CLAIM", err.message);
+      throw err;
+    }
+  }),
+);
 
 const withdrawSchema = z.object({
   to: z.string().min(3).max(64),

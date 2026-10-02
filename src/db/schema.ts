@@ -282,9 +282,10 @@ export const gameBuilds = pgTable(
     buildCid: text("build_cid").notNull(),
     buildZipCid: text("build_zip_cid"),
     buildSizeKb: integer("build_size_kb"),
-    // The HCS message announcing this version. Null for versions recorded
-    // before the game was published, which were never announced.
-    hcsTxId: text("hcs_tx_id"),
+    // The transaction that recorded this version on `GameRegistry`. Null for
+    // versions recorded before the game was published, which were never
+    // announced. Was an HCS message id before the move to Arc.
+    chainTxHash: text("chain_tx_hash"),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [uniqueIndex("game_builds_game_version_idx").on(table.gameId, table.version)],
@@ -337,13 +338,13 @@ export const gamePromotions = pgTable("game_promotions", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
-// One row per price change, each carrying the HCS message that announced it.
+// One row per price change, each carrying the transaction that recorded it.
 //
 // Every storefront could show a price history and none of them can make it
 // credible, because they all own the database it lives in. Ours is a local
-// index of messages already on a public topic: `hcsTxId` is checkable on the
-// mirror node by someone who does not trust this table at all. That is the
-// only reason it is worth storing separately from `games.price_units`.
+// index of events already on a public chain: `chainTxHash` is checkable on the
+// explorer by someone who does not trust this table at all. That is the only
+// reason it is worth storing separately from `games.price_units`.
 export const gamePriceChanges = pgTable("game_price_changes", {
   id: uuid("id").primaryKey().defaultRandom(),
   gameId: uuid("game_id").notNull().references(() => games.id),
@@ -351,7 +352,7 @@ export const gamePriceChanges = pgTable("game_price_changes", {
   toUnits: bigint("to_units", { mode: "number" }).notNull(),
   asset: text("asset").notNull(),
   changedByUserId: uuid("changed_by_user_id").references(() => users.id),
-  hcsTxId: text("hcs_tx_id"),
+  chainTxHash: text("chain_tx_hash"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
 

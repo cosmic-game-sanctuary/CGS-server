@@ -297,11 +297,11 @@ gameManageRouter.post(
       const built = await commitBuild(game.id, artifacts, { label, notes });
 
       const [fresh] = await db.select().from(games).where(eq(games.id, game.id));
-      let hcsTxId: string | null = null;
+      let chainTxHash: string | null = null;
       if (fresh!.status === "published") {
-        hcsTxId = await announce(fresh!, "build_updated", { version: built.version, label: label ?? null });
-        if (hcsTxId) {
-          await db.update(gameBuilds).set({ hcsTxId }).where(eq(gameBuilds.id, built.id));
+        chainTxHash = await announce(fresh!, "build_updated", { version: built.version, label: label ?? null });
+        if (chainTxHash) {
+          await db.update(gameBuilds).set({ chainTxHash }).where(eq(gameBuilds.id, built.id));
         }
         await notifyOwnersOfBuild(fresh!, built.version, notes ?? null);
       }
@@ -312,7 +312,7 @@ gameManageRouter.post(
         notes: built.notes,
         buildCid: built.buildCid,
         buildSizeKb: built.buildSizeKb,
-        hcsTxId,
+        chainTxHash,
         createdAt: built.createdAt,
       });
     } finally {
@@ -440,8 +440,8 @@ gameManageRouter.post(
       .where(eq(games.id, game.id))
       .returning();
 
-    const hcsTxId = await announce(updated!, "relisted");
-    res.json({ ...updated, announced: hcsTxId !== null });
+    const chainTxHash = await announce(updated!, "relisted");
+    res.json({ ...updated, announced: chainTxHash !== null });
   }),
 );
 
