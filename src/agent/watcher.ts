@@ -924,7 +924,20 @@ export async function runAgentSweep(): Promise<{
 
       // The ceiling goes on chain straight away, because `runRound` refuses any
       // purchase above it and a missing ceiling reads as "none published".
-      await publishAgentMandate({ ...agent, erc8004AgentId: agentId.toString() });
+      const live = { ...agent, status: "funded" as const, erc8004AgentId: agentId.toString() };
+      await publishAgentMandate(live);
+
+      // **And it gets one evaluation right now**, which is a fix rather than an
+      // optimisation. Discovery is event-driven: the listener acts on a
+      // `GameRegistry` event and only for agents already `funded` or
+      // `watching`. An agent funded *after* its wanted game was listed at an
+      // acceptable price therefore missed the only event that would ever have
+      // told it, and nothing else in this sweep evaluates a funded agent — so
+      // it would wait for the studio to change the price again, forever. The
+      // natural trigger is the moment it becomes able to act.
+      await evaluateAgent(live).catch((err) =>
+        logger.error({ err, agentId: agent.id }, "the first round after funding failed"),
+      );
     } catch (err) {
       // One agent failing to register must not stop the sweep, and it must not
       // leave the row claiming to be funded when it is not.

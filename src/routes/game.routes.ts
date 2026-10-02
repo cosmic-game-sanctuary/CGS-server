@@ -67,7 +67,8 @@ import {
 } from "../services/arc/x402/gate.js";
 import { fulfilArcPurchase } from "../services/games/fulfilArc.js";
 import { publishLimiter } from "../middleware/ratelimit.middleware.js";
-import { publishAgentMandateInBackground } from "../services/agent/mandate.js";
+import { publishAgentMandate } from "../services/agent/mandate.js";
+import { evaluateAgent } from "../agent/watcher.js";
 import {
   prepare as prepareArcPayment,
   prepareTrialChunk as prepareArcTrialChunk,
@@ -1547,16 +1548,28 @@ gameRouter.patch(
 
     const [updated] = await db.update(wishlistItems).set(fields).where(eq(wishlistItems.id, item.id)).returning();
 
-    // The ceiling this agent publishes on its own ENS name is derived from
+    // The ceiling the agent publishes on its ERC-8004 token is derived from
     // these rows, so changing one makes the on-chain record stale. Republished
-    // in the background: it is four Sepolia writes and the buyer should not
-    // wait a minute to adjust their own wishlist. Only matters if `agentMaxUnits`
-    // actually moved — a note change cannot alter the ceiling.
+    // in the background, because the buyer should not wait on a chain write to
+    // adjust their own wishlist. Only matters if `agentMaxUnits` actually moved
+    // — a note change cannot alter the ceiling.
+    //
+    // **And the agent is evaluated straight afterwards**, for the same reason
+    // the sweep evaluates a newly funded one: raising a maximum above a game's
+    // current price makes that game eligible *now*, and nothing else would
+    // notice until the studio next changed the price. Awaited in sequence
+    // inside the background task so the round reads the ceiling that was just
+    // written rather than the one it replaced.
     if (fields.agentMaxUnits !== undefined) {
       const agent = await db.query.wishlistAgents.findFirst({
         where: eq(wishlistAgents.buyerUserId, req.auth!.id),
       });
-      if (agent) publishAgentMandateInBackground(agent);
+      if (agent) {
+        void (async () => {
+          await publishAgentMandate(agent);
+          if (agent.status === "funded" || agent.status === "watching") await evaluateAgent(agent);
+        })().catch((err) => logger.error({ err, agentId: agent.id }, "reacting to a changed want failed"));
+      }
     }
     res.json({
       gameId: game.id,
