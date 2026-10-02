@@ -197,7 +197,16 @@ check(
   file?.["cgs:fundingPrincipal"],
 );
 
-const published = await ceilingFromChain(funded!);
+// `erc8004AgentId` lands in the row as soon as registration confirms, but the
+// sweep's ceiling write is a *separate* transaction straight afterward — so the
+// instant the row says funded is not the instant the ceiling has landed. Same
+// lag as every other "read right after a write" case in this codebase: poll
+// rather than assume the two happen in the same beat.
+const published = await until(
+  "the published ceiling to reach the expected value",
+  () => ceilingFromChain(funded!),
+  (v) => v === Number(CEILING_UNITS),
+);
 check("its spending ceiling is published on chain", published === Number(CEILING_UNITS), published);
 
 // ── buying, within the mandate ─────────────────────────────────────────────
