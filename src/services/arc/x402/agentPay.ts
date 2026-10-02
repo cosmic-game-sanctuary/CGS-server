@@ -27,14 +27,21 @@ const accountFor = (agent: AgentWallet) =>
  *
  * `ownerAddress` is that person: the agent pays, and the GameKey has to land
  * with them, or the purchase is pointless.
+ *
+ * `maxUnits` is the ceiling published on the agent's own ERC-8004 token. Passed
+ * down so the refusal happens before anything is signed — see `PayOptions`. The
+ * caller checks it too, and that duplication is deliberate: this is the last
+ * point at which money can leave.
  */
 export async function payForGame(
   gameId: string,
   agent: AgentWallet,
   ownerAddress: string,
+  maxUnits?: bigint,
 ): Promise<unknown> {
   const result = await payGatedResource(gameUrl(gameId), accountFor(agent), {
     ownerAddress: ownerAddress as Address,
+    maxUnits,
   });
   return result.body;
 }

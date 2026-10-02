@@ -388,3 +388,112 @@ export const erc20Abi = [
     outputs: [{ type: "string" }],
   },
 ] as const;
+
+/**
+ * ERC-8004 IdentityRegistry — the agent's identity, as a standard rather than a
+ * string we invented.
+ *
+ * It is an ERC-721 with URIStorage: registering **mints a token**, and that
+ * token id *is* the agent id. Confirmed against the contract deployed at
+ * `0x8004A818BFB912233c491871b3d84c89A494BD9e` on Arc testnet, which reports
+ * `name() = "AgentIdentity"` and is an EIP-1967 proxy over
+ * `IdentityRegistryUpgradeable`. Only the parts we use are here.
+ *
+ * Spec: https://eips.ethereum.org/EIPS/eip-8004
+ */
+export const identityRegistryAbi = [
+  // Three overloads exist; this is the one that mints and sets metadata in a
+  // single transaction. `agentURI` is written separately afterwards, because the
+  // registration file has to name its own agent id and that id does not exist
+  // until this call returns.
+  {
+    type: "function",
+    name: "register",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "agentURI", type: "string" },
+      {
+        name: "metadata",
+        type: "tuple[]",
+        components: [
+          { name: "metadataKey", type: "string" },
+          { name: "metadataValue", type: "bytes" },
+        ],
+      },
+    ],
+    outputs: [{ name: "agentId", type: "uint256" }],
+  },
+  {
+    type: "function",
+    name: "setAgentURI",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "agentId", type: "uint256" },
+      { name: "newURI", type: "string" },
+    ],
+    outputs: [],
+  },
+  {
+    type: "function",
+    name: "setMetadata",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "agentId", type: "uint256" },
+      { name: "metadataKey", type: "string" },
+      { name: "metadataValue", type: "bytes" },
+    ],
+    outputs: [],
+  },
+  {
+    type: "function",
+    name: "getMetadata",
+    stateMutability: "view",
+    inputs: [
+      { name: "agentId", type: "uint256" },
+      { name: "metadataKey", type: "string" },
+    ],
+    outputs: [{ type: "bytes" }],
+  },
+  // Reserved by the spec: the address the agent transacts from. Set to the
+  // minter automatically, which is what we want — the agent registers itself.
+  {
+    type: "function",
+    name: "getAgentWallet",
+    stateMutability: "view",
+    inputs: [{ name: "agentId", type: "uint256" }],
+    outputs: [{ type: "address" }],
+  },
+  {
+    type: "function",
+    name: "tokenURI",
+    stateMutability: "view",
+    inputs: [{ name: "tokenId", type: "uint256" }],
+    outputs: [{ type: "string" }],
+  },
+  {
+    type: "function",
+    name: "ownerOf",
+    stateMutability: "view",
+    inputs: [{ name: "tokenId", type: "uint256" }],
+    outputs: [{ type: "address" }],
+  },
+  {
+    type: "event",
+    name: "Registered",
+    inputs: [
+      { name: "agentId", type: "uint256", indexed: true },
+      { name: "agentURI", type: "string", indexed: false },
+      { name: "owner", type: "address", indexed: true },
+    ],
+  },
+  {
+    type: "event",
+    name: "MetadataSet",
+    inputs: [
+      { name: "agentId", type: "uint256", indexed: true },
+      { name: "indexedMetadataKey", type: "string", indexed: true },
+      { name: "metadataKey", type: "string", indexed: false },
+      { name: "metadataValue", type: "bytes", indexed: false },
+    ],
+  },
+] as const;

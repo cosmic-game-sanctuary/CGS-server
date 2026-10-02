@@ -7,7 +7,6 @@ import { privy } from "../privy/client.js";
 import { derivePublicKeyHex } from "../privy/signing.js";
 import { getUsdcUnits } from "../arc/reads.js";
 import { refundAgentBalance } from "../wallet/withdraw.js";
-import { resolveHederaAccount } from "../users/repo.js";
 import { isSubnameAvailable, registerAgentSubname } from "../ens/registrar.js";
 import logger from "../../utils/logger.utils.js";
 

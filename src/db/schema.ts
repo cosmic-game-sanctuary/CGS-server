@@ -452,6 +452,15 @@ export const wishlistAgents = pgTable("wishlist_agents", {
   agentPublicKeyHex: text("agent_public_key_hex").notNull(),
   agentAccountId: text("agent_account_id"),
   hcs14Aid: text("hcs14_aid"),
+  // The ERC-721 token id this agent was minted as on the ERC-8004
+  // IdentityRegistry. Stored as text because it is a uint256 and nothing here
+  // does arithmetic on it. Null until the agent is funded enough to pay for its
+  // own registration — it registers itself, so an empty wallet cannot.
+  //
+  // Replaces `hcs14Aid`, which held a string we derived ourselves and published
+  // on a topic we owned. That column is kept for now rather than dropped, so a
+  // row written under the Hedera build still says what it claimed.
+  erc8004AgentId: text("erc8004_agent_id"),
   status: agentStatusEnum("status").notNull().default("draft"),
   // Autonomous acts and tells you after. Ask-first sends the recommendation
   // and waits, but only when a human could plausibly answer before the sale

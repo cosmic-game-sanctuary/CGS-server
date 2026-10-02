@@ -1,4 +1,5 @@
 import { and, desc, eq, inArray, isNotNull, isNull, lt, lte } from "drizzle-orm";
+import type { Address } from "viem";
 import { db } from "../db/client.js";
 import {
   wishlistAgents,
@@ -8,13 +9,11 @@ import {
   notifications,
   users,
 } from "../db/schema.js";
-import { getAccountByEvmAddress } from "../services/hedera/mirror.js";
-import { getBlockNumber, getListingEvents, type ListingEvent as RegistryEvent } from "../services/arc/reads.js";
+import { getBlockNumber, getListingEvents, getUsdcUnits, type ListingEvent as RegistryEvent } from "../services/arc/reads.js";
 import { uuidFromGameId } from "../services/arc/registry.js";
-import { anchorAgentIdentity } from "../services/agent/identity.js";
+import { registerAgentIdentity } from "../services/agent/identity.js";
 import { agentBalance, retireAgent } from "../services/agent/wallet.js";
-import { ceilingFromChain } from "../services/agent/mandate.js";
-import { resolveHederaAccount } from "../services/users/repo.js";
+import { ceilingFromChain, ceilingUnitsFor, publishAgentMandate } from "../services/agent/mandate.js";
 import {
   eligibleWantsFor,
   wantsFor,
@@ -37,6 +36,16 @@ import logger from "../utils/logger.utils.js";
 
 type Agent = typeof wishlistAgents.$inferSelect;
 type Decision = typeof agentDecisions.$inferSelect;
+
+/**
+ * What an agent's wallet must hold before it is worth trying to register it.
+ *
+ * Registration is two transactions, one of which writes the whole registration
+ * file on chain, so it is the most expensive thing an agent ever does. Measured
+ * at well under this; the margin is deliberate so a newly funded agent is not
+ * left unable to act because registration drained it.
+ */
+const REGISTRATION_RESERVE_UNITS = 50_000n; // 0.05 USDC
 
 /** One round's inference charge, and the settlement that paid it. */
 type Charge = { costUnits: number | null; txId: string | null };
@@ -284,14 +293,14 @@ async function runRound(agent: Agent): Promise<void> {
     return;
   }
 
-  // The agent pays; the GameKey belongs to whoever it is working for. Resolved
-  // once per round rather than per purchase — it does not change mid-round,
-  // and by the time an agent can buy at all it was already required to
-  // resolve once, at anchoring (see runAgentSweep), so this is a cached read.
+  // The agent pays; the GameKey belongs to whoever it is working for. Read once
+  // per round rather than per purchase — it does not change mid-round. Always
+  // present in practice: `users.evm_address` is `notNull`, and an agent cannot
+  // leave `draft` without its buyer having been found (see runAgentSweep).
   const buyerUser = await db.query.users.findFirst({ where: eq(users.id, agent.buyerUserId) });
   const buyerAddress = buyerUser?.evmAddress ?? null;
   if (!buyerAddress) {
-    logger.error({ agentId: agent.id }, "agent can't buy — its own buyer has no resolvable Hedera account");
+    logger.error({ agentId: agent.id }, "agent can't buy — its own buyer has no address to receive the key");
     // Still reschedule. Returning bare would leave this agent with no alarm
     // clock at all, so it would never look again even once the buyer's account
     // exists — and a buyer who has never received anything is exactly the
@@ -571,24 +580,50 @@ async function executeBuys(
   // above the number we published on chain gets bought.
   //
   // **It can only ever refuse.** A null means no ceiling is being claimed
-  // publicly — the agent has no name, or Sepolia was briefly unreachable — and
-  // that leaves the existing behaviour exactly as it was. An ENS outage must
-  // not be able to stop a Hedera purchase the buyer already authorised, and an
-  // agent nobody named must not start behaving differently because this code
-  // exists.
+  // publicly — the agent is not registered yet, or nothing has been written
+  // against its token — and that leaves the existing behaviour exactly as it
+  // was. It is read from the agent's ERC-8004 token on Arc, the same chain the
+  // money moves on, so there is no longer a second chain whose outage could
+  // interfere with a purchase the buyer already authorised.
   const ceiling = await ceilingFromChain(agent);
 
   const bought: EligibleWant[] = [];
   for (const want of buyNow) {
     if (ceiling !== null && want.currentPriceUnits > ceiling) {
+      // **A published ceiling can be stale, and a stale low one is the
+      // dangerous direction** — it silently refuses purchases the buyer did
+      // authorise. Seen for real twice: an agent registered in the instant
+      // before its first want existed published a zero, and an agent whose
+      // buyer raised a maximum kept the old number on chain because the write
+      // that republishes it is fire-and-forget.
+      //
+      // So before refusing, check whether our own rule would have allowed it.
+      // If it would, the published number is behind rather than binding:
+      // republish and let the next round act on the fresh one. This cannot be
+      // used to lift a real cap, because the republished value is recomputed
+      // from the buyer's own wants — if they really did set a low maximum, the
+      // same number goes back on chain and the refusal stands.
+      const allowedLocally = await ceilingUnitsFor(agent);
+      if (allowedLocally >= want.currentPriceUnits) {
+        logger.warn(
+          { agentId: agent.id, gameId: want.gameId, publishedUnits: ceiling, allowedUnits: allowedLocally },
+          "the published ceiling is behind the buyer's own wants — republishing, and deciding next round",
+        );
+        void publishAgentMandate(agent);
+        continue;
+      }
+
       logger.warn(
         { agentId: agent.id, gameId: want.gameId, priceUnits: want.currentPriceUnits, ceilingUnits: ceiling },
-        "refusing a purchase above the ceiling published on this agent's ENS name",
+        "refusing a purchase above the ceiling published on this agent's ERC-8004 token",
       );
       continue;
     }
     try {
-      await payForGame(want.gameId, agent, buyerAddress);
+      // The ceiling is handed down as well as checked above, so the agent
+      // cannot sign an authorization above it even if this loop's own guard
+      // were ever removed.
+      await payForGame(want.gameId, agent, buyerAddress, ceiling === null ? undefined : BigInt(ceiling));
       bought.push(want);
     } catch (err) {
       // One failed purchase does not stop the others — each was planned
@@ -850,23 +885,51 @@ export async function runAgentSweep(): Promise<{
   let anchored = 0;
   const drafts = await db.query.wishlistAgents.findMany({ where: eq(wishlistAgents.status, "draft") });
   for (const agent of drafts) {
-    const account = await getAccountByEvmAddress(agent.agentEvmAddress);
-    if (!account) continue; // not funded yet — a normal, common wait, not an error
+    // **"Is this wallet funded" is a balance, not the existence of an account.**
+    // This used to ask the Hedera mirror node whether the agent's address had an
+    // account at all, which was the right question on Hedera and is unanswerable
+    // on Arc: an Arc address has no Hedera account and never will, so the lookup
+    // returned null, this loop skipped every agent, and **no agent ever left
+    // `draft`** — the listener discovered price drops correctly and had nobody
+    // to tell. Found reviewing Stage 5.
+    const balanceUnits = await getUsdcUnits(agent.agentEvmAddress as Address);
+    if (balanceUnits === 0n) continue; // not funded yet — a normal, common wait
 
-    // The anchor's whole point is naming who is really behind this wallet, so
-    // it needs the buyer's own Hedera account, not the agent's — a buyer who
-    // has never received anything themselves has nothing to name yet, so
-    // anchoring waits one more round rather than anchoring the wrong party.
+    // Registration is a transaction the agent signs and pays for itself, so it
+    // cannot happen before funding. Same shape as `SplitVault.claimFor`: gas on
+    // Arc is USDC, so an empty wallet cannot do anything at all, registering
+    // its own identity included. Waiting for a usable balance rather than
+    // attempting and failing every tick.
+    if (balanceUnits < REGISTRATION_RESERVE_UNITS) {
+      logger.info(
+        { agentId: agent.id, balanceUnits: balanceUnits.toString() },
+        "agent funded but not enough to pay for its own ERC-8004 registration yet",
+      );
+      continue;
+    }
+
     const buyer = await db.query.users.findFirst({ where: eq(users.id, agent.buyerUserId) });
-    const buyerAccountId = buyer ? await resolveHederaAccount(buyer) : null;
-    if (!buyerAccountId) continue;
+    if (!buyer) continue;
 
-    const { aid } = await anchorAgentIdentity(agent.id, account.account, buyerAccountId);
-    await db
-      .update(wishlistAgents)
-      .set({ status: "funded", agentAccountId: account.account, hcs14Aid: aid })
-      .where(eq(wishlistAgents.id, agent.id));
-    anchored += 1;
+    try {
+      // Names the buyer as funding principal, which is what the HCS-14 anchor
+      // this replaces existed to do — now as ERC-8004 metadata on the same
+      // chain the agent spends on, rather than a message on a topic we own.
+      const { agentId } = await registerAgentIdentity(agent, buyer.evmAddress);
+      await db
+        .update(wishlistAgents)
+        .set({ status: "funded", erc8004AgentId: agentId.toString() })
+        .where(eq(wishlistAgents.id, agent.id));
+      anchored += 1;
+
+      // The ceiling goes on chain straight away, because `runRound` refuses any
+      // purchase above it and a missing ceiling reads as "none published".
+      await publishAgentMandate({ ...agent, erc8004AgentId: agentId.toString() });
+    } catch (err) {
+      // One agent failing to register must not stop the sweep, and it must not
+      // leave the row claiming to be funded when it is not.
+      logger.error({ err, agentId: agent.id }, "registering an agent on ERC-8004 failed — staying draft, will retry");
+    }
   }
 
   let expired = 0;

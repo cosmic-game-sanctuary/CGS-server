@@ -1,54 +1,34 @@
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
-import { PublicKey } from "@hiero-ledger/sdk";
 import { privy } from "./client.js";
 
-// The bridge between Privy's signing API and Hedera's.
+// Deriving a Privy wallet's public key, which Privy itself will not tell us.
 //
-// Hedera signs ECDSA as secp256k1(keccak256(message)) and wants a 64-byte
-// compact signature (r||s). Privy's `secp256k1_sign` takes an already-computed
-// hash and returns an Ethereum-style hex signature, which is 65 bytes when it
-// carries the trailing recovery byte. So: keccak here, hand Privy the hash,
-// drop the recovery byte on the way back.
-export async function signHederaMessage(walletId: string, message: Uint8Array): Promise<Uint8Array> {
-  const hash = keccak_256(message);
-  const response = await privy.wallets().rpc(walletId, {
-    method: "secp256k1_sign",
-    params: { hash: `0x${Buffer.from(hash).toString("hex")}` },
-  });
-
-  const raw = Buffer.from(response.data.signature.replace(/^0x/, ""), "hex");
-  if (raw.length === 65) return new Uint8Array(raw.subarray(0, 64));
-  if (raw.length === 64) return new Uint8Array(raw);
-  throw new Error(`unexpected signature length from Privy: ${raw.length} bytes`);
-}
-
-// The mirror node reports an account's public key as compressed hex once the
-// account exists. Needed because Hedera's signWith() wants the public key
-// alongside the signature — Privy never hands us the private half.
-export function hederaPublicKeyFromHex(compressedHex: string): PublicKey {
-  return PublicKey.fromStringECDSA(compressedHex);
-}
-
+// This file used to be the bridge between Privy's signing API and Hedera's —
+// `signHederaMessage` and `hederaPublicKeyFromHex` lived here and were the only
+// reason `@hiero-ledger/sdk` was a dependency. Both are gone: on Arc the agent
+// signs through `createViemAccount`, which is an ordinary viem `LocalAccount`,
+// so there is no second signing convention to bridge to. What is left is the one
+// thing that was never Hedera-specific.
+//
+// Privy's `secp256k1_sign` returns an Ethereum-style hex signature, 65 bytes
+// when it carries the trailing recovery byte. The key is recovered by trying
+// both recovery ids and keeping whichever one yields the address we expected,
+// which is cheaper and more certain than parsing `v`.
 /**
- * Which key made this signature, given the address it should belong to.
+ * An EVM address from a compressed secp256k1 public key.
  *
- * An ECDSA signature carries its own public key: with the message hash, two
- * candidate keys can be recovered from it, and the recovery id says which. This
- * tries both and keeps whichever derives the expected address, so it does not
- * matter how the signer encoded its v byte — Ethereum tooling uses 27/28, plain
- * secp256k1 libraries use 0/1, and Privy is not documented either way.
- *
- * Checking against the address is not a convenience. It is what makes this
- * safe: a signature from any other key recovers to some other address and is
- * refused, so this doubles as proof that the signer holds the wallet it claims.
- *
- * Why it is needed at all: an account that has only ever *received* value has
- * no public key on Hedera. It is a hollow account (HIP-583) whose alias is the
- * 20-byte EVM address, and the Mirror Node reports `key: null` until it signs
- * something. That is every new buyer, so the key has to come from the payment
- * signature itself. Signing the payment is also what completes the account.
+ * Replaces `PublicKey.fromStringECDSA(hex).toEvmAddress()`, which was the last
+ * thing in this repo needing `@hiero-ledger/sdk`. The derivation is not
+ * Hedera-specific and never was: decompress the point, drop the `0x04` prefix,
+ * keccak the 64 bytes, take the last 20.
  */
+function evmAddressFromCompressed(compressedHex: string): string {
+  const point = secp256k1.Point.fromHex(compressedHex);
+  const uncompressed = point.toBytes(false); // 65 bytes, 0x04-prefixed
+  return Buffer.from(keccak_256(uncompressed.subarray(1)).subarray(-20)).toString("hex");
+}
+
 export function publicKeyForAddress(
   hash: Uint8Array,
   signatureHex: string,
@@ -68,7 +48,7 @@ export function publicKeyForAddress(
         { prehash: false },
       );
       const hex = Buffer.from(compressed).toString("hex");
-      if (PublicKey.fromStringECDSA(hex).toEvmAddress().toLowerCase() === want) return hex;
+      if (evmAddressFromCompressed(hex) === want) return hex;
     } catch {
       // A recovery id that doesn't yield a point on the curve. Try the other.
     }

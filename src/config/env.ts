@@ -2,11 +2,6 @@ import "dotenv/config";
 import { createPublicKey } from "node:crypto";
 import { z } from "zod";
 
-// a real 0.0.x account id, not .env.example's `0.0.xxxxx` placeholder
-const hederaAccountId = z
-  .string()
-  .regex(/^\d+\.\d+\.\d+$/, "must be a real Hedera account id like 0.0.12345");
-
 const evmAddress = z.string().regex(/^0x[a-fA-F0-9]{40}$/, "must be a real 0x address");
 
 // Privy verifies access tokens against a P-256 public key, which `jose` loads
@@ -89,26 +84,17 @@ const envSchema = z.object({
   DATABASE_URL: z.string(),
   DATABASE_URL_POOLED: z.string(),
 
-  // `0.0.xxxxx` is what .env.example ships — catching it here turns a
-  // confusing facilitator rejection into an obvious boot-time failure.
-  HEDERA_OPERATOR_ID: hederaAccountId,
-  HEDERA_OPERATOR_KEY: z.string(),
-  HEDERA_NETWORK: z.enum(["testnet", "mainnet"]).default("testnet"),
-  HEDERA_MIRROR_URL: z.string(),
-
-  X402_FACILITATOR_URL: z.string(),
-  // x402 types network as the CAIP-2 template literal `${string}:${string}`,
-  // so a plain string doesn't satisfy it — validate the shape, then say so.
-  X402_NETWORK: z
-    .string()
-    .regex(/^[^:]+:[^:]+$/, "must be CAIP-2, e.g. hedera:testnet")
-    .default("hedera:testnet")
-    .transform((v) => v as `${string}:${string}`),
+  // **The Hedera block is gone.** `HEDERA_OPERATOR_ID/KEY/NETWORK/MIRROR_URL`,
+  // `X402_FACILITATOR_URL`, `X402_NETWORK`, `X402_PAY_TO` and the three
+  // `HCS_*_TOPIC`s were all removed in Stage 6 along with the code that read
+  // them. Nothing here talks to Hedera any more; a checkout that still has them
+  // in its `.env` is harmless, since unknown keys are ignored.
+  //
+  // `X402_ASSET` stays, and the name is still accurate: x402 is still the
+  // protocol and USDC is still the asset — only the facilitator and the chain
+  // changed. It holds Arc's native USDC address now rather than a `0.0.x`.
   X402_ASSET: z.string(),
   X402_ASSET_DECIMALS: z.coerce.number(),
-  // where buyers pay. A real 0.0.x, never an EVM address — facilitators
-  // default to rejecting the alias auto-creation an address would trigger.
-  X402_PAY_TO: hederaAccountId,
 
   // Arc, being built alongside the Hedera config above until Stages 4-6 take
   // over its callers. Optional so a checkout that predates the port still boots;
@@ -129,6 +115,11 @@ const envSchema = z.object({
   ARC_GAME_REGISTRY: evmAddress.optional(),
   ARC_GAME_KEY: evmAddress.optional(),
   ARC_VAULT_FACTORY: evmAddress.optional(),
+  // ERC-8004's IdentityRegistry, a per-chain singleton we do not deploy.
+  // Defaulted rather than left blank because the address is the same on Arc
+  // testnet and mainnet and is not ours to choose; override only if that
+  // stops being true.
+  ARC_IDENTITY_REGISTRY: evmAddress.default("0x8004A818BFB912233c491871b3d84c89A494BD9e"),
   // Where the platform's cut lands. Defaults to the operator — see
   // services/arc/client.ts#platformPayoutAddress for why that is a stopgap.
   ARC_PLATFORM_PAYOUT: evmAddress.optional(),
@@ -150,10 +141,6 @@ const envSchema = z.object({
   // 3000 and itch.io's 1000. Fixed into each vault at publish and visible to the
   // developer before they agree — see docs/arc-port.md §3.
   PLATFORM_FEE_BPS: z.coerce.number().int().min(0).max(10_000).default(500),
-
-  HCS_LISTINGS_TOPIC: z.string().optional(),
-  HCS_SALES_TOPIC: z.string().optional(),
-  HCS_AGENT_IDENTITY_TOPIC: z.string().optional(),
 
   PRIVY_APP_ID: z.string(),
   PRIVY_APP_SECRET: z.string(),

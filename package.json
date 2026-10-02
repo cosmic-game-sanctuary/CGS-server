@@ -1,7 +1,7 @@
 {
   "name": "cgs-server",
   "version": "1.0.0",
-  "description": "Backend for Cosmic Game Sanctuary \u2014 API, Arc chain integration, and the wishlist agent.",
+  "description": "Backend for Cosmic Game Sanctuary — API, Arc chain integration, and the wishlist agent.",
   "main": "index.js",
   "scripts": {
     "dev": "tsx watch --exclude \"storage/**\" --exclude \"logs/**\" --exclude \"tmp/**\" --exclude \"uploads/**\" --exclude \".cache/**\" src/index.ts",
@@ -31,7 +31,9 @@
     "arc:check:x402": "tsx scripts/arc-x402-check.ts",
     "arc:check:purchase": "tsx scripts/arc-purchase-check.ts",
     "arc:check:publish": "tsx scripts/arc-publish-check.ts",
-    "arc:check:listener": "tsx scripts/arc-agent-listener-check.ts"
+    "arc:check:listener": "tsx scripts/arc-agent-listener-check.ts",
+    "arc:check:identity": "tsx scripts/arc-agent-identity-check.ts",
+    "arc:check:agent": "tsx scripts/arc-agent-buy-check.ts"
   },
   "repository": {
     "type": "git",
@@ -44,7 +46,7 @@
   },
   "homepage": "https://github.com/cosmic-game-sanctuary/CGS-server#readme",
   "dependencies": {
-    "@hiero-ledger/sdk": "^2.87.0",
+    "@noble/curves": "^2.4.0",
     "@noble/hashes": "^2.4.0",
     "@privy-io/node": "^0.34.0",
     "cors": "^2.8.6",

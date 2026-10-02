@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { Router } from "express";
-import { and, asc, eq, inArray, isNotNull } from "drizzle-orm";
+import { and, asc, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import multer from "multer";
 import { db } from "../db/client.js";
@@ -342,8 +342,21 @@ async function notifyOwnersOfBuild(game: typeof games.$inferSelect, version: num
   const accountIds = [...new Set(keys.map((k) => k.ownerAccountId))];
   if (accountIds.length === 0) return;
 
+  // `game_keys.owner_account_id` holds an **EVM address** for anything minted on
+  // Arc, and a `0.0.x` for the Hedera rows that came before. This looked up
+  // `users.hedera_account_id` only, so after the move to Arc it matched nobody
+  // and every owner silently stopped being told their game had shipped a patch —
+  // which is precisely the notification that makes owning a key rather than a
+  // file worth something. Both shapes are matched now; the Hedera half can go
+  // once those rows do.
+  const evmOwners = accountIds.filter((a) => a.startsWith("0x")).map((a) => a.toLowerCase());
+  const hederaOwners = accountIds.filter((a) => /^\d+\.\d+\.\d+$/.test(a));
+
   const owners = await db.query.users.findMany({
-    where: inArray(users.hederaAccountId, accountIds),
+    where: or(
+      evmOwners.length ? sql`lower(${users.evmAddress}) IN ${evmOwners}` : undefined,
+      hederaOwners.length ? inArray(users.hederaAccountId, hederaOwners) : undefined,
+    ),
     columns: { id: true },
   });
   if (owners.length === 0) return;

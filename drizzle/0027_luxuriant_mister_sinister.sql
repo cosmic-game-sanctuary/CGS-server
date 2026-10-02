@@ -1,0 +1,1 @@
+ALTER TABLE "wishlist_agents" ADD COLUMN "erc8004_agent_id" text;

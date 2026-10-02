@@ -5,6 +5,7 @@ import {
   fallback,
   http,
   nonceManager,
+  type Account,
   type Address,
   type Hex,
   type PublicClient,
@@ -116,6 +117,29 @@ export function explorerUrl(): string {
 
 export const explorerTxUrl = (hash: string) => `${explorerUrl()}/tx/${hash}`;
 export const explorerAddressUrl = (address: string) => `${explorerUrl()}/address/${address}`;
+
+export function identityRegistryAddress(): Address {
+  return env.ARC_IDENTITY_REGISTRY as Address;
+}
+
+/**
+ * CAIP-style registry identifier, which ERC-8004 calls `agentRegistry`:
+ * `{namespace}:{chainId}:{identityRegistry}`. It goes in the agent's own
+ * registration file so a reader who has the file can tell which chain and which
+ * registry it belongs to.
+ */
+export const agentRegistryId = () => `eip155:${arcChain().id}:${identityRegistryAddress()}`;
+
+/**
+ * A wallet client that signs as somebody other than the operator — an agent's
+ * own Privy wallet, in practice.
+ *
+ * Not memoised, unlike `walletClient()`: there is one operator and many agents,
+ * so caching by nothing would hand the wrong signer to the wrong agent.
+ */
+export function clientFor(account: Account): WalletClient {
+  return createWalletClient({ account, chain: arcChain(), transport: transport() });
+}
 
 export function vaultFactoryAddress(): Address {
   if (!env.ARC_VAULT_FACTORY) {

@@ -113,6 +113,23 @@ export type PayOptions = {
    * only when the payer really is a known agent.
    */
   ownerAddress?: Address;
+  /**
+   * The most this payment may be for, in atomic units. Refused rather than
+   * signed if the server quotes more.
+   *
+   * **This is the cap that actually binds, and Arc is what made it possible.**
+   * On Hedera the only real limit on an agent was the balance of its wallet —
+   * `ScheduleCreateTransaction` has no cap field, so "it will never pay more
+   * than $4 for a game" was a rule enforced only by our own code choosing to
+   * obey it. An EIP-3009 authorization is signed for an *exact* amount, so
+   * checking here means the agent never puts its name to anything above the
+   * ceiling: the refusal happens before a signature exists, not before a
+   * function call.
+   *
+   * Kept here rather than only in the caller because this is the last point
+   * money can leave. A future caller that forgets the check cannot overspend.
+   */
+  maxUnits?: bigint;
 };
 
 export type PayResult = { alreadyGranted: boolean; body: unknown; authorization?: Authorization };
@@ -134,11 +151,18 @@ export async function payGatedResource(
   if (first.paid) return { alreadyGranted: true, body: first.body };
 
   const { challenge } = first;
-  const auth = buildAuthorization(
-    signer.address,
-    challenge.requirements.payTo,
-    BigInt(challenge.requirements.amount),
-  );
+  const amount = BigInt(challenge.requirements.amount);
+
+  if (options.maxUnits !== undefined && amount > options.maxUnits) {
+    throw new AppError(
+      409,
+      "ABOVE_MANDATE",
+      `This costs ${amount} units and the mandate allows ${options.maxUnits}. Nothing was signed.`,
+      { amountUnits: amount.toString(), maxUnits: options.maxUnits.toString() },
+    );
+  }
+
+  const auth = buildAuthorization(signer.address, challenge.requirements.payTo, amount);
   const signature = await signAuthorization(signer, auth);
 
   const headers: Record<string, string> = {

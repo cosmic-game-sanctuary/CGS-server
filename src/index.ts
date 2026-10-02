@@ -134,7 +134,7 @@ app.use(notFoundHandler);
 app.use(errorHandler);
 
 app.listen(env.PORT, () => {
-  console.log(`cgs-server listening on :${env.PORT} (${env.HEDERA_NETWORK})`);
+  console.log(`cgs-server listening on :${env.PORT} (arc-${env.ARC_NETWORK})`);
 
   // The agent's whole trigger mechanism: one subscription to the public
   // listings topic, for every agent at once — never a poll. See

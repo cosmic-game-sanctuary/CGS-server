@@ -14,14 +14,16 @@ import { eq, inArray } from "drizzle-orm";
 import { db } from "../src/db/client.js";
 import { users, studios, studioMembers, games, splits, reviews } from "../src/db/schema.js";
 import { env } from "../src/config/env.js";
+import { operator } from "../src/services/arc/client.js";
 import { slugify } from "../src/lib/slug.js";
 
 const SEED_EMAIL = "seed@cgs.local";
 
-// Splits have to name a payable account or a sale would fail on them. The
-// operator is the only account this script can be sure exists, and a seeded
-// game can't be bought anyway, so it stands in for every seeded collaborator.
-const SEED_WALLET = env.HEDERA_OPERATOR_ID;
+// Splits have to name a payable address or a publish would fail on them. The
+// operator is the only address this script can be sure exists, and a seeded
+// game has no vault and cannot be bought anyway, so it stands in for every
+// seeded collaborator.
+const SEED_WALLET = operator().address;
 
 type SeedStudio = { name: string; bio: string; ens?: string };
 type SeedGame = {

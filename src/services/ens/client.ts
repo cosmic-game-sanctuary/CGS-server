@@ -5,8 +5,7 @@ import { env } from "../../config/env.js";
 
 // the operator account for every ENS transaction the backend makes — a
 // dedicated key, generated fresh, never a personal wallet. Same role
-// SEPOLIA_OPERATOR_KEY plays here as HEDERA_OPERATOR_KEY plays on the Hedera
-// side.
+// SEPOLIA_OPERATOR_KEY plays here as ARC_OPERATOR_KEY plays on Arc.
 export const ensAccount = privateKeyToAccount(env.SEPOLIA_OPERATOR_KEY as `0x${string}`);
 
 export const publicClient = createPublicClient({
