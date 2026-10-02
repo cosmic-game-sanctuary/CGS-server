@@ -30,7 +30,8 @@
     "arc:check:eip3009": "tsx scripts/arc-eip3009-check.ts",
     "arc:check:x402": "tsx scripts/arc-x402-check.ts",
     "arc:check:purchase": "tsx scripts/arc-purchase-check.ts",
-    "arc:check:publish": "tsx scripts/arc-publish-check.ts"
+    "arc:check:publish": "tsx scripts/arc-publish-check.ts",
+    "arc:check:listener": "tsx scripts/arc-agent-listener-check.ts"
   },
   "repository": {
     "type": "git",

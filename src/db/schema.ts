@@ -525,10 +525,20 @@ export const agentDecisions = pgTable("agent_decisions", {
 // number of agents and hit the mirror node's rate limit at around 25 of them.
 // A consensus timestamp rather than a sequence number, because that is what
 // TopicMessageQuery.setStartTime() resumes from after a restart.
+// Where the agent's listener got to, so a restart resumes instead of replaying.
+//
+// One row. `lastBlock` is the live cursor: the agent reads `GameRegistry` events
+// with `eth_getLogs` and remembers the last block it processed. The two columns
+// above it are from the HCS build, where the cursor was a consensus timestamp on
+// a topic; they are nullable now and nothing writes them.
 export const listenerState = pgTable("listener_state", {
   id: integer("id").primaryKey().default(1),
-  topicId: text("topic_id").notNull(),
+  topicId: text("topic_id"),
   lastConsensusAt: timestamp("last_consensus_at", { withTimezone: true }),
+  // Nullable because a cold start has no cursor and deliberately begins at the
+  // current block rather than replaying the chain — nothing old enough to need
+  // replaying is still a live price.
+  lastBlock: bigint("last_block", { mode: "bigint" }),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });
 

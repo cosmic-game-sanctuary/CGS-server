@@ -190,6 +190,13 @@
       "when": 1790950992548,
       "tag": "0025_sour_phantom_reporter",
       "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1790951692623,
+      "tag": "0026_green_morlun",
+      "breakpoints": true
     }
   ]
 }

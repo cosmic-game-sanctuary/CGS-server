@@ -1,4 +1,3 @@
-import { TopicMessageQuery, Timestamp } from "@hiero-ledger/sdk";
 import { and, desc, eq, inArray, isNotNull, isNull, lt, lte } from "drizzle-orm";
 import { db } from "../db/client.js";
 import {
@@ -9,8 +8,9 @@ import {
   notifications,
   users,
 } from "../db/schema.js";
-import client from "../services/hedera/client.js";
 import { getAccountByEvmAddress } from "../services/hedera/mirror.js";
+import { getBlockNumber, getListingEvents, type ListingEvent as RegistryEvent } from "../services/arc/reads.js";
+import { uuidFromGameId } from "../services/arc/registry.js";
 import { anchorAgentIdentity } from "../services/agent/identity.js";
 import { agentBalance, retireAgent } from "../services/agent/wallet.js";
 import { ceilingFromChain } from "../services/agent/mandate.js";
@@ -54,23 +54,30 @@ function spendOf(charge: Charge) {
  * The wishlist agent, rebuilt for 1:N — one agent per person, several
  * wanted games, one shared budget.
  *
- * **What changed and why it had to.** The old watcher polled the Mirror Node
- * once per agent on a timer — 25 agents alone used a fifth of the public
- * node's entire rate budget, and 125 exhausted it, starving downloads and
- * ownership checks for everyone. This subscribes to the listings topic once,
- * for every agent at once, over gRPC — cost stays flat no matter how many
- * agents exist. `listener_state` existed for this resume cursor since Stage 5
- * and nothing read it until now.
+ * **What changed and why it had to.** An even older watcher polled per agent on
+ * a timer — 25 agents alone used a fifth of the public node's rate budget, and
+ * 125 exhausted it, starving downloads and ownership checks for everyone. One
+ * reader for every agent at once fixed that, and the cost stays flat no matter
+ * how many agents exist.
  *
- * **What did not change.** This still reads the *public* topic through a real
- * subscription, never an internal "did a price change" flag — the one rule in
- * this whole project marked "do not get this wrong." The message only ever
- * tells this code *which game to look at*; the actual eligibility decision
- * re-reads that game's current price from the ordinary database, the same way
- * every other feature in this app treats `games.price_units` as ground truth.
- * Replaying an old message after a restart is therefore harmless — it just
- * asks "is this game still worth buying right now", and the honest answer
- * might be no.
+ * **What the move to Arc changed.** The public log is now `GameRegistry`'s
+ * events rather than an HCS topic, so there is no gRPC subscription to hold
+ * open: this polls `eth_getLogs` from the last block it processed. One request
+ * per interval for all agents, which is the same flat cost as the subscription
+ * was. `listener_state.last_block` is the cursor.
+ *
+ * **What did not change, and must not.** This reads the *public* log, never an
+ * internal "did a price change" flag — the one rule in this whole project
+ * marked "do not get this wrong." Anyone could run this same listener against
+ * the same contract without our permission, which is the difference between an
+ * app with a bot and a public action someone else could build on.
+ *
+ * An event only ever tells this code *which game to look at*; the eligibility
+ * decision re-reads that game's current price from the ordinary database, the
+ * same way every other feature treats `games.price_units` as ground truth.
+ * Re-reading an old event after a restart is therefore harmless — it just asks
+ * "is this game still worth buying right now", and the honest answer might be
+ * no.
  *
  * **Stage 19 adds the decision layer, and W9 moved when it runs.** A topic
  * message no longer means "buy". It means "look again, and work out when you
@@ -87,74 +94,99 @@ function spendOf(charge: Charge) {
  * against before anything acts on it.
  */
 
-let unsubscribe: (() => void) | null = null;
+let polling: NodeJS.Timeout | null = null;
+let reading = false;
+
+/**
+ * How often to ask the chain for new listing events.
+ *
+ * Arc produces a block roughly every half second, so this is a handful of
+ * blocks per request. One request serves every agent, and `eth_getLogs` over a
+ * tiny range is cheap, so the interval trades a few seconds of latency on a
+ * price drop against a request rate that does not grow with the number of
+ * agents. It reuses the sweep interval because both are "how often does the
+ * agent look at the world".
+ */
+const POLL_INTERVAL_MS = env.AGENT_SWEEP_INTERVAL_MS;
 
 export async function startAgentListener(): Promise<void> {
-  if (!env.HCS_LISTINGS_TOPIC) {
-    logger.warn("no HCS_LISTINGS_TOPIC configured — the agent listener is not starting");
-    return;
-  }
-
   const cursor = await db.query.listenerState.findFirst({ where: eq(listenerState.id, 1) });
-  // No prior cursor: start from now, not from the topic's beginning. Replaying
-  // years of listings on a cold start would be harmless but slow and pointless
-  // — nothing that old is still a live price for anything.
-  const startTime = cursor?.lastConsensusAt ? Timestamp.fromDate(cursor.lastConsensusAt) : Timestamp.fromDate(new Date());
 
+  // No prior cursor: start from the current block, not from the registry's
+  // first. Replaying every listing ever made would be harmless but slow and
+  // pointless — nothing that old is still a live price for anything.
+  let from = cursor?.lastBlock ?? (await getBlockNumber());
   if (!cursor) {
-    await db
-      .insert(listenerState)
-      .values({ id: 1, topicId: env.HCS_LISTINGS_TOPIC, lastConsensusAt: null })
-      .onConflictDoNothing();
+    await db.insert(listenerState).values({ id: 1, lastBlock: from }).onConflictDoNothing();
+  } else if (cursor.lastBlock === null) {
+    await db.update(listenerState).set({ lastBlock: from, updatedAt: new Date() }).where(eq(listenerState.id, 1));
   }
 
-  const handle = new TopicMessageQuery({ topicId: env.HCS_LISTINGS_TOPIC, startTime }).subscribe(
-    client,
-    (_message, error) => {
-      logger.error({ err: error }, "agent listener subscription error");
-    },
-    (message) => {
-      const consensusAt = message.consensusTimestamp.toDate();
-      let payload: { type?: string; gameId?: string; priceUnits?: number | null };
-      try {
-        payload = JSON.parse(Buffer.from(message.contents).toString("utf8"));
-      } catch {
-        payload = {};
+  const tick = async () => {
+    // Skipped rather than queued if the previous read is still running: a slow
+    // round must not stack up overlapping log queries that would each hand the
+    // same event to the same agents.
+    if (reading) return;
+    reading = true;
+    try {
+      // `eth_blockNumber` trails what a `latest` state read already sees, which
+      // for a log cursor is the safe direction — it delays an event rather than
+      // skipping one, and the next tick picks it up. See services/arc/reads.ts.
+      const head = await getBlockNumber();
+      if (head < from) return;
+
+      const events = await getListingEvents(from, head);
+      from = head + 1n;
+      await db.update(listenerState).set({ lastBlock: from, updatedAt: new Date() }).where(eq(listenerState.id, 1));
+
+      for (const event of events) {
+        await handleEvent(event).catch((err) =>
+          logger.error({ err, gameId: event.gameId, kind: event.kind }, "handling a registry event failed"),
+        );
       }
+    } catch (err) {
+      // Left where it was on failure, so a transient RPC error re-reads the
+      // same range next tick instead of skipping past it.
+      logger.error({ err, from: from.toString() }, "reading GameRegistry events failed");
+    } finally {
+      reading = false;
+    }
+  };
 
-      // Fire-and-log: a subscription callback cannot be awaited, and one bad
-      // message must not take the whole listener down.
-      handleMessage(payload, consensusAt).catch((err) =>
-        logger.error({ err, gameId: payload.gameId }, "handling a listings message failed"),
-      );
-    },
-  );
-
-  unsubscribe = () => handle.unsubscribe();
-  logger.info({ topic: env.HCS_LISTINGS_TOPIC, resumedFrom: startTime.toDate().toISOString() }, "agent listener subscribed");
+  polling = setInterval(() => void tick(), POLL_INTERVAL_MS);
+  logger.info({ resumedFromBlock: from.toString(), everyMs: POLL_INTERVAL_MS }, "agent listener reading GameRegistry events");
 }
 
 export function stopAgentListener(): void {
-  unsubscribe?.();
-  unsubscribe = null;
+  if (polling) clearInterval(polling);
+  polling = null;
 }
 
-async function handleMessage(
-  payload: { type?: string; gameId?: string; priceUnits?: number | null },
-  consensusAt: Date,
-): Promise<void> {
-  // The cursor moves on every message, not only ones that trigger something —
-  // otherwise a restart replays everything after the last message that
-  // happened to matter, which grows without bound.
-  await db.update(listenerState).set({ lastConsensusAt: consensusAt, updatedAt: new Date() }).where(eq(listenerState.id, 1));
+/**
+ * One registry event, turned into "which agents should look again".
+ *
+ * Only events that state a price someone could act on get this far. A delisting
+ * must never read as an offer, and on the registry it cannot: `Delisted` has no
+ * price field to misread. `Demand` is excluded for the same reason — it says how
+ * many people want a game, not what it costs.
+ */
+async function handleEvent(event: RegistryEvent): Promise<void> {
+  const gameUuid = uuidFromGameId(event.gameId);
+  if (!gameUuid) return;
 
-  // Only messages that actually state a price are worth anyone's attention —
-  // same filter the old watcher used, for the same reason: a delisting must
-  // never look like an offer to something reading the topic.
-  if (!payload.gameId || typeof payload.priceUnits !== "number") return;
+  // `build_updated` is excluded on purpose, and this is a change from the HCS
+  // version, which re-evaluated on a patch only because the topic message
+  // happened to carry a price field. A patch does not change what a game costs,
+  // so it cannot change whether an agent should buy it.
+  const statesAPrice = event.kind === "listed" || event.kind === "relisted" || event.kind === "price_changed";
+  if (!statesAPrice) return;
 
+  await notifyWanters(gameUuid);
+}
+
+async function notifyWanters(gameId: string): Promise<void> {
   const wanters = await db.query.wishlistItems.findMany({
-    where: and(eq(wishlistItems.gameId, payload.gameId), isNotNull(wishlistItems.agentMaxUnits)),
+    where: and(eq(wishlistItems.gameId, gameId), isNotNull(wishlistItems.agentMaxUnits)),
     columns: { userId: true },
   });
   if (wanters.length === 0) return;
