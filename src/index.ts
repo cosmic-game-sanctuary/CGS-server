@@ -7,8 +7,7 @@ import httpLogger from "./middleware/httpLogger.js";
 import generalLimiter from "./middleware/ratelimit.middleware.js";
 import { notFoundHandler, errorHandler } from "./middleware/errorHandler.middleware.js";
 import { pingDb } from "./db/client.js";
-import hederaClient from "./services/hedera/client.js";
-import { pingMirror } from "./services/hedera/mirror.js";
+import { operator as arcOperator, publicClient } from "./services/arc/client.js";
 
 import gameRouter from "./routes/game.routes.js";
 import gameManageRouter from "./routes/gameManage.routes.js";
@@ -44,9 +43,42 @@ app.use(httpLogger);
 app.use(generalLimiter);
 
 app.get("/health", async (_req: Request, res: Response) => {
-  const [dbReachable, mirrorReachable] = await Promise.all([pingDb(), pingMirror()]);
-  res.json({ ok: dbReachable && mirrorReachable, network: env.HEDERA_NETWORK, operatorId: hederaClient.operatorAccountId?.toString() ?? null, mirrorReachable, dbReachable });
+  const [dbReachable, chain] = await Promise.all([pingDb(), pingArc()]);
+  res.json({
+    ok: dbReachable && chain.reachable,
+    network: `arc-${env.ARC_NETWORK}`,
+    chainId: chain.chainId,
+    blockNumber: chain.blockNumber,
+    operator: chain.operator,
+    chainReachable: chain.reachable,
+    dbReachable,
+  });
 });
+
+/**
+ * Is the chain answering, and are we configured to write to it?
+ *
+ * Reports the operator address rather than just "reachable" because the two
+ * failures look identical from outside and are fixed completely differently: an
+ * unreachable RPC is Arc's problem, and a missing key is ours.
+ */
+async function pingArc() {
+  try {
+    const [chainId, blockNumber] = await Promise.all([
+      publicClient().getChainId(),
+      publicClient().getBlockNumber(),
+    ]);
+    let operator: string | null = null;
+    try {
+      operator = arcOperator().address;
+    } catch {
+      operator = null; // no ARC_OPERATOR_KEY — reads work, writes do not
+    }
+    return { reachable: true, chainId, blockNumber: Number(blockNumber), operator };
+  } catch {
+    return { reachable: false, chainId: null, blockNumber: null, operator: null };
+  }
+}
 
 // Before gameRouter, so its PATCH/DELETE/:id and /:id/builds land before the
 // catalog's own "/:idOrSlug" gets a chance at them. Same prefix, different

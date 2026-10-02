@@ -5,7 +5,7 @@ import { AppError, Errors } from "../../lib/errors.js";
 import { env } from "../../config/env.js";
 import { privy } from "../privy/client.js";
 import { derivePublicKeyHex } from "../privy/signing.js";
-import { getAccountByEvmAddress } from "../hedera/mirror.js";
+import { getUsdcUnits } from "../arc/reads.js";
 import { refundAgentBalance } from "../wallet/withdraw.js";
 import { resolveHederaAccount } from "../users/repo.js";
 import { isSubnameAvailable, registerAgentSubname } from "../ens/registrar.js";
@@ -163,11 +163,13 @@ export async function nameAgent(agent: Agent, label: string): Promise<Agent> {
  * a fresh agent, not an error.
  */
 export async function agentBalance(agent: Agent): Promise<bigint> {
-  const account = await getAccountByEvmAddress(agent.agentEvmAddress);
-  if (!account) return 0n;
-  const token = account.balance?.tokens.find((t) => t.token_id === env.X402_ASSET);
-  return BigInt(token?.balance ?? 0);
+  // The agent's spending cap *is* this number and nothing else — it is never
+  // mirrored into a column, because a cached balance is a wrong balance waiting
+  // to happen. Read in the app's own 6-decimal units, the same unit a price is
+  // quoted in, so a comparison against a want's maximum needs no conversion.
+  return getUsdcUnits(agent.agentEvmAddress as `0x${string}`);
 }
+
 
 /**
  * End an agent and hand back whatever is left, in one server-side action —
@@ -196,30 +198,18 @@ export async function retireAgent(
   if (!claimed) return { agent, refundTxId: null, refundedUnits: 0n };
 
   const balance = await agentBalance(claimed);
-  if (balance <= 0n || !claimed.agentAccountId) {
-    return { agent: claimed, refundTxId: null, refundedUnits: 0n };
-  }
+  if (balance <= 0n) return { agent: claimed, refundTxId: null, refundedUnits: 0n };
 
   const buyer = await db.query.users.findFirst({ where: eq(users.id, claimed.buyerUserId) });
   if (!buyer) return { agent: claimed, refundTxId: null, refundedUnits: 0n };
 
-  const buyerAccountId = await resolveHederaAccount(buyer);
-  // The buyer's own wallet has never received anything — genuinely rare (they
-  // funded the agent from somewhere else entirely) but not impossible, and
-  // there is nowhere to send the refund. Left in the agent's wallet rather
-  // than lost; a future retry (or a manual withdrawal once they do have an
-  // account) can still move it.
-  if (!buyerAccountId) {
-    logger.warn({ agentId: claimed.id }, "agent retired but the buyer has no Hedera account to refund to");
-    return { agent: claimed, refundTxId: null, refundedUnits: 0n };
-  }
-
+  // No "has the buyer got an account yet" check any more: on Arc their address
+  // is always a valid destination, so the one case that used to strand a refund
+  // cannot happen.
   const refundTxId = await refundAgentBalance({
     agentWalletId: claimed.agentWalletId,
-    agentPublicKeyHex: claimed.agentPublicKeyHex,
-    fromAccountId: claimed.agentAccountId,
-    toAccountId: buyerAccountId,
-    asset: env.X402_ASSET,
+    agentAddress: claimed.agentEvmAddress as `0x${string}`,
+    to: buyer.evmAddress as `0x${string}`,
     amountUnits: balance,
   });
 

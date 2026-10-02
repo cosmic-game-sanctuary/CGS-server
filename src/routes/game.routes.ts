@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { Router, type Request } from "express";
+import type { Address } from "viem";
 import { and, desc, asc, eq, or, ilike, inArray, isNotNull, lt, sql } from "drizzle-orm";
 import { z } from "zod";
 import multer from "multer";
@@ -57,19 +58,23 @@ import { pinFile, gatewayUrl } from "../services/ipfs/pinata.js";
 import { ingestBuild, commitBuild } from "../services/games/builds.js";
 import { announce } from "../services/games/listing.js";
 import {
-  resourceServer,
-  ensureInitialized,
+  challengeBody,
+  decodePaymentHeader,
+  ownerForPayment,
   readPaymentHeader,
-  decodePaymentPayload,
-} from "../services/x402/server.js";
-import { fulfilPurchase } from "../services/games/fulfil.js";
+  settleFromHeader,
+  termsFor,
+} from "../services/arc/x402/gate.js";
+import { fulfilArcPurchase } from "../services/games/fulfilArc.js";
 import { publishLimiter } from "../middleware/ratelimit.middleware.js";
 import { publishAgentMandateInBackground } from "../services/agent/mandate.js";
-import { getAccountByEvmAddress } from "../services/hedera/mirror.js";
-import { preparePayment, completePayment, prepareTrialChunk, completeTrialChunk } from "../services/x402/pay.js";
+import {
+  prepare as prepareArcPayment,
+  prepareTrialChunk as prepareArcTrialChunk,
+  complete as completeArcPayment,
+} from "../services/arc/x402/browserPay.js";
 import { emailStudioInvite } from "../services/email/messages.js";
 import { createGameToken } from "../services/hedera/hts.js";
-import { resolveHederaAccount } from "../services/users/repo.js";
 import {
   trialEnabled,
   trialStatusFor,
@@ -383,7 +388,7 @@ gameRouter.get(
     let agentMaxUnits: number | null = null;
     let agentNote: string | null = null;
     if (req.auth) {
-      owned = (await ownsGame(req.auth.evmAddress, game.htsTokenId)).owned;
+      owned = (await ownsGame(req.auth.evmAddress, game.id)).owned;
       const saved = await db.query.wishlistItems.findFirst({
         where: and(eq(wishlistItems.gameId, game.id), eq(wishlistItems.userId, req.auth.id)),
       });
@@ -838,6 +843,28 @@ gameRouter.post(
   }),
 );
 
+/**
+ * Circle's idempotency key for a payment, scoped to our seller account.
+ *
+ * Derived from the authorization's own nonce rather than generated per request,
+ * so a retry of the *same* signed authorization converges on Circle's same
+ * payment record instead of being treated as a second charge. A fresh signature
+ * is a genuinely new payment and gets a new id, which is what we want.
+ */
+function paymentIdFor(gameId: string, payment: { authorization: { nonce: string } }): string {
+  const nonce = payment.authorization.nonce.replace(/^0x/, "");
+  return `cgs_${gameId.replaceAll("-", "")}_${nonce}`.slice(0, 128);
+}
+
+/** Is this address an agent's wallet? Decides whether to honour an owner override. */
+async function isAgentAddress(address: string): Promise<boolean> {
+  const row = await db.query.wishlistAgents.findFirst({
+    where: sql`lower(${wishlistAgents.agentEvmAddress}) = ${address.toLowerCase()}`,
+    columns: { id: true },
+  });
+  return Boolean(row);
+}
+
 // The x402-gated route — the one endpoint here that isn't ordinary REST.
 //
 // Three branches, in this order:
@@ -878,22 +905,24 @@ gameRouter.get(
     // itself always is: this handler runs once to issue the 402 and again to
     // settle the retry, and both runs need to agree. See
     // services/games/trials.ts#resolvePurchasePrice for the arithmetic.
-    const creditAccountId = req.auth ? await resolveHederaAccount(req.auth) : null;
+    // On Arc the buyer's own address *is* their account id, so there is no
+    // resolution step and no "wallet not funded yet" state to handle.
+    const creditAccountId = req.auth ? req.auth.evmAddress : null;
     const { owedUnits, creditUnits } = await resolvePurchasePrice(game, creditAccountId);
 
-    // Credit alone covers the whole price. Below the relay's one-tinybar
-    // floor a zero-amount x402 challenge would just fail confusingly, so this
-    // routes through the same "nothing to charge" shape a free game uses,
-    // rather than ever offering payment terms for zero.
+    // Credit alone covers the whole price, so there is nothing to charge. A
+    // zero-amount x402 challenge is not a thing, so this routes through the
+    // same "nothing to charge" shape a free game uses.
     if (owedUnits === 0 && creditAccountId) {
-      await fulfilPurchase(
+      await fulfilArcPurchase({
         game,
-        creditAccountId,
-        `trial-credit:${game.id}:${creditAccountId}`,
-        0,
-        "purchase",
-        game.priceUnits,
-      );
+        ownerAddress: creditAccountId as Address,
+        payerAddress: creditAccountId as Address,
+        settlementTx: "0x",
+        amountUnits: 0,
+        kind: "purchase",
+        creditAppliedUnits: game.priceUnits,
+      });
       res.json({
         buildPath: buildPathFor(game),
         buildCid: game.buildCid,
@@ -903,99 +932,75 @@ gameRouter.get(
       return;
     }
 
-    await ensureInitialized();
+    const terms = termsFor(req, game, owedUnits, `${game.title} — game build`);
 
-    const requirements = await resourceServer.buildPaymentRequirements({
-      scheme: "exact",
-      network: env.X402_NETWORK,
-      payTo: env.X402_PAY_TO,
-      price: { asset: game.priceAsset, amount: String(owedUnits) },
-      maxTimeoutSeconds: 180,
-    });
-
-    const resourceInfo = {
-      url: `${req.protocol}://${req.get("host")}${req.originalUrl}`,
-      description: `${game.title} — game build`,
-      mimeType: "application/json",
-    };
-
-    const header = readPaymentHeader(req.headers as Record<string, unknown>);
+    const header = readPaymentHeader(req.headers);
     if (!header) {
-      const paymentRequired = await resourceServer.createPaymentRequiredResponse(
-        requirements,
-        resourceInfo,
-      );
-      res.status(402).json(paymentRequired);
+      res.status(402).json(challengeBody(terms));
       return;
     }
 
-    const payload = decodePaymentPayload(header);
-    const matched = resourceServer.findMatchingRequirements(requirements, payload);
-    if (!matched) {
-      throw new AppError(402, "PAYMENT_REQUIRED", "The payment doesn't match this game's price.");
-    }
-
-    const verification = await resourceServer.verifyPayment(payload, matched);
-    if (!verification.isValid) {
-      throw new AppError(402, "PAYMENT_REQUIRED", "Payment could not be verified.", {
-        reason: verification.invalidReason,
-        message: verification.invalidMessage,
-      });
-    }
-
-    const settlement = await resourceServer.settlePayment(payload, matched);
-    if (!settlement.success) {
-      throw new AppError(402, "PAYMENT_REQUIRED", "Payment could not be settled.", {
-        reason: settlement.errorReason,
-      });
-    }
-
-    // Settlement is the moment the buyer is entitled to the game, so respond
-    // now and do the minting, the split and the sale log in the background.
-    // Blocking here would put ~6s of chain round-trips in front of the single
-    // most important moment in the product.
-    //
-    // Awaited, though, because fulfilPurchase records the purchase before it
-    // returns and only the chain work runs on. The client asks for the build
-    // the instant this responds, and that request checks the record.
-    let buyerAccountId = settlement.payer ?? payload.accepted?.payTo;
+    const payment = decodePaymentHeader(header);
 
     // An agent pays with its own wallet on behalf of whoever funded it — the
-    // GameKey belongs to that person, not to the agent's own account, which
-    // nobody ever logs into. Only honoured when the account that actually
-    // signed the payment is a real agent's, so this header changes nothing
-    // for an ordinary buyer's own purchase.
-    const ownerOverride = req.headers["x-owner-account-id"];
-    if (typeof ownerOverride === "string" && settlement.payer) {
-      const payerIsAgent = await db.query.wishlistAgents.findFirst({
-        where: eq(wishlistAgents.agentAccountId, settlement.payer),
-        columns: { id: true },
+    // GameKey belongs to that person, not to the agent's wallet, which nobody
+    // ever logs into. Only honoured when the address that actually signed the
+    // payment is a known agent's, so this header changes nothing for an
+    // ordinary buyer's own purchase.
+    //
+    // Resolved from the *claimed* payer before settling, so the check below can
+    // run first. Circle confirms who really signed, and that is asserted against
+    // this afterwards.
+    const owner = await ownerForPayment(req, payment.authorization.from, isAgentAddress);
+
+    // **Refuse rather than charge.** An x402 client carries no bearer token, so
+    // the branch above that serves an owner their game cannot recognise one —
+    // it only knows who an authenticated caller is. Without this, an agent or a
+    // script that already held the key would pay a second time for something it
+    // already owns, and get a second key for it. The payment names its own
+    // payer, which is enough to answer the question before any money moves.
+    const already = await hasEntitlement(owner, game);
+    if (already.owned) {
+      throw new AppError(409, "ALREADY_OWNED", "That wallet already owns this game. Nothing was charged.", {
+        serial: already.serial,
       });
-      if (payerIsAgent) buyerAccountId = ownerOverride;
     }
 
-    if (buyerAccountId) {
-      // The amount the payment was actually verified and settled against, not
-      // the game's price read a second time. Those are the same number today
-      // and stop being the same number the instant a promotion starts or ends
-      // between the 402 and the retry — see fulfil.ts#fulfilPurchase.
-      const paidUnits = Number(matched.amount ?? owedUnits);
-      // `creditUnits` was computed once, above, from the same authenticated
-      // caller this challenge was built for — an agent's purchase never has
-      // one (no bearer token on that request), so an agent can never redeem a
-      // person's trial credit on their behalf without them asking.
-      // `settlement.payer` as well as the buyer: when an agent paid, those are
-      // two different accounts and the studio should hear the agent's name.
-      await fulfilPurchase(
-        game,
-        buyerAccountId,
-        settlement.transaction,
-        paidUnits,
-        "purchase",
-        creditUnits,
-        settlement.payer ?? buyerAccountId,
-      );
-    }
+    // Idempotent per (game, buyer, authorization): retrying the same signed
+    // authorization converges on Circle's same payment record rather than
+    // charging twice, which is what makes a retry after a timeout safe.
+    const settled = await settleFromHeader(terms, payment, paymentIdFor(game.id, payment));
+
+    // Circle recovers the payer itself, and a smart-account buyer's signature
+    // need not recover to the address in the authorization. If the two disagree
+    // about who paid, the owner resolved above was resolved from the wrong
+    // address — so re-resolve from Circle's answer, which is authoritative.
+    const confirmedOwner =
+      settled.payer.toLowerCase() === payment.authorization.from.toLowerCase()
+        ? owner
+        : await ownerForPayment(req, settled.payer, isAgentAddress);
+
+    // Settlement is the moment the buyer is entitled to the game, so the mint
+    // runs in the background and this responds now. Awaited, though, because
+    // the sale is recorded before it returns and the client asks for the build
+    // the instant this responds — that request reads the record.
+    //
+    // `settled.amountUnits` is what the payment actually settled for, never the
+    // listing price read a second time: those are the same number until a
+    // promotion starts or ends between the 402 and the retry.
+    //
+    // `creditUnits` was computed above from the same authenticated caller this
+    // challenge was built for. An agent's purchase carries no bearer token, so
+    // an agent can never redeem a person's trial credit without them asking.
+    await fulfilArcPurchase({
+      game,
+      ownerAddress: confirmedOwner,
+      payerAddress: settled.payer,
+      settlementTx: settled.transaction,
+      amountUnits: settled.amountUnits,
+      kind: "purchase",
+      creditAppliedUnits: creditUnits,
+    });
 
     res.setHeader("payment-verified", "true");
     res.json({
@@ -1003,7 +1008,7 @@ gameRouter.get(
       buildCid: game.buildCid,
       tokenId: game.htsTokenId,
       keyStatus: "pending",
-      settlementTxId: settlement.transaction,
+      settlementTxId: settled.transaction,
     });
   }),
 );
@@ -1041,8 +1046,7 @@ gameRouter.get(
         // here, whoever holds the zip holds it. So the honest line is the one
         // that matches what was actually sold: money changed hands for access,
         // and the clock is the client's promise to keep.
-        const accountId = await resolveHederaAccount(req.auth!);
-        const chunks = accountId ? await trialChunksFor(game.id, accountId) : [];
+        const chunks = await trialChunksFor(game.id, req.auth!.evmAddress);
         if (chunks.length === 0) {
           throw Errors.notOwner("You need to own this game, or a trial chunk of it, to download it.");
         }
@@ -1074,7 +1078,7 @@ gameRouter.get(
   asyncHandler(async (req, res) => {
     const game = await findGameByRef(param(req, "id"));
     if (!game) throw Errors.notFound("Game");
-    const result = await ownsGame(req.auth!.evmAddress, game.htsTokenId);
+    const result = await ownsGame(req.auth!.evmAddress, game.id);
     res.json(result);
   }),
 );
@@ -1090,27 +1094,10 @@ gameRouter.get(
 // is a much bigger permission than a purchase needs — it is standing authority
 // to move their money whenever we like — and it would have to be granted before
 // the first buy, on the checkout screen, in a modal about wallet delegation.
-// See services/x402/pay.ts#preparePayment.
+// See services/arc/x402/browserPay.ts.
 //
 // The agent does not come through here. Its wallet is one we created, so it can
-// still be signed for in one step (services/x402/pay.ts#payForGame).
-
-/**
- * The Hedera account behind a wallet, or the reason there isn't one yet.
- *
- * No public key is looked up here, and that is the whole point. A wallet that
- * has only ever received value has a *hollow* account (HIP-583): it holds the
- * money, its alias is the 20-byte EVM address, and the Mirror Node reports
- * `key: null` until it signs something. That describes every first-time buyer,
- * so demanding a published key up front refused exactly the people we exist to
- * serve. The key comes out of the payment signature instead, and signing the
- * payment is also what completes the account.
- */
-async function payerFor(evmAddress: string) {
-  const account = await getAccountByEvmAddress(evmAddress);
-  if (!account) throw Errors.walletNotFunded();
-  return { accountId: account.account };
-}
+// still be signed for in one step (services/arc/x402/agentPay.ts#payForGame).
 
 gameRouter.post(
   "/:id/pay/prepare",
@@ -1128,37 +1115,32 @@ gameRouter.post(
       return;
     }
 
-    const payer = await payerFor(req.auth!.evmAddress);
-    const result = await preparePayment({
-      userId: req.auth!.id,
-      gameId: game.id,
-      accountId: payer.accountId,
-      evmAddress: req.auth!.evmAddress,
-      // Handed on so the self-call to /download is made as this buyer. That
-      // handler prices a purchase by subtracting their trial credit, and it
-      // can only do that for a caller it can see.
-      authorization: req.headers.authorization,
-    });
+    // The same price the 402 would quote, including trial credit — so what the
+    // buyer signs is what we asked for, and a client cannot author its own.
+    const { owedUnits } = await resolvePurchasePrice(game, req.auth!.evmAddress);
+    const terms = termsFor(req, game, owedUnits, `${game.title} — game build`);
 
-    if ("granted" in result) {
-      res.json({ status: "granted", ...(result.granted as object) });
-      return;
-    }
-    res.json({ status: "prepared", ...result.prepared });
+    res.json({
+      status: "prepared",
+      ...prepareArcPayment({
+        userId: req.auth!.id,
+        gameId: game.id,
+        evmAddress: req.auth!.evmAddress,
+        requirements: terms.requirements,
+        resource: terms.resource,
+        // Handed on so the loopback settle is made as this buyer. That handler
+        // prices a purchase by subtracting their trial credit, and it can only
+        // do that for a caller it can see.
+        bearer: req.headers.authorization,
+      }),
+    });
   }),
 );
 
 const completePaymentSchema = z.object({
   intentId: z.string().uuid(),
-  signatures: z
-    .array(
-      z.object({
-        hash: z.string().regex(/^0x[0-9a-fA-F]{64}$/, "must be a 32-byte hex hash"),
-        signature: z.string().regex(/^0x[0-9a-fA-F]{128,130}$/, "must be a hex signature"),
-      }),
-    )
-    .min(1)
-    .max(16),
+  /** One EIP-712 signature over the authorization `prepare` handed back. */
+  signature: z.string().regex(/^0x[0-9a-fA-F]{130}$/, "must be a 65-byte hex signature"),
 });
 
 gameRouter.post(
@@ -1170,11 +1152,10 @@ gameRouter.post(
     const game = await findGameByRef(param(req, "id"));
     if (!game) throw Errors.notFound("Game");
 
-    const result = await completePayment({
+    const result = await completeArcPayment({
       userId: req.auth!.id,
-      gameId: game.id,
       intentId: body.intentId,
-      signatures: body.signatures,
+      signature: body.signature as `0x${string}`,
     });
     res.json(result);
   }),
@@ -1184,7 +1165,7 @@ gameRouter.post(
 //
 // A chunk of play, bought like anything else in this route file — a real
 // x402 payment, prepared and signed the same two-step way a purchase is
-// (services/x402/pay.ts#prepareTrialChunk). What every chunk paid for adds up
+// (services/arc/x402/browserPay.ts#prepareTrialChunk). What every chunk paid for adds up
 // to credit toward the purchase, applied automatically by /:id/download —
 // see services/games/trials.ts. See docs/stage-20.md for the design and the
 // reason a build being unpacked in the browser means a trial can't be
@@ -1203,8 +1184,7 @@ gameRouter.get(
     const game = await findGameByRef(param(req, "id"));
     if (!game) throw Errors.notFound("Game");
 
-    const buyerAccountId = req.auth ? await resolveHederaAccount(req.auth) : null;
-    const status = await trialStatusFor(game, buyerAccountId);
+    const status = await trialStatusFor(game, req.auth?.evmAddress ?? null);
 
     res.json({
       ...status,
@@ -1235,67 +1215,43 @@ gameRouter.get(
       throw new AppError(422, "TRIAL_NOT_ENABLED", "This game doesn't offer a trial.");
     }
 
-    await ensureInitialized();
+    const terms = termsFor(
+      req,
+      game,
+      game.trialChunkPriceUnits!,
+      `${game.title} — one trial chunk (${game.trialChunkMinutes} min)`,
+    );
 
-    const requirements = await resourceServer.buildPaymentRequirements({
-      scheme: "exact",
-      network: env.X402_NETWORK,
-      payTo: env.X402_PAY_TO,
-      price: { asset: game.priceAsset, amount: String(game.trialChunkPriceUnits) },
-      maxTimeoutSeconds: 180,
-    });
-
-    const resourceInfo = {
-      url: `${req.protocol}://${req.get("host")}${req.originalUrl}`,
-      description: `${game.title} — one trial chunk (${game.trialChunkMinutes} min)`,
-      mimeType: "application/json",
-    };
-
-    const header = readPaymentHeader(req.headers as Record<string, unknown>);
+    const header = readPaymentHeader(req.headers);
     if (!header) {
-      const paymentRequired = await resourceServer.createPaymentRequiredResponse(requirements, resourceInfo);
-      res.status(402).json(paymentRequired);
+      res.status(402).json(challengeBody(terms));
       return;
     }
 
-    const payload = decodePaymentPayload(header);
-    const matched = resourceServer.findMatchingRequirements(requirements, payload);
-    if (!matched) {
-      throw new AppError(402, "PAYMENT_REQUIRED", "The payment doesn't match the trial chunk's price.");
-    }
+    const payment = decodePaymentHeader(header);
+    const settled = await settleFromHeader(terms, payment, paymentIdFor(game.id, payment));
 
-    const verification = await resourceServer.verifyPayment(payload, matched);
-    if (!verification.isValid) {
-      throw new AppError(402, "PAYMENT_REQUIRED", "Payment could not be verified.", {
-        reason: verification.invalidReason,
-        message: verification.invalidMessage,
-      });
-    }
-
-    const settlement = await resourceServer.settlePayment(payload, matched);
-    if (!settlement.success) {
-      throw new AppError(402, "PAYMENT_REQUIRED", "Payment could not be settled.", {
-        reason: settlement.errorReason,
-      });
-    }
-
-    const buyerAccountId = settlement.payer ?? payload.accepted?.payTo;
-    if (buyerAccountId) {
-      // How many chunks this account has already paid for on this game,
-      // checked against the cap here rather than trusted from the client —
-      // the same "never trust a stale snapshot" reasoning as everywhere else
-      // gated on the Mirror Node. The payment already settled by this point,
-      // so a chunk bought past the cap is still recorded (money moved, the
-      // record has to be honest) but the max is enforced by `/prepare`
-      // refusing to build one in the first place — this is the backstop.
-      const paidUnits = Number(matched.amount ?? game.trialChunkPriceUnits);
-      await fulfilPurchase(game, buyerAccountId, settlement.transaction, paidUnits, "trial_chunk");
-    }
+    // A chunk goes to whoever signed for it. There is no bearer token on this
+    // request at all — the payment is the identification, exactly as it is for
+    // an anonymous purchase through /download.
+    //
+    // The cap is enforced by `/trial/chunks/prepare` refusing to build a chunk
+    // past `trialMaxChunks`. By here the money has already moved, so a chunk
+    // bought past the cap is still recorded — the record has to be honest about
+    // what was paid — and this is the backstop, not the gate.
+    await fulfilArcPurchase({
+      game,
+      ownerAddress: settled.payer,
+      payerAddress: settled.payer,
+      settlementTx: settled.transaction,
+      amountUnits: settled.amountUnits,
+      kind: "trial_chunk",
+    });
 
     res.setHeader("payment-verified", "true");
     res.json({
       chunkMinutes: game.trialChunkMinutes,
-      settlementTxId: settlement.transaction,
+      settlementTxId: settled.transaction,
     });
   }),
 );
@@ -1310,32 +1266,34 @@ gameRouter.post(
       throw new AppError(422, "TRIAL_NOT_ENABLED", "This game doesn't offer a trial.");
     }
 
-    const buyerAccountId = await resolveHederaAccount(req.auth!);
-    if (!buyerAccountId) throw Errors.walletNotFunded();
+    const buyerAccountId = req.auth!.evmAddress;
 
-    // The cap is enforced here, before a transfer is even built — a chunk
-    // that would push past `trialMaxChunks` is refused rather than sold and
-    // then somehow un-sold. Read fresh, not trusted from an earlier response.
+    // The cap is enforced here, before anything is signed — a chunk that would
+    // push past `trialMaxChunks` is refused rather than sold and then somehow
+    // un-sold. Read fresh, not trusted from an earlier response.
     const status = await trialStatusFor(game, buyerAccountId);
     if (status.chunksLeft <= 0) {
       throw new AppError(409, "TRIAL_CHUNKS_EXHAUSTED", "No trial chunks left for this game.");
     }
 
-    const result = await prepareTrialChunk({
-      userId: req.auth!.id,
-      gameId: game.id,
-      accountId: buyerAccountId,
-      evmAddress: req.auth!.evmAddress,
-      authorization: req.headers.authorization,
-    });
+    const terms = termsFor(
+      req,
+      game,
+      game.trialChunkPriceUnits!,
+      `${game.title} — one trial chunk (${game.trialChunkMinutes} min)`,
+    );
 
-    if ("granted" in result) {
-      // Not a real path today — the settle route always prices a chunk above
-      // zero — but kept rather than assumed away, the same as /pay/prepare.
-      res.json({ status: "granted", ...(result.granted as object) });
-      return;
-    }
-    res.json({ status: "prepared", ...result.prepared });
+    res.json({
+      status: "prepared",
+      ...prepareArcTrialChunk({
+        userId: req.auth!.id,
+        gameId: game.id,
+        evmAddress: buyerAccountId,
+        requirements: terms.requirements,
+        resource: terms.resource,
+        bearer: req.headers.authorization,
+      }),
+    });
   }),
 );
 
@@ -1348,11 +1306,10 @@ gameRouter.post(
     const game = await findGameByRef(param(req, "id"));
     if (!game) throw Errors.notFound("Game");
 
-    const result = await completeTrialChunk({
+    const result = await completeArcPayment({
       userId: req.auth!.id,
-      gameId: game.id,
       intentId: body.intentId,
-      signatures: body.signatures,
+      signature: body.signature as `0x${string}`,
     });
     res.json(result);
   }),
@@ -1414,7 +1371,7 @@ gameRouter.post(
     const game = await findGameByRef(param(req, "id"));
     if (!game) throw Errors.notFound("Game");
 
-    const { owned } = await ownsGame(req.auth!.evmAddress, game.htsTokenId);
+    const { owned } = await ownsGame(req.auth!.evmAddress, game.id);
     if (!owned) throw Errors.notOwner("You need to own this game to review it.");
 
     const [review] = await db

@@ -501,7 +501,7 @@ async function notifyStudio(game: Game, amountUnits: number, payerAccountId: str
   }
 }
 
-export { resolveAccountId, distributeSplits };
+export { resolveAccountId, distributeSplits, notifyStudio, recordPurchase };
 
 /**
  * Everything held for this person, across every studio they are on.

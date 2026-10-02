@@ -218,6 +218,14 @@ export const games = pgTable("games", {
   // endpoint has to be able to tell them apart.
   delistedBy: text("delisted_by"),
   htsTokenId: text("hts_token_id"),
+  // The game's own SplitVault on Arc — where buyers pay, and the only place its
+  // revenue ever sits. Deployed at publish with the split fixed in it, so this
+  // is both the x402 `payTo` and the proof that the split is not ours to change:
+  // the contract at this address has no function that could redirect a payment.
+  // Null for a game published before the Arc port, which falls back to
+  // ARC_FALLBACK_PAY_TO. Never rewritten once set — a vault is immutable, so
+  // changing this would mean pointing a published game's money somewhere else.
+  vaultAddress: text("vault_address"),
   // Trial config. Null trialChunkPriceUnits means the developer never opted
   // in, which is the default and the common case — checked together with
   // trialMaxChunks in the manage route, not here, since "chunk price without

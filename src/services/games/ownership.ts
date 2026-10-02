@@ -1,17 +1,25 @@
-import { getAccountByEvmAddress, getNftsForAccount } from "../hedera/mirror.js";
+import type { Address } from "viem";
+import { ownsGame as ownsOnChain } from "../arc/keys.js";
+import { gameIdFor } from "../arc/registry.js";
 
-// the only correct way to answer "does this wallet own this game" — checked
-// against the mirror node every time, never against the GameKey cache table.
-// a game with no hts_token_id yet (not published, or published before Stage 2
-// mints one) can never be owned, which is the right answer, not a bug.
-export async function ownsGame(evmAddress: string, htsTokenId: string | null) {
-  if (!htsTokenId) return { owned: false as const };
-
-  const account = await getAccountByEvmAddress(evmAddress);
-  if (!account) return { owned: false as const }; // wallet not funded yet -> owns nothing
-
-  const nfts = await getNftsForAccount(account.account, htsTokenId);
-  if (nfts.length === 0) return { owned: false as const };
-
-  return { owned: true as const, serial: nfts[0]!.serial_number };
+/**
+ * The only correct way to answer "does this wallet own this game" — asked of
+ * Arc every time, never of the `game_keys` cache table.
+ *
+ * On Arc there is one `GameKey` collection for every game, and the key records
+ * which game it is for, so this is a single `eth_call` against contract state
+ * rather than the Hedera build's per-game token lookup. It is also the reason
+ * `GameKey` is enumerable: the alternative is scanning `Transfer` logs, and
+ * Arc's public RPC refuses a span wide enough to cover a game's history.
+ *
+ * Anyone can run this same query without our permission, which is what makes
+ * ownership a claim about the chain rather than about our database.
+ */
+export async function ownsGame(
+  evmAddress: string,
+  /** The game's own id. Padded to the `bytes32` the contracts use. */
+  gameUuid: string,
+): Promise<{ owned: false } | { owned: true; serial: number }> {
+  const result = await ownsOnChain(evmAddress as Address, gameIdFor(gameUuid));
+  return result.owned ? { owned: true, serial: Number(result.tokenId) } : { owned: false };
 }

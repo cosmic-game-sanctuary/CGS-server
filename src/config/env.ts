@@ -129,6 +129,24 @@ const envSchema = z.object({
   ARC_GAME_REGISTRY: evmAddress.optional(),
   ARC_GAME_KEY: evmAddress.optional(),
 
+  // Circle's Facilitator Service — it verifies each buyer authorization, screens
+  // both parties, submits the USDC transfer and pays the settlement gas. One
+  // host for both networks; the CAIP-2 `network` field selects testnet.
+  CIRCLE_FACILITATOR_URL: z.string().url().default("https://api.circle.com"),
+  // Free, from console.circle.com. **Effectively required**: without it
+  // settlement falls back to Circle's keyless trial, which authenticates with a
+  // signature from the key controlling `payTo` — and `payTo` is a SplitVault,
+  // which has no key. See services/arc/x402/facilitator.ts.
+  CIRCLE_API_KEY: z.string().optional(),
+  // Where a game's money goes until its vault exists. Only ever used for a game
+  // with no `vault_address` (published before Stage 5), and never a real sale's
+  // destination once vaults are deployed at publish.
+  ARC_FALLBACK_PAY_TO: evmAddress.optional(),
+  // The platform's share of every sale, basis points. 500 = 5%, against Steam's
+  // 3000 and itch.io's 1000. Fixed into each vault at publish and visible to the
+  // developer before they agree — see docs/arc-port.md §3.
+  PLATFORM_FEE_BPS: z.coerce.number().int().min(0).max(10_000).default(500),
+
   HCS_LISTINGS_TOPIC: z.string().optional(),
   HCS_SALES_TOPIC: z.string().optional(),
   HCS_AGENT_IDENTITY_TOPIC: z.string().optional(),

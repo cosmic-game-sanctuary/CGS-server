@@ -29,7 +29,7 @@ import {
   type Verdict,
 } from "../services/agent/decide.js";
 import { rawVerdictSchema } from "../services/agent/model.js";
-import { payForGame, payForVerdict } from "../services/x402/pay.js";
+import { payForGame, payForVerdict } from "../services/arc/x402/agentPay.js";
 import { canAsk, decideByFor, ASK_WINDOW_MS } from "../services/agent/timing.js";
 import { emailAgentPurchased, emailAgentExpired, emailAgentAsked } from "../services/email/messages.js";
 import { env } from "../config/env.js";
@@ -257,8 +257,8 @@ async function runRound(agent: Agent): Promise<void> {
   // and by the time an agent can buy at all it was already required to
   // resolve once, at anchoring (see runAgentSweep), so this is a cached read.
   const buyerUser = await db.query.users.findFirst({ where: eq(users.id, agent.buyerUserId) });
-  const buyerAccountId = buyerUser ? await resolveHederaAccount(buyerUser) : null;
-  if (!buyerAccountId) {
+  const buyerAddress = buyerUser?.evmAddress ?? null;
+  if (!buyerAddress) {
     logger.error({ agentId: agent.id }, "agent can't buy — its own buyer has no resolvable Hedera account");
     // Still reschedule. Returning bare would leave this agent with no alarm
     // clock at all, so it would never look again even once the buyer's account
@@ -274,7 +274,7 @@ async function runRound(agent: Agent): Promise<void> {
     ? await getVerdict(agent, eligible, balance, deterministic)
     : fallbackVerdict(eligible, deterministic); // Nothing is being traded off: buy it, no model call, no cost.
 
-  const bought = await actOnVerdict(agent, buyerAccountId, eligible, verdict);
+  const bought = await actOnVerdict(agent, buyerAddress, eligible, verdict);
 
   // One line per round, because until now the only thing an agent logged was a
   // completed purchase — and the interesting rounds are the ones where it
@@ -385,11 +385,7 @@ async function getVerdict(
   if (!env.GROQ_API_KEY) return fallbackVerdict(eligible, deterministic);
 
   try {
-    const paid = await payForVerdict({
-      walletId: agent.agentWalletId,
-      accountId: agent.agentAccountId!,
-      publicKeyHex: agent.agentPublicKeyHex,
-    });
+    const paid = await payForVerdict(agent);
     const raw = rawVerdictSchema.parse(paid.verdict);
     return sanitizeVerdict(raw, eligible, balance, deterministic, paid.costUnits, paid.settlementTxId ?? null);
   } catch (err) {
@@ -413,7 +409,7 @@ function tightestDeadline(wants: EligibleWant[]): Date | null {
  *  from the schedule it sets next. */
 async function actOnVerdict(
   agent: Agent,
-  buyerAccountId: string,
+  buyerAddress: string,
   eligible: EligibleWant[],
   verdict: Verdict,
 ): Promise<Set<string>> {
@@ -465,7 +461,7 @@ async function actOnVerdict(
 
   const bought =
     verdict.buyNow.length > 0
-      ? await executeBuys(agent, buyerAccountId, consideredIds, verdict.buyNow, verdict.reasoning, takeCharge())
+      ? await executeBuys(agent, buyerAddress, consideredIds, verdict.buyNow, verdict.reasoning, takeCharge())
       : new Set<string>();
   await recordDeclines(agent, consideredIds, verdict.decline, verdict.reasoning, takeCharge);
   return bought;
@@ -528,7 +524,8 @@ async function notifyAsked(
  */
 async function executeBuys(
   agent: Agent,
-  buyerAccountId: string,
+  /** The person this agent works for. The key lands with them, not the agent. */
+  buyerAddress: string,
   consideredIds: string[],
   buyNow: EligibleWant[],
   reasoning: string | null,
@@ -559,11 +556,7 @@ async function executeBuys(
       continue;
     }
     try {
-      await payForGame(
-        want.gameId,
-        { walletId: agent.agentWalletId, accountId: agent.agentAccountId!, publicKeyHex: agent.agentPublicKeyHex },
-        buyerAccountId,
-      );
+      await payForGame(want.gameId, agent, buyerAddress);
       bought.push(want);
     } catch (err) {
       // One failed purchase does not stop the others — each was planned
@@ -658,9 +651,9 @@ export async function respondToDecision(
     const toBuy = planPurchases(stillWanted, balance);
 
     const buyerUser = await db.query.users.findFirst({ where: eq(users.id, agent.buyerUserId) });
-    const buyerAccountId = buyerUser ? await resolveHederaAccount(buyerUser) : null;
+    const buyerAddress = buyerUser?.evmAddress ?? null;
 
-    if (toBuy.length === 0 || !buyerAccountId) {
+    if (toBuy.length === 0 || !buyerAddress) {
       await db.insert(agentDecisions).values({
         agentId: agent.id,
         kind: "declined",
@@ -672,7 +665,7 @@ export async function respondToDecision(
       return { outcome: "declined", alreadyResolved: false };
     }
 
-    await executeBuys(claimed, buyerAccountId, decision.consideredGameIds, toBuy, null, NO_CHARGE);
+    await executeBuys(claimed, buyerAddress, decision.consideredGameIds, toBuy, null, NO_CHARGE);
     return { outcome: "bought", alreadyResolved: false };
   } finally {
     await db.update(wishlistAgents).set({ status: "watching" }).where(eq(wishlistAgents.id, claimed.id));
@@ -751,9 +744,9 @@ async function resolveDecision(decision: Decision): Promise<void> {
 
       if (bought.length > 0) {
         const buyerUser = await db.query.users.findFirst({ where: eq(users.id, agent.buyerUserId) });
-        const buyerAccountId = buyerUser ? await resolveHederaAccount(buyerUser) : null;
-        if (buyerAccountId) {
-          await executeBuys(claimed, buyerAccountId, decision.chosenGameIds, bought, null, NO_CHARGE);
+        const buyerAddress = buyerUser?.evmAddress ?? null;
+        if (buyerAddress) {
+          await executeBuys(claimed, buyerAddress, decision.chosenGameIds, bought, null, NO_CHARGE);
         } else {
           bought = [];
         }

@@ -37,6 +37,16 @@ export function errorHandler(
     return;
   }
 
+  // A misconfiguration, not a bug: the chain layer could not be used because
+  // something it needs was never set. Reported as such rather than as an
+  // opaque 500, because the message names exactly which setting is missing and
+  // "Something went wrong on our end" throws that away.
+  if (err instanceof Error && (err.name === "ArcConfigError" || err.name === "FacilitatorConfigError")) {
+    logger.error({ err, path: req.originalUrl }, "chain configuration is incomplete");
+    res.status(503).json({ error: { code: "CHAIN_NOT_CONFIGURED", message: err.message } });
+    return;
+  }
+
   logger.error({ err }, "unhandled error");
   res.status(500).json({
     error: { code: "INTERNAL", message: "Something went wrong on our end." },

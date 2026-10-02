@@ -1,5 +1,4 @@
 import { Router } from "express";
-import { eq } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { wishlistAgents } from "../db/schema.js";
 import { asyncHandler } from "../lib/asyncHandler.js";
@@ -8,12 +7,16 @@ import { env } from "../config/env.js";
 import { wantsFor } from "../services/agent/decide.js";
 import { agentBalance } from "../services/agent/wallet.js";
 import { callAgentModel } from "../services/agent/model.js";
+import { sql } from "drizzle-orm";
 import {
-  resourceServer,
-  ensureInitialized,
+  challengeBody,
+  decodePaymentHeader,
+  operatorAddress,
   readPaymentHeader,
-  decodePaymentPayload,
-} from "../services/x402/server.js";
+  settleFromHeader,
+  type GateTerms,
+} from "../services/arc/x402/gate.js";
+import { buildRequirements } from "../services/arc/x402/requirements.js";
 import logger from "../utils/logger.utils.js";
 
 const agentInferenceRouter = Router({ caseSensitive: true, strict: true });
@@ -25,11 +28,11 @@ const agentInferenceRouter = Router({ caseSensitive: true, strict: true });
  * handler for the shape this is deliberately copying.
  *
  * No request body. What to decide about is derived entirely from *who paid*:
- * the settled payment names an account, and if that account is a known
+ * the settled payment names an address, and if that address is a known
  * agent's, its currently eligible wants and its currently held balance are
  * recomputed fresh here rather than trusted from whatever the caller saw a
- * moment earlier — the same reasoning that makes the Mirror Node the only
- * ground truth anywhere else in this app. A client that isn't a known agent
+ * moment earlier — the same reasoning that makes the chain the only ground
+ * truth anywhere else in this app. A client that isn't a known agent
  * gets a clear error after paying a few hundredths of a cent for nothing,
  * which is the same tradeoff `/download`'s owner-override header already
  * makes: identity is checked against `wishlistAgents` after settlement, not
@@ -47,56 +50,36 @@ agentInferenceRouter.get(
       throw new AppError(503, "MODEL_UNAVAILABLE", "No decision model is configured on this server.");
     }
 
-    await ensureInitialized();
-
-    const requirements = await resourceServer.buildPaymentRequirements({
-      scheme: "exact",
-      network: env.X402_NETWORK,
-      payTo: env.X402_PAY_TO,
-      price: { asset: env.X402_ASSET, amount: String(env.AGENT_INFERENCE_PRICE_UNITS) },
-      maxTimeoutSeconds: 60,
-    });
-
-    const resourceInfo = {
-      url: `${req.protocol}://${req.get("host")}${req.originalUrl}`,
-      description: "wishlist agent — one purchase verdict",
-      mimeType: "application/json",
+    // The one route whose payee is genuinely us: a verdict is this platform's own
+    // service, not a game, so there is no vault and no split to enforce. Paid to
+    // the operator directly, which is also why it is the one `payTo` that does
+    // not come from `payToFor`.
+    const terms: GateTerms = {
+      payTo: operatorAddress(),
+      requirements: buildRequirements(operatorAddress(), BigInt(env.AGENT_INFERENCE_PRICE_UNITS)),
+      resource: {
+        url: `${req.protocol}://${req.get("host")}${req.originalUrl}`,
+        description: "wishlist agent — one purchase verdict",
+        mimeType: "application/json",
+      },
     };
 
-    const header = readPaymentHeader(req.headers as Record<string, unknown>);
+    const header = readPaymentHeader(req.headers);
     if (!header) {
-      const paymentRequired = await resourceServer.createPaymentRequiredResponse(
-        requirements,
-        resourceInfo,
-      );
-      res.status(402).json(paymentRequired);
+      res.status(402).json(challengeBody(terms));
       return;
     }
 
-    const payload = decodePaymentPayload(header);
-    const matched = resourceServer.findMatchingRequirements(requirements, payload);
-    if (!matched) {
-      throw new AppError(402, "PAYMENT_REQUIRED", "The payment doesn't match the verdict price.");
-    }
+    const payment = decodePaymentHeader(header);
+    const settled = await settleFromHeader(
+      terms,
+      payment,
+      `cgs_verdict_${payment.authorization.nonce.replace(/^0x/, "")}`.slice(0, 128),
+    );
 
-    const verification = await resourceServer.verifyPayment(payload, matched);
-    if (!verification.isValid) {
-      throw new AppError(402, "PAYMENT_REQUIRED", "Payment could not be verified.", {
-        reason: verification.invalidReason,
-      });
-    }
-
-    const settlement = await resourceServer.settlePayment(payload, matched);
-    if (!settlement.success) {
-      throw new AppError(402, "PAYMENT_REQUIRED", "Payment could not be settled.", {
-        reason: settlement.errorReason,
-      });
-    }
-
-    const payerAccountId = settlement.payer ?? payload.accepted?.payTo;
-    const agent = payerAccountId
-      ? await db.query.wishlistAgents.findFirst({ where: eq(wishlistAgents.agentAccountId, payerAccountId) })
-      : null;
+    const agent = await db.query.wishlistAgents.findFirst({
+      where: sql`lower(${wishlistAgents.agentEvmAddress}) = ${settled.payer.toLowerCase()}`,
+    });
     if (!agent) {
       throw new AppError(403, "NOT_AN_AGENT", "Only a known agent wallet can pay for a verdict.");
     }
@@ -108,7 +91,7 @@ agentInferenceRouter.get(
 
     try {
       const verdict = await callAgentModel({ eligible, pending, balanceUnits, asset: env.X402_ASSET });
-      res.json({ verdict, costUnits: env.AGENT_INFERENCE_PRICE_UNITS, settlementTxId: settlement.transaction });
+      res.json({ verdict, costUnits: env.AGENT_INFERENCE_PRICE_UNITS, settlementTxId: settled.transaction });
     } catch (err) {
       // The payment already settled — thinking failed, not paying for it. The
       // caller (evaluateAgent) falls back to the deterministic plan either
@@ -116,7 +99,7 @@ agentInferenceRouter.get(
       // not a stuck agent.
       logger.error({ err, agentId: agent.id }, "agent model call failed after settlement");
       throw new AppError(502, "MODEL_UNAVAILABLE", "Could not get a verdict this round.", {
-        settlementTxId: settlement.transaction,
+        settlementTxId: settled.transaction,
       });
     }
   }),

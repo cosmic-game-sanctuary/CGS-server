@@ -1,248 +1,195 @@
 import { randomUUID } from "node:crypto";
-import {
-  AccountId,
-  Client,
-  Hbar,
-  PrivateKey,
-  TokenId,
-  type Transaction,
-  TransactionId,
-  TransferTransaction,
-} from "@hiero-ledger/sdk";
-import { env } from "../../config/env.js";
-import { hederaPublicKeyFromHex, publicKeyForAddress, signHederaMessage } from "../privy/signing.js";
-import { attachSignatures, signingHashes, toCompactSignature } from "../x402/transfer.js";
+import { createWalletClient, http, isAddress, type Address, type Hex } from "viem";
+import { arcChain, confirm, feeOverrides, publicClient, unitsToWei, USDC_ADDRESS, weiToUnits } from "../arc/client.js";
+import { getUsdcUnits } from "../arc/reads.js";
+import { privyViemAccount } from "../arc/x402/payer.js";
+import { AppError, Errors } from "../../lib/errors.js";
+import logger from "../../utils/logger.utils.js";
 
 /**
  * Taking money back out of the wallet Privy made for you.
  *
- * Two things make this different from a purchase, and both are why it is its
- * own module rather than a branch inside the payment path.
+ * **Almost all of this used to be server-side and no longer needs to be.** On
+ * Hedera a withdrawal had to be built, frozen and submitted here so that the
+ * *operator* could pay the network fee — a wallet holding only USDC and no HBAR
+ * was otherwise a wallet you could not empty. On Arc the fee is denominated in
+ * USDC, which is the same asset being withdrawn, so a wallet with money in it
+ * can always afford to move that money. The entire reason for the server to
+ * stand in the middle is gone.
  *
- * **The operator pays the fee, not the person withdrawing.** A purchase has
- * its fee covered by the x402 facilitator, so a buyer can hold nothing but
- * USDC and still transact. A withdrawal is an ordinary transfer with no
- * facilitator in it, and requiring HBAR to move your own money out would mean
- * a wallet holding only USDC is a wallet you cannot empty. The transaction id
- * names the operator, which is what makes it the fee payer.
+ * So this is now validation and a receipt, not orchestration:
  *
- * **The server still cannot sign for the owner.** Their key is theirs, same as
- * a purchase, so this keeps the same two-step shape: build and freeze here,
- * sign in the browser, submit here.
+ *   `prepare` checks the destination and the amount against the live balance and
+ *   hands back the exact transaction to send. The browser sends it with the
+ *   buyer's own wallet, because the key belongs to them — the same division of
+ *   authority as a purchase.
+ *
+ *   `confirm` verifies on chain that the transaction it is told about really did
+ *   move the amount to the destination. It is a receipt, so it cannot be
+ *   fooled by a client reporting a withdrawal that did not happen.
+ *
+ * This replaces the earnings withdrawal too, but only for a wallet balance. A
+ * developer's *share of sales* is never withdrawn from us at all: it accrues in
+ * the game's SplitVault and they call `claim()` on it themselves.
  */
 
 export type WithdrawIntent = {
   id: string;
   userId: string;
-  evmAddress: string;
-  fromAccountId: string;
-  /** What to call the destination on screen: an account id, or the address. */
-  toAccountId: string;
-  asset: string;
-  amountUnits: string;
-  memo: string | null;
-  frozenTx: string;
-  hashes: string[];
+  from: Address;
+  to: Address;
+  amountUnits: bigint;
   expiresAt: number;
 };
 
-// Same window as a payment intent and for the same reason: a Hedera
-// transaction is valid for 120 seconds from the valid start fixed at freeze
-// time, and expiring a little early makes a late completion fail here rather
-// than as an opaque network rejection.
-const TTL_MS = 100_000;
-
+const TTL_MS = 10 * 60 * 1000;
 const intents = new Map<string, WithdrawIntent>();
 
-function client(): Client {
-  const c = env.HEDERA_NETWORK === "mainnet" ? Client.forMainnet() : Client.forTestnet();
-  c.setMaxNodesPerTransaction(3);
-  return c;
-}
-
-export async function prepareWithdraw(input: {
-  userId: string;
-  evmAddress: string;
-  fromAccountId: string;
-  /** Null when the destination has no Hedera account yet. See `toEvmAddress`. */
-  toAccountId: string | null;
-  /**
-   * The destination as an EVM address, when that is what was given.
-   *
-   * A wallet that has never received value has no account to send to, and
-   * refusing on that basis made a whole class of destination unreachable — a
-   * brand new agent's wallet most of all, since funding it *is* the first thing
-   * that would ever have landed there. Transferring to the alias creates the
-   * account as a side effect, which is the same HIP-542 mechanic a held payout
-   * already uses to pay a collaborator who has never touched Hedera. The
-   * creation fee falls on the sender, and the sender here is the operator.
-   */
-  toEvmAddress?: string | null;
-  asset: string;
-  amountUnits: bigint;
-  memo?: string | null;
-}): Promise<WithdrawIntent> {
+function sweep(): void {
   const now = Date.now();
-  for (const [id, held] of intents) if (held.expiresAt <= now) intents.delete(id);
-
-  const from = AccountId.fromString(input.fromAccountId);
-  const to = input.toAccountId
-    ? AccountId.fromString(input.toAccountId)
-    : AccountId.fromEvmAddress(0, 0, input.toEvmAddress!);
-  const tx = new TransferTransaction();
-
-  if (input.asset === "0.0.0") {
-    tx.addHbarTransfer(from, Hbar.fromTinybars((-input.amountUnits).toString()));
-    tx.addHbarTransfer(to, Hbar.fromTinybars(input.amountUnits.toString()));
-  } else {
-    const token = TokenId.fromString(input.asset);
-    tx.addTokenTransfer(token, from, -input.amountUnits);
-    tx.addTokenTransfer(token, to, input.amountUnits);
-  }
-
-  // Exchanges run pooled deposit accounts and use the memo to work out whose
-  // deposit it is — the same mechanic as an XRP tag or a Stellar memo. Sending
-  // to one without it is how people lose money, so it has to be passable.
-  if (input.memo) tx.setTransactionMemo(input.memo);
-
-  // The operator, so the person withdrawing needs no HBAR of their own.
-  tx.setTransactionId(TransactionId.generate(AccountId.fromString(env.HEDERA_OPERATOR_ID)));
-
-  const c = client();
-  try {
-    tx.freezeWith(c);
-  } finally {
-    c.close();
-  }
-
-  const frozen = tx.toBytes();
-  const intent: WithdrawIntent = {
-    id: randomUUID(),
-    userId: input.userId,
-    evmAddress: input.evmAddress,
-    fromAccountId: input.fromAccountId,
-    toAccountId: input.toAccountId ?? input.toEvmAddress!,
-    asset: input.asset,
-    amountUnits: input.amountUnits.toString(),
-    memo: input.memo ?? null,
-    frozenTx: Buffer.from(frozen).toString("base64"),
-    hashes: await signingHashes(frozen),
-    expiresAt: now + TTL_MS,
-  };
-  intents.set(intent.id, intent);
-  return intent;
+  for (const [id, intent] of intents) if (intent.expiresAt <= now) intents.delete(id);
 }
 
 /**
- * Removed rather than read, before anything is submitted, so retrying the same
- * intent cannot send a second transfer.
+ * Gas has to come out of the same balance being moved, so sending *everything*
+ * would leave nothing to pay for sending it. This is held back from a
+ * "withdraw all" and is deliberately generous — a plain transfer costs about a
+ * tenth of this.
  */
+export const GAS_RESERVE_UNITS = 20_000n;
+
+export async function prepareWithdraw(input: {
+  userId: string;
+  from: Address;
+  to: string;
+  /** Omit to send everything the wallet can afford to send. */
+  amountUnits?: bigint;
+}): Promise<WithdrawIntent & { reservedForGasUnits: bigint }> {
+  sweep();
+
+  if (!isAddress(input.to)) {
+    throw Errors.validationFailed({ to: "That doesn't look like a wallet address." });
+  }
+  const to = input.to as Address;
+  if (to.toLowerCase() === input.from.toLowerCase()) {
+    throw Errors.validationFailed({ to: "That is this wallet. Send it somewhere else." });
+  }
+
+  const balanceUnits = await getUsdcUnits(input.from);
+  const sendable = balanceUnits > GAS_RESERVE_UNITS ? balanceUnits - GAS_RESERVE_UNITS : 0n;
+
+  const amountUnits = input.amountUnits ?? sendable;
+  if (amountUnits <= 0n) {
+    throw Errors.validationFailed({
+      amountUnits:
+        balanceUnits === 0n
+          ? "There is nothing in this wallet to withdraw yet."
+          : "There is not enough here to cover the transfer fee as well.",
+    });
+  }
+  if (amountUnits > balanceUnits) {
+    throw Errors.validationFailed({ amountUnits: `That is more than this wallet holds (${balanceUnits}).` });
+  }
+  if (amountUnits > sendable) {
+    throw Errors.validationFailed({
+      amountUnits: `Leave at least ${GAS_RESERVE_UNITS} units for the transfer fee — the most you can send is ${sendable}.`,
+    });
+  }
+
+  const intent: WithdrawIntent = {
+    id: randomUUID(),
+    userId: input.userId,
+    from: input.from,
+    to,
+    amountUnits,
+    expiresAt: Date.now() + TTL_MS,
+  };
+  intents.set(intent.id, intent);
+  return { ...intent, reservedForGasUnits: GAS_RESERVE_UNITS };
+}
+
+/** The transaction the browser should send. Native USDC, so no token call. */
+export function transactionFor(intent: WithdrawIntent) {
+  return {
+    to: intent.to,
+    /** Native 18-decimal wei, which is what a wallet expects in `value`. */
+    value: unitsToWei(intent.amountUnits).toString(),
+    chainId: arcChain().id,
+  };
+}
+
 export function consumeWithdrawIntent(id: string, userId: string): WithdrawIntent | undefined {
   const intent = intents.get(id);
   if (!intent) return undefined;
   intents.delete(id);
-  if (intent.userId !== userId) return undefined;
-  if (intent.expiresAt <= Date.now()) return undefined;
+  if (intent.userId !== userId || intent.expiresAt <= Date.now()) return undefined;
   return intent;
 }
 
 /**
- * Move money out of a wallet the server itself holds — an agent's — with no
- * browser round trip at all.
+ * Confirm a withdrawal actually happened, from the chain rather than from the
+ * client's word for it.
+ */
+export async function confirmWithdraw(
+  intent: WithdrawIntent,
+  txHash: Hex,
+): Promise<{ txHash: Hex; amountUnits: bigint; to: Address }> {
+  const receipt = await publicClient().waitForTransactionReceipt({ hash: txHash, timeout: 60_000 });
+  if (receipt.status !== "success") {
+    throw new AppError(422, "WITHDRAW_FAILED", "That transaction failed on chain. Nothing was sent.");
+  }
+
+  const tx = await publicClient().getTransaction({ hash: txHash });
+  const sameParties =
+    tx.from.toLowerCase() === intent.from.toLowerCase() && tx.to?.toLowerCase() === intent.to.toLowerCase();
+  if (!sameParties || weiToUnits(tx.value) !== intent.amountUnits) {
+    throw new AppError(
+      422,
+      "WITHDRAW_MISMATCH",
+      "That transaction does not match the withdrawal it was sent for.",
+    );
+  }
+  return { txHash, amountUnits: weiToUnits(tx.value), to: intent.to };
+}
+
+/**
+ * Hand an agent's leftover balance back to the person who funded it.
  *
- * A user's withdrawal needs the two-step prepare/sign/submit shape because
- * their key is theirs and only their browser can sign with it. An agent's key
- * belongs to a wallet we created, so both signatures — the agent's own and the
- * operator's fee — happen here in one call. This is what makes cancelling or
- * expiring an agent a single server-side action rather than something that
- * waits on the person coming back to approve it.
+ * The one withdrawal the server may do on someone's behalf, and only because the
+ * wallet in question is one *we* created for the agent — never a person's own.
+ * It runs with no browser round trip, which is what lets an agent be retired or
+ * expired by a background sweep rather than only while its owner is watching.
+ *
+ * Returns null when there is nothing worth sending: the balance has to cover the
+ * fee to move it, and an agent whose remaining balance is smaller than its own
+ * transfer fee has, in every sense that matters, nothing left.
  */
 export async function refundAgentBalance(input: {
   agentWalletId: string;
-  agentPublicKeyHex: string;
-  fromAccountId: string;
-  toAccountId: string;
-  asset: string;
+  agentAddress: Address;
+  to: Address;
   amountUnits: bigint;
-}): Promise<string | null> {
-  if (input.amountUnits <= 0n) return null; // nothing to return is not an error
-
-  const from = AccountId.fromString(input.fromAccountId);
-  const to = AccountId.fromString(input.toAccountId);
-  const tx = new TransferTransaction();
-
-  if (input.asset === "0.0.0") {
-    tx.addHbarTransfer(from, Hbar.fromTinybars((-input.amountUnits).toString()));
-    tx.addHbarTransfer(to, Hbar.fromTinybars(input.amountUnits.toString()));
-  } else {
-    const token = TokenId.fromString(input.asset);
-    tx.addTokenTransfer(token, from, -input.amountUnits);
-    tx.addTokenTransfer(token, to, input.amountUnits);
-  }
-  tx.setTransactionId(TransactionId.generate(AccountId.fromString(env.HEDERA_OPERATOR_ID)));
-
-  const c = client();
-  try {
-    tx.freezeWith(c);
-    // The agent's own signature, produced the same way a purchase's is — see
-    // x402/signer.ts#createPrivyHederaSigner. `signWith` handles the
-    // per-node signing a multi-node transaction actually needs; there is no
-    // browser step to hand hashes to here.
-    await tx.signWith(hederaPublicKeyFromHex(input.agentPublicKeyHex), (message) =>
-      signHederaMessage(input.agentWalletId, message),
+}): Promise<Hex | null> {
+  const sendable = input.amountUnits > GAS_RESERVE_UNITS ? input.amountUnits - GAS_RESERVE_UNITS : 0n;
+  if (sendable <= 0n) {
+    logger.info(
+      { agentAddress: input.agentAddress, amountUnits: input.amountUnits.toString() },
+      "agent balance is too small to cover its own refund fee — nothing sent",
     );
-    const withFee = await tx.sign(PrivateKey.fromStringECDSA(env.HEDERA_OPERATOR_KEY.replace(/^0x/, "")));
-    const response = await withFee.execute(c);
-    const receipt = await response.getReceipt(c);
-    if (receipt.status.toString() !== "SUCCESS") {
-      throw new Error(`agent refund failed on the network: ${receipt.status.toString()}`);
-    }
-    return response.transactionId.toString();
-  } finally {
-    c.close();
+    return null;
   }
+
+  const account = privyViemAccount(input.agentWalletId, input.agentAddress);
+  const wallet = createWalletClient({ account, chain: arcChain(), transport: http() });
+  const hash = await wallet.sendTransaction({
+    account,
+    chain: arcChain(),
+    to: input.to,
+    value: unitsToWei(sendable),
+    ...(await feeOverrides()),
+  });
+  await confirm(hash);
+  return hash;
 }
 
-export async function submitWithdraw(
-  intent: WithdrawIntent,
-  signatures: { hash: string; signature: string }[],
-): Promise<string> {
-  const frozen = new Uint8Array(Buffer.from(intent.frozenTx, "base64"));
-
-  // Recovered from the signature rather than looked up, because a wallet that
-  // has only ever received value publishes no key (HIP-583). Recovering it and
-  // checking it against the address being debited also proves the signer holds
-  // that wallet.
-  const first = signatures[0];
-  if (!first) throw new Error("no signatures were provided");
-  const publicKeyHex = publicKeyForAddress(
-    new Uint8Array(Buffer.from(first.hash.replace(/^0x/, ""), "hex")),
-    first.signature,
-    intent.evmAddress,
-  );
-  if (!publicKeyHex) throw new Error("the signature does not belong to this wallet");
-
-  const byHash = new Map(signatures.map((s) => [s.hash, toCompactSignature(s.signature)]));
-  const signed: Transaction = await attachSignatures(
-    frozen,
-    hederaPublicKeyFromHex(publicKeyHex),
-    byHash,
-  );
-
-  const c = client();
-  try {
-    // The owner authorises the debit, the operator pays the fee. Both
-    // signatures have to be on it for the transaction to be valid.
-    const withFee = await signed.sign(
-      PrivateKey.fromStringECDSA(env.HEDERA_OPERATOR_KEY.replace(/^0x/, "")),
-    );
-    const response = await withFee.execute(c);
-    const receipt = await response.getReceipt(c);
-    if (receipt.status.toString() !== "SUCCESS") {
-      throw new Error(`withdrawal failed on the network: ${receipt.status.toString()}`);
-    }
-    return response.transactionId.toString();
-  } finally {
-    c.close();
-  }
-}
+export { USDC_ADDRESS };

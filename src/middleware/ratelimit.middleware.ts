@@ -8,7 +8,7 @@ import { AppError } from "../lib/errors.js";
  * Two things about this were wrong until 2026-09-11 and both surfaced as a
  * paid trial dying mid-play with a bare "Request failed (429)".
  *
- * **A settling payment is four requests, not two.** `services/x402/pay.ts`
+ * **A settling payment is four requests, not two.** `services/arc/x402/browserPay.ts`
  * settles by calling our own gated route over loopback — `readChallenge` for
  * the `402`, then `settle` to pay it — so one chunk costs `prepare` +
  * `complete` from the browser plus two requests this process makes to itself.

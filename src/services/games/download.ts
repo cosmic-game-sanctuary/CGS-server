@@ -1,8 +1,8 @@
+import type { Address } from "viem";
 import { games } from "../../db/schema.js";
 import { Errors } from "../../lib/errors.js";
-import { getAccountByEvmAddress } from "../hedera/mirror.js";
 import { hasEntitlement } from "./entitlement.js";
-import { fulfilPurchase } from "./fulfil.js";
+import { fulfilArcPurchase } from "./fulfilArc.js";
 import type { Auth } from "../../middleware/auth.middleware.js";
 
 type Game = typeof games.$inferSelect;
@@ -70,18 +70,22 @@ export async function grantAccess(game: Game, auth: Auth | undefined): Promise<A
  * A free game still mints a real GameKey. `price = 0` is a real purchase with
  * real ownership, not a bypass.
  *
- * Nothing to do if the wallet has never received value: there is no Hedera
- * account to mint to yet. That is not an error, it just means the key arrives
- * the first time they come back with a funded wallet.
+ * Simpler on Arc than it was on Hedera, where a wallet that had never received
+ * value had no account to mint to and the key had to wait for one. An address is
+ * a valid recipient from the moment it exists, so a free game's key mints the
+ * first time someone asks for it, funded or not.
  */
 async function grantFreeKey(game: Game, buyerEvmAddress: string): Promise<void> {
   const { owned } = await hasEntitlement(buyerEvmAddress, game);
   if (owned) return;
 
-  const account = await getAccountByEvmAddress(buyerEvmAddress);
-  if (!account) return;
-
-  // Zero received, so zero to split. `runSplitDistribution` short-circuits on
-  // that and marks the sale distributed rather than leaving it pending forever.
-  void fulfilPurchase(game, account.account, "free", 0);
+  // Nothing was received, so there is nothing to split and no vault involved.
+  void fulfilArcPurchase({
+    game,
+    ownerAddress: buyerEvmAddress as Address,
+    payerAddress: buyerEvmAddress as Address,
+    settlementTx: "0x",
+    amountUnits: 0,
+    kind: "purchase",
+  });
 }

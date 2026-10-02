@@ -1,18 +1,25 @@
 import { Router } from "express";
 import { z } from "zod";
 import multer from "multer";
-import { and, desc, eq, inArray, isNotNull, ne } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, ne, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { studios, studioMembers, games, playSessions, users, sales, gameKeys } from "../db/schema.js";
 import { requireAuth } from "../middleware/auth.middleware.js";
 import { asyncHandler } from "../lib/asyncHandler.js";
 import { env } from "../config/env.js";
-import { resolveHederaAccount } from "../services/users/repo.js";
-import { getAccountByEvmAddress, getAllNftsForAccount } from "../services/hedera/mirror.js";
+import { getUsdcUnits } from "../services/arc/reads.js";
+import { keysHeldBy } from "../services/arc/keys.js";
+import { uuidFromGameId } from "../services/arc/registry.js";
 import { assetDecimals, ensFullName, toDisplayAmount } from "../lib/display.js";
 import { validate } from "../middleware/validate.middleware.js";
 import { Errors } from "../lib/errors.js";
-import { consumeWithdrawIntent, prepareWithdraw, submitWithdraw } from "../services/wallet/withdraw.js";
+import {
+  confirmWithdraw,
+  consumeWithdrawIntent,
+  prepareWithdraw,
+  transactionFor,
+  USDC_ADDRESS,
+} from "../services/wallet/withdraw.js";
 import { settleHeldPayoutsForUser } from "../services/games/fulfil.js";
 import { personalEarnings } from "../services/earnings/report.js";
 import { wishlistFor } from "../services/games/wishlist.js";
@@ -24,45 +31,24 @@ import { AppError } from "../lib/errors.js";
 
 const meRouter = Router({ caseSensitive: true, strict: true });
 
-// The identity endpoint neither login screen nor profile menu had anywhere
-// to call: who you are, whether your wallet has a Hedera account yet, its
-// current balance in the game asset, and which studio (if any) you own or
-// belong to. Nothing here is cached except the hederaAccountId itself
-// (through resolveHederaAccount) — balance always asks the Mirror Node fresh,
-// since a cached balance is just a wrong balance waiting to happen.
+// The identity endpoint neither login screen nor profile menu had anywhere to
+// call: who you are, your wallet's current balance, and which studio (if any)
+// you own or belong to.
+//
+// Simpler on Arc in two ways. There is no "does this wallet have an account
+// yet" state — an address is live from the moment it exists — and there is no
+// second asset to report, because the gas token and the money are the same
+// token. Nothing here is cached: a cached balance is a wrong balance waiting to
+// happen, so it is always read fresh from the chain.
 meRouter.get(
   "/",
   requireAuth,
   asyncHandler(async (req, res) => {
     const auth = req.auth!;
-    const hadAccount = auth.hederaAccountId !== null;
-    const hederaAccountId = await resolveHederaAccount(auth);
 
-    // A safety net, not the primary path any more — settleHeldPayouts pays a
-    // known EVM address directly now, account or not (fulfil.ts), so a share
-    // is held only for as long as an invite is genuinely unaccepted. This
-    // just catches anything from before that was true, or a transient
-    // failure at accept-time. Fires once, on the request where the account
-    // first resolves, and on a request we were serving anyway.
-    if (!hadAccount && hederaAccountId) {
-      void settleHeldPayoutsForUser(auth.id, { accountId: hederaAccountId, evmAddress: auth.evmAddress }).catch(
-        (err) => logger.error({ err, userId: auth.id }, "auto-settling held payouts failed"),
-      );
-    }
-
-    let balanceUnits: string | null = null;
-    // Tinybars. Reported separately from the settlement asset because it isn't
-    // spending money here: the x402 facilitator covers the fee on a purchase
-    // and the operator covers it on a withdrawal, so HBAR is only ever what
-    // opened the account. A wallet showing 0 USDC and some HBAR is a funded
-    // wallet with nothing to spend, and those read identically without this.
-    let hbarUnits: string | null = null;
-    if (hederaAccountId) {
-      const account = await getAccountByEvmAddress(auth.evmAddress);
-      const tokenBalance = account?.balance?.tokens.find((t) => t.token_id === env.X402_ASSET);
-      balanceUnits = String(tokenBalance?.balance ?? 0);
-      hbarUnits = String(account?.balance?.balance ?? 0);
-    }
+    // Atomic USDC units, 6dp — the same unit a price is quoted in. There is no
+    // separate gas balance to report: on Arc the fee is paid in this.
+    const balanceUnits = String(await getUsdcUnits(auth.evmAddress as `0x${string}`));
 
     const ownedStudio = await db.query.studios.findFirst({ where: eq(studios.ownerUserId, auth.id) });
 
@@ -149,16 +135,13 @@ meRouter.get(
       avatarCid: me?.avatarCid ?? null,
       avatarUrl: me?.avatarCid ? gatewayUrl(me.avatarCid) : null,
       libraryPublic: me?.libraryPublic ?? true,
-      hederaAccountId,
       balanceUnits,
-      balanceAsset: env.X402_ASSET,
-      // same reasoning as priceUsd on a game: the header renders this and
-      // never computes with it, and the decimals it would need to derive one
-      // are config that only lives here. See game.routes.ts#toDisplayAmount.
-      balanceUsd: balanceUnits === null ? 0 : toDisplayAmount(Number(balanceUnits), env.X402_ASSET),
-      balanceAssetDecimals: assetDecimals(env.X402_ASSET),
-      hbarUnits,
-      hbar: hbarUnits === null ? 0 : toDisplayAmount(Number(hbarUnits), "0.0.0"),
+      balanceAsset: USDC_ADDRESS,
+      // Same reasoning as priceUsd on a game: the header renders this and never
+      // computes with it, and the decimals it would need are config that only
+      // lives here. See game.routes.ts#toDisplayAmount.
+      balanceUsd: toDisplayAmount(Number(balanceUnits), USDC_ADDRESS),
+      balanceAssetDecimals: 6,
       studio,
       // Every studio this person can act in, owned or joined. `studio` above
       // is whichever of these is primary, kept so existing callers don't move.
@@ -190,24 +173,29 @@ meRouter.get(
   requireAuth,
   asyncHandler(async (req, res) => {
     const auth = req.auth!;
-    const hederaAccountId = await resolveHederaAccount(auth);
-    if (!hederaAccountId) {
-      res.json({ games: [] }); // wallet not funded yet -> holds nothing, not an error
-      return;
-    }
 
-    const nfts = await getAllNftsForAccount(hederaAccountId);
-    const tokenIds = [...new Set(nfts.map((n) => n.token_id))];
-    if (tokenIds.length === 0) {
+    // One call for the whole library: every key this wallet holds, each naming
+    // the game it belongs to. The Hedera version walked paginated NFT lists and
+    // then matched token ids back to games; here the key carries the game id.
+    const keys = await keysHeldBy(auth.evmAddress as `0x${string}`);
+    if (keys.length === 0) {
       res.json({ games: [] });
       return;
     }
 
-    // `removed` means storage is actually gone — nothing left to play, so it
-    // has no place in the library even though the NFT itself still exists.
-    // Every other status stays, per "delisting never revokes access."
+    const gameUuids = keys
+      .map((k) => uuidFromGameId(k.gameId))
+      .filter((id): id is string => id !== null);
+    if (gameUuids.length === 0) {
+      res.json({ games: [] });
+      return;
+    }
+
+    // `removed` means storage is actually gone — nothing left to play, so it has
+    // no place in the library even though the key itself still exists. Every
+    // other status stays, per "delisting never revokes access."
     const owned = await db.query.games.findMany({
-      where: and(inArray(games.htsTokenId, tokenIds), ne(games.status, "removed")),
+      where: and(inArray(games.id, gameUuids), ne(games.status, "removed")),
       with: { studio: true },
     });
     if (owned.length === 0) {
@@ -215,7 +203,12 @@ meRouter.get(
       return;
     }
 
-    const serialByToken = new Map(nfts.map((n) => [n.token_id, n.serial_number]));
+    const serialByGame = new Map(
+      keys.flatMap((k) => {
+        const uuid = uuidFromGameId(k.gameId);
+        return uuid ? [[uuid, Number(k.tokenId)] as const] : [];
+      }),
+    );
     const gameIds = owned.map((g) => g.id);
 
     const sessions = await db.query.playSessions.findMany({
@@ -241,7 +234,7 @@ meRouter.get(
         coverUrl: g.coverCid ? gatewayUrl(g.coverCid) : null,
         coverSeed: g.coverSeed,
         status: g.status,
-        serial: g.htsTokenId ? (serialByToken.get(g.htsTokenId) ?? null) : null,
+        serial: serialByGame.get(g.id) ?? null,
         myPlayCount: statsByGame.get(g.id)?.playCount ?? 0,
         myPlaytimeSeconds: statsByGame.get(g.id)?.playtimeSeconds ?? 0,
       })),
@@ -394,14 +387,9 @@ meRouter.get(
   requireAuth,
   asyncHandler(async (req, res) => {
     const auth = req.auth!;
-    const hederaAccountId = await resolveHederaAccount(auth);
-    if (!hederaAccountId) {
-      res.json({ purchases: [] });
-      return;
-    }
 
     const rows = await db.query.sales.findMany({
-      where: eq(sales.buyerAccountId, hederaAccountId),
+      where: sql`lower(${sales.buyerAccountId}) = ${auth.evmAddress.toLowerCase()}`,
       orderBy: desc(sales.createdAt),
     });
     if (rows.length === 0) {
@@ -413,7 +401,10 @@ meRouter.get(
     const [gameRows, keys] = await Promise.all([
       db.query.games.findMany({ where: inArray(games.id, gameIds), with: { studio: true } }),
       db.query.gameKeys.findMany({
-        where: and(eq(gameKeys.ownerAccountId, hederaAccountId), inArray(gameKeys.gameId, gameIds)),
+        where: and(
+          sql`lower(${gameKeys.ownerAccountId}) = ${auth.evmAddress.toLowerCase()}`,
+          inArray(gameKeys.gameId, gameIds),
+        ),
         columns: { gameId: true, tokenId: true, serial: true },
       }),
     ]);
@@ -456,23 +447,25 @@ meRouter.get(
 
 // --- withdrawing -----------------------------------------------------------
 //
-// Same two-step shape as a purchase, for the same reason: the server builds and
-// freezes the transfer because that needs a Hedera client, and the browser
-// signs it because the key belongs to the person, not to us. What differs is
-// who pays the network fee — see services/wallet/withdraw.ts.
+// Much smaller than it was, and the shrinkage is the point. On Hedera the server
+// had to build, freeze and submit the transfer so the *operator* could pay the
+// network fee — a wallet holding only USDC and no HBAR could not otherwise be
+// emptied. On Arc the fee is paid in USDC, the same asset being withdrawn, so a
+// wallet with money in it can always afford to move that money and the server
+// has no reason to stand in the middle.
+//
+// What is left: we validate and hand back the transaction, the browser sends it
+// with the owner's own key, and we confirm it from the chain. See
+// services/wallet/withdraw.ts.
+//
+// A developer's share of sales is not withdrawn here at all — it accrues in the
+// game's SplitVault and they call `claim()` on it themselves.
 
 const withdrawSchema = z.object({
-  // Either a Hedera account id or an EVM address. A person copying an address
-  // out of their own wallet has no reason to know which one we wanted.
   to: z.string().min(3).max(64),
-  asset: z.string().default(env.X402_ASSET),
-  // Omit to send the whole balance, which is what "take my money out" usually
-  // means and saves the client doing arithmetic on a number it shouldn't.
+  // Omit to send everything the wallet can afford to send, which is what "take
+  // my money out" usually means. A little is held back for the fee.
   amountUnits: z.string().regex(/^\d+$/).optional(),
-  // Required by every exchange deposit address, which are pooled accounts that
-  // use it to tell whose money arrived. Sending to one without it is the
-  // classic way to lose a withdrawal, so it has to be offered.
-  memo: z.string().max(100).optional(),
 });
 
 meRouter.post(
@@ -481,55 +474,26 @@ meRouter.post(
   validate(withdrawSchema),
   asyncHandler(async (req, res) => {
     const auth = req.auth!;
-    const { to, asset, amountUnits, memo } = req.body as z.infer<typeof withdrawSchema>;
-
-    const from = await resolveHederaAccount(auth);
-    if (!from) throw Errors.walletNotFunded("There is nothing in this wallet to withdraw yet.");
-
-    const destination = await resolveDestination(to);
-    if (!destination) {
-      throw Errors.validationFailed({
-        to: "That doesn't look like a Hedera account id or a wallet address.",
-      });
-    }
-    if (destination.accountId === from || destination.evmAddress?.toLowerCase() === auth.evmAddress.toLowerCase()) {
-      throw Errors.validationFailed({ to: "That is this wallet. Send it somewhere else." });
-    }
-
-    const account = await getAccountByEvmAddress(auth.evmAddress);
-    const available =
-      asset === "0.0.0"
-        ? (account?.balance?.balance ?? 0)
-        : (account?.balance?.tokens.find((t) => t.token_id === asset)?.balance ?? 0);
-
-    const amount = amountUnits === undefined ? BigInt(available) : BigInt(amountUnits);
-    if (amount <= 0n) throw Errors.validationFailed({ amountUnits: "There is nothing to send." });
-    if (amount > BigInt(available)) {
-      throw Errors.validationFailed({
-        amountUnits: `That is more than this wallet holds (${available}).`,
-      });
-    }
+    const { to, amountUnits } = req.body as z.infer<typeof withdrawSchema>;
 
     const intent = await prepareWithdraw({
       userId: auth.id,
-      evmAddress: auth.evmAddress,
-      fromAccountId: from,
-      toAccountId: destination.accountId,
-      toEvmAddress: destination.evmAddress,
-      asset,
-      amountUnits: amount,
-      memo,
+      from: auth.evmAddress as `0x${string}`,
+      to,
+      amountUnits: amountUnits === undefined ? undefined : BigInt(amountUnits),
     });
 
     res.json({
       intentId: intent.id,
-      hashes: intent.hashes,
-      to: intent.toAccountId,
-      asset,
-      amountUnits: intent.amountUnits,
-      memo: intent.memo,
-      amountDisplay: toDisplayAmount(Number(intent.amountUnits), asset),
-      assetDecimals: assetDecimals(asset),
+      to: intent.to,
+      asset: USDC_ADDRESS,
+      amountUnits: intent.amountUnits.toString(),
+      amountDisplay: toDisplayAmount(Number(intent.amountUnits), USDC_ADDRESS),
+      assetDecimals: 6,
+      reservedForGasUnits: intent.reservedForGasUnits.toString(),
+      // Send this from the owner's wallet. `value` is native 18-decimal wei,
+      // which is what a wallet expects — USDC is the native token here.
+      transaction: transactionFor(intent),
       expiresAt: new Date(intent.expiresAt).toISOString(),
     });
   }),
@@ -537,9 +501,7 @@ meRouter.post(
 
 const completeSchema = z.object({
   intentId: z.string().uuid(),
-  signatures: z
-    .array(z.object({ hash: z.string().min(3), signature: z.string().min(3) }))
-    .min(1),
+  txHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/, "must be a transaction hash"),
 });
 
 meRouter.post(
@@ -547,7 +509,7 @@ meRouter.post(
   requireAuth,
   validate(completeSchema),
   asyncHandler(async (req, res) => {
-    const { intentId, signatures } = req.body as z.infer<typeof completeSchema>;
+    const { intentId, txHash } = req.body as z.infer<typeof completeSchema>;
 
     const intent = consumeWithdrawIntent(intentId, req.auth!.id);
     if (!intent) {
@@ -556,50 +518,18 @@ meRouter.post(
       });
     }
 
-    try {
-      const transactionId = await submitWithdraw(intent, signatures);
-      res.json({
-        status: "sent",
-        transactionId,
-        to: intent.toAccountId,
-        asset: intent.asset,
-        amountUnits: intent.amountUnits,
-      });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      logger.error({ err, intentId }, "withdrawal failed");
-      // TOKEN_NOT_ASSOCIATED_TO_ACCOUNT is the one a person can actually act
-      // on, and the raw status says nothing about what to do next.
-      if (message.includes("TOKEN_NOT_ASSOCIATED_TO_ACCOUNT")) {
-        throw Errors.validationFailed({
-          to: "That account cannot receive this token yet. Associate it in your wallet, then try again.",
-        });
-      }
-      throw Errors.validationFailed({ intentId: message });
-    }
+    // Confirmed against the chain, never taken on the client's word: this is a
+    // receipt for something that already happened.
+    const confirmed = await confirmWithdraw(intent, txHash as `0x${string}`);
+    res.json({
+      status: "sent",
+      transactionId: confirmed.txHash,
+      to: confirmed.to,
+      asset: USDC_ADDRESS,
+      amountUnits: confirmed.amountUnits.toString(),
+    });
   }),
 );
 
-/**
- * Where the money is going, as either kind of address.
- *
- * An EVM address with no account behind it yet is a **valid destination**, not
- * a bad one. It used to be refused, which made a brand new wallet unfundable
- * by the one route that could have funded it — and funding an agent is exactly
- * that case, since the agent's wallet has by definition never received
- * anything. `prepareWithdraw` sends to the alias in that case and the transfer
- * brings the account into existence.
- *
- * Null now means only what it says: that is not an address.
- */
-async function resolveDestination(
-  input: string,
-): Promise<{ accountId: string | null; evmAddress: string | null } | null> {
-  const value = input.trim();
-  if (/^\d+\.\d+\.\d+$/.test(value)) return { accountId: value, evmAddress: null };
-  if (!/^0x[a-fA-F0-9]{40}$/.test(value)) return null;
-  const account = await getAccountByEvmAddress(value);
-  return { accountId: account?.account ?? null, evmAddress: value };
-}
 
 export default meRouter;

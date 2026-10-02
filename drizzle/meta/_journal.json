@@ -169,6 +169,13 @@
       "when": 1789044467663,
       "tag": "0022_skinny_night_thrasher",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1790936225708,
+      "tag": "0023_light_mother_askani",
+      "breakpoints": true
     }
   ]
 }

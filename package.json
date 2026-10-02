@@ -1,7 +1,7 @@
 {
   "name": "cgs-server",
   "version": "1.0.0",
-  "description": "Backend for Cosmic Game Sanctuary \u2014 API, Hedera/ENS chain integration, and the wishlist agent.",
+  "description": "Backend for Cosmic Game Sanctuary \u2014 API, Arc chain integration, and the wishlist agent.",
   "main": "index.js",
   "scripts": {
     "dev": "tsx watch --exclude \"storage/**\" --exclude \"logs/**\" --exclude \"tmp/**\" --exclude \"uploads/**\" --exclude \".cache/**\" src/index.ts",
@@ -27,7 +27,10 @@
     "catalog:clean": "tsx scripts/clean-catalog.ts",
     "account:reset": "tsx scripts/reset-account.ts",
     "ens:migrate": "tsx scripts/ens-hackathon-migrate.ts",
-    "arc:check": "tsx scripts/arc-chain-check.ts"
+    "arc:check": "tsx scripts/arc-chain-check.ts",
+    "arc:check:eip3009": "tsx scripts/arc-eip3009-check.ts",
+    "arc:check:x402": "tsx scripts/arc-x402-check.ts",
+    "arc:check:purchase": "tsx scripts/arc-purchase-check.ts"
   },
   "repository": {
     "type": "git",
@@ -43,9 +46,6 @@
     "@hiero-ledger/sdk": "^2.87.0",
     "@noble/hashes": "^2.4.0",
     "@privy-io/node": "^0.34.0",
-    "@x402/core": "^2.25.0",
-    "@x402/express": "^2.25.0",
-    "@x402/hedera": "^2.25.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.45.2",

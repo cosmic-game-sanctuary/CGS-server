@@ -1,4 +1,5 @@
-import { and, desc, eq, inArray, ne, or } from "drizzle-orm";
+import { and, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
+import type { AnyPgColumn } from "drizzle-orm/pg-core";
 import { db } from "../../db/client.js";
 import {
   users,
@@ -106,8 +107,18 @@ export type BuyerIdentity = {
 };
 
 export async function buyerIdentity(accountId: string): Promise<BuyerIdentity | null> {
+  // A buyer is named by a `0.0.x` on Hedera and by a `0x…` address on Arc, and
+  // both forms reach here — a sale settled through Circle only ever knows the
+  // payer's address. Matching on either keeps one identity lookup for both,
+  // rather than a second one that would have to be kept in step with this.
+  // Compared case-insensitively because an address's case is only a checksum.
+  const isAddress = /^0x[a-fA-F0-9]{40}$/.test(accountId);
+  const sameAddress = (column: AnyPgColumn) => sql`lower(${column}) = ${accountId.toLowerCase()}`;
+
   const agent = await db.query.wishlistAgents.findFirst({
-    where: eq(wishlistAgents.agentAccountId, accountId),
+    where: isAddress
+      ? sameAddress(wishlistAgents.agentEvmAddress)
+      : eq(wishlistAgents.agentAccountId, accountId),
     columns: { ensLabel: true, agentEvmAddress: true },
   });
   if (agent) {
@@ -121,7 +132,7 @@ export async function buyerIdentity(accountId: string): Promise<BuyerIdentity | 
   }
 
   const person = await db.query.users.findFirst({
-    where: eq(users.hederaAccountId, accountId),
+    where: isAddress ? sameAddress(users.evmAddress) : eq(users.hederaAccountId, accountId),
     columns: { handle: true, displayName: true, libraryPublic: true },
   });
   if (!person) return null;

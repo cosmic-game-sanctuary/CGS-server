@@ -1,8 +1,7 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { db } from "../../db/client.js";
 import { games, gameKeys } from "../../db/schema.js";
 import { ownsGame } from "./ownership.js";
-import { getAccountByEvmAddress } from "../hedera/mirror.js";
 
 type Game = typeof games.$inferSelect;
 
@@ -21,30 +20,33 @@ export type Entitlement = {
  * "Is this person allowed to play this game", which is a wider question than
  * `ownsGame` answers.
  *
- * `ownsGame` asks the Mirror Node whether the wallet holds the NFT, and that is
- * the right question for anything that has to be provable to someone else. It
- * is the wrong question in the seconds after a purchase: payment settles first,
- * the mint follows, and in that gap the buyer has paid real money and holds no
- * key. Gating play on the chain alone locks them out of the one moment the
- * whole product is about.
+ * `ownsGame` asks Arc whether the wallet holds the key, and that is the right
+ * question for anything that has to be provable to someone else. It is the wrong
+ * question in the seconds after a purchase: payment settles first, the mint
+ * follows, and in that gap the buyer has paid real money and holds no key.
+ * Gating play on the chain alone locks them out of the one moment the whole
+ * product is about.
  *
  * So a `game_keys` row counts too. One is written the instant fulfilment starts
- * (see fulfil.ts), before the mint is attempted, and its status records how far
- * the mint got. A `failed` row still counts — the payment succeeded, the mint
- * is ours to retry, and that is not the buyer's problem.
+ * (see fulfilArc.ts), before the mint is attempted, and its status records how
+ * far the mint got. A `failed` row still counts — the payment succeeded, the
+ * mint is ours to retry, and that is not the buyer's problem.
  *
  * Reviews deliberately keep using `ownsGame`: a verified-purchase badge is a
  * claim made to other people, so it should rest on what other people can check.
  */
 export async function hasEntitlement(evmAddress: string, game: Game): Promise<Entitlement> {
-  const onChain = await ownsGame(evmAddress, game.htsTokenId);
+  const onChain = await ownsGame(evmAddress, game.id);
   if (onChain.owned) return { owned: true, serial: onChain.serial, source: "chain" };
 
-  const account = await getAccountByEvmAddress(evmAddress);
-  if (!account) return { owned: false, source: "none" };
-
+  // Case-insensitively: an address's case is only a checksum, and the one
+  // recorded at purchase need not have been written the same way as the one on
+  // this request.
   const key = await db.query.gameKeys.findFirst({
-    where: and(eq(gameKeys.gameId, game.id), eq(gameKeys.ownerAccountId, account.account)),
+    where: and(
+      eq(gameKeys.gameId, game.id),
+      sql`lower(${gameKeys.ownerAccountId}) = ${evmAddress.toLowerCase()}`,
+    ),
   });
   if (!key) return { owned: false, source: "none" };
 
