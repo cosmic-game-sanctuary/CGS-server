@@ -4,6 +4,7 @@ import { Errors } from "../../lib/errors.js";
 import { hasEntitlement } from "./entitlement.js";
 import { fulfilArcPurchase } from "./fulfilArc.js";
 import type { Auth } from "../../middleware/auth.middleware.js";
+import { keyAddress } from "../arc/client.js";
 
 type Game = typeof games.$inferSelect;
 
@@ -48,7 +49,12 @@ export function assertServable(game: Game): void {
  */
 export async function grantAccess(game: Game, auth: Auth | undefined): Promise<AccessGrant | null> {
   assertServable(game);
-  const base = { buildPath: buildPathFor(game), buildCid: game.buildCid!, tokenId: game.htsTokenId };
+  // `tokenId` is the GameKey *contract*, not a per-game token. On Hedera every
+  // game minted its own HTS token, so `games.hts_token_id` identified the key
+  // you were about to receive; on Arc one ERC-721 collection covers every game
+  // and the key is identified by that address plus a token id the mint assigns.
+  // So this names the collection, and the serial arrives with the key.
+  const base = { buildPath: buildPathFor(game), buildCid: game.buildCid!, tokenId: keyAddress() };
 
   // A free game is still a purchase — it mints a real GameKey to a real
   // wallet — so it needs to know who you are. Browsing doesn't require an

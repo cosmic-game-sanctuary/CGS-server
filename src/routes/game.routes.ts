@@ -76,7 +76,7 @@ import {
 import { emailStudioInvite } from "../services/email/messages.js";
 import { addressForEmail } from "../services/privy/wallets.js";
 import { publishOnChain } from "../services/games/publishArc.js";
-import { explorerAddressUrl, registryAddress } from "../services/arc/client.js";
+import { explorerAddressUrl, keyAddress, registryAddress } from "../services/arc/client.js";
 import {
   trialEnabled,
   trialStatusFor,
@@ -947,7 +947,7 @@ gameRouter.get(
       res.json({
         buildPath: buildPathFor(game),
         buildCid: game.buildCid,
-        tokenId: game.htsTokenId,
+        tokenId: keyAddress(),
         keyStatus: "pending",
       });
       return;
@@ -1027,7 +1027,7 @@ gameRouter.get(
     res.json({
       buildPath: buildPathFor(game),
       buildCid: game.buildCid,
-      tokenId: game.htsTokenId,
+      tokenId: keyAddress(),
       keyStatus: "pending",
       settlementTxId: settled.transaction,
     });

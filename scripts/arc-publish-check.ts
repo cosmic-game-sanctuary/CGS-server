@@ -180,6 +180,35 @@ if (listed?.kind === "listed") {
   check("the logged slug identifies the game", listed.slug === game!.slug);
 }
 
+// ── every later change to the listing also lands on chain ──────────────────
+// These are what the agent reads after the first listing, and every one of them
+// is now a contract call rather than a free-form topic message. Untested, they
+// are the difference between a price the agent can see and one only we can.
+console.log("\n== a price change, a delisting and a relisting ==");
+const { changePrice } = await import("../src/services/games/listing.js");
+const priced = await db.query.games.findFirst({ where: eq(games.id, game!.id) });
+const changed = await changePrice(priced!, 250_000, null);
+check("a price change is recorded on chain", changed.announced);
+check("and the row carries the transaction that recorded it", changed.change.chainTxHash !== null);
+
+const { announce } = await import("../src/services/games/listing.js");
+const delisted = await announce({ ...priced!, priceUnits: 250_000 }, "delisted");
+check("a delisting is recorded on chain", delisted !== null);
+check("and the registry now reports the game as delisted", (await getListing(gameId)).delisted);
+
+const relisted = await announce({ ...priced!, priceUnits: 250_000 }, "relisted");
+check("a relisting is recorded on chain", relisted !== null);
+check("and the registry reports it listed again", !(await getListing(gameId)).delisted);
+
+const demanded = await announce({ ...priced!, priceUnits: 250_000 }, "demand", {
+  wishlistCount: 137,
+  milestone: 100,
+});
+check("a demand milestone is published too", demanded !== null);
+
+// Restore the price, so the sale below is for the amount the vault expects.
+await db.update(games).set({ priceUnits: Number(PRICE_UNITS) }).where(eq(games.id, game!.id));
+
 // ── retrying a publish ─────────────────────────────────────────────────────
 console.log("\n== a publish that half-failed can be retried ==");
 const retry = await publishOnChain({ ...game!, status: "published" });

@@ -248,12 +248,16 @@ gameManageRouter.patch(
           logger.error({ err, gameId: game.id }, "notifying a price drop failed"),
         );
       }
-    } else if (Object.keys(fields).length > 0 && updated.status === "published") {
-      // Anything else that changed still belongs on the topic: the listing is
-      // the message, so a listing that only changed here is a listing that
-      // half-changed.
-      await announce(updated, "price_changed", { fromUnits: updated.priceUnits, metadataOnly: true });
     }
+    // A metadata-only edit — a title, a description, a cover — used to be put on
+    // the HCS topic as well, because the topic took one free-form message and
+    // "the listing is the message" meant all of it. `GameRegistry` has a
+    // function per kind of change instead, and none of them is "the description
+    // changed". It was announced here as a *price* change with the same price on
+    // both sides, which cost gas to tell every watching agent to re-examine a
+    // price that had not moved, and told any other reader of the log something
+    // untrue. Silence is better than a wrong event; if metadata is ever worth
+    // publishing, it wants an event of its own rather than this one's.
 
     res.json({
       ...updated,
