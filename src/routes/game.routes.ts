@@ -898,11 +898,11 @@ async function isAgentAddress(address: string): Promise<boolean> {
 //
 // Three branches, in this order:
 //   1. free game            -> serve, still mint a GameKey
-//   2. caller already owns  -> serve, no second charge (checked against the
-//                              Mirror Node, not our cache). Without this a
+//   2. caller already owns  -> serve, no second charge (checked on-chain via
+//                              ownsGame, not our cache). Without this a
 //                              buyer pays again on every page refresh.
 //   3. otherwise            -> 402 + PaymentRequirements, then verify + settle
-//                              through Blocky402 on the retry.
+//                              through Circle's Facilitator Service on the retry.
 //
 // A delisted game still serves to branch 2 — delisting removes a game from the
 // catalog, it does not revoke anyone's copy. Only `removed` (illegal content,
