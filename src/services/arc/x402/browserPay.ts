@@ -98,6 +98,13 @@ function liveIntent(userId: string, gameId: string, kind: Intent["kind"]): Inten
 /**
  * Taken out of the store before anything is submitted, so a replayed `complete`
  * cannot settle a second payment.
+ *
+ * Put back by `complete` in exactly one case — a settlement Circle has accepted
+ * but not yet resolved. Re-submitting the *same* authorization is idempotent
+ * (same nonce, so the token refuses a second transfer; same `paymentId`, so
+ * Circle converges on one payment record), whereas signing a fresh one is a
+ * genuinely new payment. So the intent has to survive for the retry
+ * `INTEGRATION.md` tells a client to make to be possible at all.
  */
 function consume(id: string, userId: string): Intent | undefined {
   const intent = intents.get(id);
@@ -217,6 +224,14 @@ export async function complete(input: {
 
   const body = (await res.json()) as { error?: { code?: string; message?: string; details?: unknown } };
   if (!res.ok) {
+    // Circle has the payment and hasn't finished with it. The buyer must be
+    // able to ask again *with this same authorization* — a fresh signature is
+    // a second charge — so the intent goes back in the store rather than being
+    // lost with the request that found out. Without this the documented advice
+    // ("re-request rather than re-signing") had nothing left to re-request.
+    if (body.error?.code === "PAYMENT_PENDING") {
+      intents.set(intent.id, intent);
+    }
     throw new AppError(
       res.status,
       body.error?.code ?? "PAYMENT_FAILED",

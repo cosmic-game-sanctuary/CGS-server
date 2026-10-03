@@ -5,6 +5,7 @@ import { hasEntitlement } from "./entitlement.js";
 import { fulfilArcPurchase } from "./fulfilArc.js";
 import type { Auth } from "../../middleware/auth.middleware.js";
 import { keyAddress } from "../arc/client.js";
+import logger from "../../utils/logger.utils.js";
 
 type Game = typeof games.$inferSelect;
 
@@ -86,6 +87,14 @@ async function grantFreeKey(game: Game, buyerEvmAddress: string): Promise<void> 
   if (owned) return;
 
   // Nothing was received, so there is nothing to split and no vault involved.
+  //
+  // The `.catch` is not decoration. `fulfilArcPurchase` awaits two database
+  // inserts before it reaches the mint it already guards, so it can reject —
+  // and an unhandled rejection **terminates a Node process**, which on this
+  // path meant a database hiccup while someone claimed a free game could take
+  // the whole server down and, with it, every in-memory payment intent of
+  // everyone mid-purchase at that moment. Deliberately fire-and-forget, so the
+  // failure belongs in the log rather than in this request's response.
   void fulfilArcPurchase({
     game,
     ownerAddress: buyerEvmAddress as Address,
@@ -93,5 +102,5 @@ async function grantFreeKey(game: Game, buyerEvmAddress: string): Promise<void> 
     settlementTx: "0x",
     amountUnits: 0,
     kind: "purchase",
-  });
+  }).catch((err) => logger.error({ err, gameId: game.id, buyerEvmAddress }, "granting a free game's key failed"));
 }

@@ -11,6 +11,7 @@ import { param } from "../lib/params.js";
 import { assetDecimals, ensFullName, toDisplayAmount } from "../lib/display.js";
 import { env } from "../config/env.js";
 import { createAgent, agentBalance, nameAgent, retireAgent } from "../services/agent/wallet.js";
+import { explorerTxUrl, explorerUrl, identityRegistryAddress } from "../services/arc/client.js";
 import { respondToDecision } from "../agent/watcher.js";
 import { publishAgentMandateInBackground } from "../services/agent/mandate.js";
 
@@ -33,6 +34,26 @@ function serializeAgent(agent: typeof wishlistAgents.$inferSelect, balanceUnits:
     onTimeout: agent.onTimeout,
     expiresAt: agent.expiresAt,
     fundAddress: agent.agentEvmAddress,
+    /**
+     * The agent's identity, as an ERC-8004 token it registered itself. This is
+     * what replaced the HCS-14 AID — and it is strictly better to show, because
+     * `identityUrl` opens the token on a public explorer and proves the agent
+     * exists independently of anything we say about it.
+     *
+     * Null until the agent is funded: registration is a transaction *it* pays
+     * for, so an empty wallet cannot have an identity yet. That is the honest
+     * thing for a client to render at `draft` — "not registered yet", not
+     * "no account on Hedera", which is what the screen said while the two dead
+     * fields below were the only identity this route exposed.
+     */
+    erc8004AgentId: agent.erc8004AgentId,
+    identityUrl: agent.erc8004AgentId
+      ? `${explorerUrl()}/token/${identityRegistryAddress()}/instance/${agent.erc8004AgentId}`
+      : null,
+    /**
+     * @deprecated Both are always null on Arc and are kept only so a client
+     * written against the Hedera shape keeps parsing. Read `erc8004AgentId`.
+     */
     agentAccountId: agent.agentAccountId,
     hcs14Aid: agent.hcs14Aid,
     ensLabel: agent.ensLabel,
@@ -174,7 +195,17 @@ agentRouter.get(
       orderBy: desc(agentDecisions.createdAt),
       limit: 50,
     });
-    res.json({ decisions: rows });
+    // `inferenceUrl` alongside `inferenceTxId` for the same reason receipts
+    // carry one: "the agent pays for its own reasoning" is an assertion until
+    // somebody can open the transfer, and only this side knows which explorer
+    // is the right one. The client was building a HashScan URL, which cannot
+    // resolve an Arc transaction at all.
+    res.json({
+      decisions: rows.map((r) => ({
+        ...r,
+        inferenceUrl: r.inferenceTxId ? explorerTxUrl(r.inferenceTxId) : null,
+      })),
+    });
   }),
 );
 

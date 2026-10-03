@@ -32,6 +32,27 @@ export const USDC_ADDRESS: Address = "0x3600000000000000000000000000000000000000
 const MULTICALL3: Address = "0xcA11bde05977b3631167028862bE2a173976CA11";
 const RECEIPT_TIMEOUT_MS = 60_000;
 
+/**
+ * Refuse to run with two different answers to "what asset is the money".
+ *
+ * `X402_ASSET` denominates every amount this server *displays*; `USDC_ADDRESS`
+ * is the token every transfer actually moves. They describe one fact, from two
+ * places, and nothing previously checked them against each other — so a wrong
+ * `X402_ASSET` in a deployment's environment would not fail, it would quietly
+ * price everything against an asset nobody was paying in. Called at boot from
+ * `index.ts`, where a misconfiguration is still cheap to notice.
+ */
+export function assertAssetAgrees(): void {
+  if (env.X402_ASSET.toLowerCase() !== USDC_ADDRESS.toLowerCase()) {
+    throw new ArcConfigError(
+      "X402_ASSET",
+      `It is set to ${env.X402_ASSET}, but every transfer this server makes moves ${USDC_ADDRESS} ` +
+        `(Arc's native USDC predeploy). Displayed amounts would be denominated against an asset nobody pays in. ` +
+        `Unset it — it defaults correctly — or set it to ${USDC_ADDRESS}.`,
+    );
+  }
+}
+
 export class ArcConfigError extends Error {
   constructor(missing: string, why: string) {
     super(`${missing} is not set. ${why}`);

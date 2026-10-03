@@ -93,8 +93,18 @@ const envSchema = z.object({
   // `X402_ASSET` stays, and the name is still accurate: x402 is still the
   // protocol and USDC is still the asset — only the facilitator and the chain
   // changed. It holds Arc's native USDC address now rather than a `0.0.x`.
-  X402_ASSET: z.string(),
-  X402_ASSET_DECIMALS: z.coerce.number(),
+  //
+  // **Defaulted rather than required, and the default is the only correct
+  // value.** Arc's USDC is a fixed predeploy at `0x3600…0000`, so this is not
+  // really configuration — it is the same fact as `USDC_ADDRESS` in
+  // `services/arc/client.ts`, which is a hardcoded constant. Two independent
+  // sources of truth for "what asset is the money" is a drift hazard with an
+  // ugly failure: every *displayed* amount would be denominated against one
+  // address while every *transfer* used the other, so the numbers on screen
+  // would silently stop describing the money that moved. `assertAssetAgrees`
+  // in `services/arc/client.ts` refuses to boot if they disagree.
+  X402_ASSET: z.string().default("0x3600000000000000000000000000000000000000"),
+  X402_ASSET_DECIMALS: z.coerce.number().default(6),
 
   // Arc, being built alongside the Hedera config above until Stages 4-6 take
   // over its callers. Optional so a checkout that predates the port still boots;

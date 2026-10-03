@@ -10,6 +10,7 @@ import { env } from "../config/env.js";
 import { getUsdcUnits } from "../services/arc/reads.js";
 import { keysHeldBy } from "../services/arc/keys.js";
 import { uuidFromGameId } from "../services/arc/registry.js";
+import { explorerTxUrl } from "../services/arc/client.js";
 import { assetDecimals, ensFullName, toDisplayAmount } from "../lib/display.js";
 import { validate } from "../middleware/validate.middleware.js";
 import { Errors } from "../lib/errors.js";
@@ -392,8 +393,18 @@ meRouter.get(
   asyncHandler(async (req, res) => {
     const auth = req.auth!;
 
+    // Purchases only. A `trial_chunk` is also a `sales` row against this same
+    // buyer, and without this filter every chunk appeared here as a receipt
+    // for a game they may not own — wrong before Stage 7 and worse after it,
+    // since a Gateway-settled chunk's `settlement_tx_id` is a transfer id that
+    // resolves nowhere on an explorer. What a buyer spent trialling is already
+    // reported by `GET /api/games/:id/trial` as `spentUnits`, which is where it
+    // belongs: it is credit toward a purchase, not a purchase.
     const rows = await db.query.sales.findMany({
-      where: sql`lower(${sales.buyerAccountId}) = ${auth.evmAddress.toLowerCase()}`,
+      where: and(
+        sql`lower(${sales.buyerAccountId}) = ${auth.evmAddress.toLowerCase()}`,
+        eq(sales.kind, "purchase"),
+      ),
       orderBy: desc(sales.createdAt),
     });
     if (rows.length === 0) {
@@ -427,8 +438,13 @@ meRouter.get(
           priceUsd: toDisplayAmount(r.priceUnits, r.priceAsset),
           assetDecimals: assetDecimals(r.priceAsset),
           // What makes this a receipt rather than a line in our database: the
-          // buyer can look it up on the Mirror Node themselves.
+          // buyer can look the settlement up themselves. The URL is built here
+          // rather than left to the client, because which explorer is correct
+          // is a fact about the network this server is pointed at — a client
+          // guessing it is how the frontend ended up with a HashScan link
+          // that cannot resolve an Arc transaction.
           settlementTxId: r.settlementTxId,
+          explorerUrl: explorerTxUrl(r.settlementTxId),
           hcsSaleTxId: r.hcsSaleTxId,
           game: game
             ? {

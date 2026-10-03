@@ -157,10 +157,19 @@ export async function settleFromHeader(
   if (outcome.status === "pending") {
     // Never fulfil on pending — the transfer may still land, so this is a "come
     // back and we'll know", not a refusal. Circle reconciles it by paymentId.
+    //
+    // **409, not 202, and the status code is the whole point.** This used to
+    // answer `202 Accepted`, which is honest about the state and actively
+    // dangerous as a contract: 202 is a 2xx, so any client that checks
+    // `response.ok` — ours did — treats the error envelope below as the
+    // success payload and proceeds as though it had been handed the game,
+    // with every field undefined. A caller's single most important question
+    // here is "may I serve the resource", the answer is no, and only a 4xx
+    // says that to a client that has never heard of this code.
     throw new AppError(
-      202,
+      409,
       "PAYMENT_PENDING",
-      "The payment is still settling. Retrying the same request will pick up the outcome; it has not been charged twice.",
+      "The payment is still settling. Ask again with the same payment to pick up the outcome; it has not been charged twice.",
       { paymentId: outcome.paymentId },
     );
   }

@@ -7,7 +7,7 @@ import httpLogger from "./middleware/httpLogger.js";
 import generalLimiter from "./middleware/ratelimit.middleware.js";
 import { notFoundHandler, errorHandler } from "./middleware/errorHandler.middleware.js";
 import { pingDb } from "./db/client.js";
-import { operator as arcOperator, publicClient } from "./services/arc/client.js";
+import { assertAssetAgrees, operator as arcOperator, publicClient } from "./services/arc/client.js";
 
 import gameRouter from "./routes/game.routes.js";
 import gameManageRouter from "./routes/gameManage.routes.js";
@@ -132,6 +132,41 @@ setInterval(() => {
 
 app.use(notFoundHandler);
 app.use(errorHandler);
+
+// Before anything binds a port. A disagreement here means every amount this
+// server prints describes a different asset from the one it moves, and there
+// is no symptom to notice later — see assertAssetAgrees.
+assertAssetAgrees();
+
+/**
+ * The two process-level nets, and they are deliberately not symmetric.
+ *
+ * **An unhandled rejection is logged and survived.** Since Node 15 the default
+ * is to terminate, and this server is full of intentional fire-and-forget work
+ * — a mint after a settlement, an invite email, an agent's mandate going on
+ * chain — where the right answer to a failure is a log line, not downtime. One
+ * missed `.catch` anywhere in that set should not be able to take the process
+ * with it, because what goes down with it is every in-memory payment intent:
+ * everyone who is mid-purchase at that instant gets a bare
+ * `PAYMENT_INTENT_EXPIRED` for something they did nothing wrong in. Each such
+ * site should still carry its own handler; this is the net under them, and a
+ * line here is a bug to go and fix rather than a steady state to accept.
+ *
+ * **An uncaught exception is logged and then the process exits.** The usual
+ * argument applies and it is a real one: an exception unwound an arbitrary
+ * stack, so anything it was halfway through is now in an unknown state, and
+ * continuing to serve money-moving requests from that is worse than a restart.
+ * Render brings it straight back, and the agent listener resumes from the
+ * block it had already recorded.
+ */
+process.on("unhandledRejection", (reason) => {
+  logger.error({ err: reason }, "unhandled promise rejection — surviving it, but this is a missing .catch somewhere");
+});
+
+process.on("uncaughtException", (err) => {
+  logger.fatal({ err }, "uncaught exception — exiting so a clean process replaces this one");
+  process.exit(1);
+});
 
 app.listen(env.PORT, () => {
   console.log(`cgs-server listening on :${env.PORT} (arc-${env.ARC_NETWORK})`);

@@ -2,7 +2,7 @@ import { inArray } from "drizzle-orm";
 import { getAddress, type Address } from "viem";
 import { db } from "../../db/client.js";
 import { games } from "../../db/schema.js";
-import { weiToUnits } from "../arc/client.js";
+import { explorerAddressUrl, explorerTxUrl, weiToUnits } from "../arc/client.js";
 import { claimFor, getVaultState } from "../arc/vault.js";
 import { assetDecimals, toDisplayAmount } from "../../lib/display.js";
 import logger from "../../utils/logger.utils.js";
@@ -135,5 +135,10 @@ export async function claimFromVault(address: string, gameId: string) {
     to: me,
     amount: money(units, game.priceAsset),
     txHash,
+    // Same reasoning as a receipt's: the release is the proof a payee was paid
+    // by the contract rather than by us, and only this side knows which
+    // explorer that resolves on.
+    explorerUrl: explorerTxUrl(txHash),
+    vaultUrl: explorerAddressUrl(state.vault),
   };
 }

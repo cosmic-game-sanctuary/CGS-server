@@ -84,18 +84,46 @@ services:
       - { key: PRIVY_APP_ID, sync: false }
       - { key: PRIVY_APP_SECRET, sync: false }
       - { key: PRIVY_VERIFICATION_KEY, sync: false }
-      - { key: HEDERA_NETWORK, sync: false }
-      - { key: HEDERA_MIRROR_URL, sync: false }
-      - { key: HEDERA_OPERATOR_ID, sync: false }
-      - { key: HEDERA_OPERATOR_KEY, sync: false }
-      - { key: HCS_LISTINGS_TOPIC, sync: false }
-      - { key: HCS_SALES_TOPIC, sync: false }
-      - { key: HCS_AGENT_IDENTITY_TOPIC, sync: false }
-      - { key: X402_FACILITATOR_URL, sync: false }
-      - { key: X402_NETWORK, sync: false }
-      - { key: X402_ASSET, sync: false }
-      - { key: X402_ASSET_DECIMALS, sync: false }
-      - { key: X402_PAY_TO, sync: false }
+
+      # --- Arc ----------------------------------------------------------
+      #
+      # The Hedera block that used to sit here is gone: `HEDERA_*`, the three
+      # `HCS_*_TOPIC`s, and `X402_FACILITATOR_URL` / `X402_NETWORK` /
+      # `X402_PAY_TO` were all deleted in Stage 6 along with the code that read
+      # them. Leaving them declared here was harmless to the app (unknown keys
+      # are ignored) and actively misleading to whoever sets these up, since
+      # the dashboard would prompt for four Hedera secrets this server has no
+      # use for and none of the Arc ones it cannot start without.
+      #
+      # `X402_ASSET` and `X402_ASSET_DECIMALS` are gone from this list too, on
+      # purpose: they now default correctly in `config/env.ts` and boot asserts
+      # they match the USDC the chain layer actually moves, so the only thing
+      # setting them by hand can do is break that agreement.
+      #
+      # `ARC_NETWORK` is the one knob that decides everything else here.
+      - { key: ARC_NETWORK, sync: false }
+      # **Mainnet will not connect without this.** viem ships public RPCs for
+      # Arc testnet and none for mainnet. Takes a comma-separated list.
+      - { key: ARC_RPC_URL, sync: false }
+      # Signs every on-chain write: mints, vault deploys, listing announcements,
+      # and the gas for releasing a payee's share.
+      - { key: ARC_OPERATOR_KEY, sync: false }
+      # The four deployed contracts. A missing one answers 503 naming itself
+      # rather than failing obscurely mid-request.
+      - { key: ARC_GAME_REGISTRY, sync: false }
+      - { key: ARC_GAME_KEY, sync: false }
+      - { key: ARC_VAULT_FACTORY, sync: false }
+      # **Baked into every vault at publish and immutable afterwards**, so
+      # getting this wrong is permanent for every game published before anyone
+      # notices. Never the operator key's own address: that account pays gas,
+      # and platform revenue accruing to it makes the two indistinguishable.
+      - { key: ARC_PLATFORM_PAYOUT, sync: false }
+      # **A hard prerequisite, not an optimisation.** Settling to a game's
+      # SplitVault is impossible without it — Circle's keyless trial
+      # authenticates with a signature from the key controlling `payTo`, and a
+      # vault has no key. Free from console.circle.com.
+      - { key: CIRCLE_API_KEY, sync: false }
+
       - { key: SEPOLIA_RPC_URL, sync: false }
       - { key: SEPOLIA_OPERATOR_KEY, sync: false }
       - { key: ENS_PARENT_NAME, sync: false }
