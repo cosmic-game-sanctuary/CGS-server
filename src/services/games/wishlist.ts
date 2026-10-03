@@ -119,21 +119,30 @@ export async function notifyPriceDrop(game: Game, fromUnits: number, toUnits: nu
 
   // Someone who already owns it does not need telling it got cheaper. That is
   // the one message guaranteed to annoy rather than help.
+  //
+  // `owner_account_id` is an EVM address for anything minted on Arc, a
+  // `0.0.x` for the Hedera rows that came before — matching on
+  // `hederaAccountId` alone meant this exclusion never fired for an Arc-era
+  // owner, same bug as `gameManage.routes.ts#notifyOwnersOfBuild` and
+  // `profile.ts#libraryFor`, found and fixed alongside them.
   const owners = await db.query.gameKeys.findMany({
     where: and(eq(gameKeys.gameId, game.id), eq(gameKeys.mintStatus, "confirmed")),
     columns: { ownerAccountId: true },
   });
-  const ownerAccounts = new Set(owners.map((o) => o.ownerAccountId));
+  const ownerEvmAccounts = new Set(owners.filter((o) => o.ownerAccountId.startsWith("0x")).map((o) => o.ownerAccountId.toLowerCase()));
+  const ownerHederaAccounts = new Set(owners.filter((o) => !o.ownerAccountId.startsWith("0x")).map((o) => o.ownerAccountId));
 
   const people = await db.query.users.findMany({
     where: inArray(users.id, items.map((i) => i.userId)),
-    columns: { id: true, email: true, hederaAccountId: true },
+    columns: { id: true, email: true, evmAddress: true, hederaAccountId: true },
   });
   const byId = new Map(people.map((p) => [p.id, p]));
 
   const recipients = items.filter((i) => {
     const person = byId.get(i.userId);
-    return person && !(person.hederaAccountId && ownerAccounts.has(person.hederaAccountId));
+    if (!person) return false;
+    const alreadyOwns = ownerEvmAccounts.has(person.evmAddress.toLowerCase()) || (person.hederaAccountId && ownerHederaAccounts.has(person.hederaAccountId));
+    return !alreadyOwns;
   });
   if (recipients.length === 0) return 0;
 

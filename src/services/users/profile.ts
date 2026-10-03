@@ -208,11 +208,21 @@ async function creditsFor(userId: string, memberIds: string[]) {
     .sort((a, b) => (b.publishedAt?.getTime() ?? 0) - (a.publishedAt?.getTime() ?? 0));
 }
 
-/** What this person owns, from the key cache. Only when they allow it. */
-async function libraryFor(userId: string, hederaAccountId: string | null) {
-  if (!hederaAccountId) return [];
+/**
+ * What this person owns, from the key cache. Only when they allow it.
+ *
+ * `game_keys.owner_account_id` holds an EVM address for anything minted on
+ * Arc and a `0.0.x` for the Hedera rows that came before — matching on
+ * `hederaAccountId` alone (true until this fix) meant every Arc-era user's
+ * public library read empty regardless of what they actually owned. Same
+ * bug, same fix, as `gameManage.routes.ts#notifyOwnersOfBuild`.
+ */
+async function libraryFor(userId: string, evmAddress: string, hederaAccountId: string | null) {
   const keys = await db.query.gameKeys.findMany({
-    where: and(eq(gameKeys.ownerAccountId, hederaAccountId), eq(gameKeys.mintStatus, "confirmed")),
+    where: and(
+      or(sql`lower(${gameKeys.ownerAccountId}) = lower(${evmAddress})`, hederaAccountId ? eq(gameKeys.ownerAccountId, hederaAccountId) : undefined),
+      eq(gameKeys.mintStatus, "confirmed"),
+    ),
     columns: { gameId: true },
   });
   const gameIds = [...new Set(keys.map((k) => k.gameId))];
@@ -274,7 +284,7 @@ export async function publicProfile(handle: string, viewerId?: string) {
   const gameById = new Map(reviewedGames.map((g) => [g.id, g]));
 
   const showLibrary = user.libraryPublic || isSelf;
-  const library = showLibrary ? await libraryFor(user.id, user.hederaAccountId) : [];
+  const library = showLibrary ? await libraryFor(user.id, user.evmAddress, user.hederaAccountId) : [];
 
   return {
     handle: user.handle,
