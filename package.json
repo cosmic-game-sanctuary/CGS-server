@@ -33,7 +33,8 @@
     "arc:check:publish": "tsx scripts/arc-publish-check.ts",
     "arc:check:listener": "tsx scripts/arc-agent-listener-check.ts",
     "arc:check:identity": "tsx scripts/arc-agent-identity-check.ts",
-    "arc:check:agent": "tsx scripts/arc-agent-buy-check.ts"
+    "arc:check:agent": "tsx scripts/arc-agent-buy-check.ts",
+    "arc:check:contested": "tsx scripts/arc-agent-contested-check.ts"
   },
   "repository": {
     "type": "git",
