@@ -738,6 +738,13 @@ export const sales = pgTable("sales", {
   priceAsset: text("price_asset").notNull(),
   settlementTxId: text("settlement_tx_id").notNull(),
   hcsSaleTxId: text("hcs_sale_tx_id"),
+  // Set only for a trial chunk settled through Circle Gateway's nanopayment
+  // batching (Stage 7). When this is set, `settlementTxId` holds that same
+  // transfer id rather than an on-chain transaction hash — Gateway credits the
+  // seller and the resource is served immediately, but the money doesn't reach
+  // the vault until Circle's next periodic batch, so don't build an explorer
+  // link from it. See services/arc/x402/gateway.ts.
+  gatewayTransferId: text("gateway_transfer_id"),
   splitStatus: splitStatusEnum("split_status").notNull().default("pending"),
   splitError: text("split_error"),
   // "purchase" mints a GameKey; "trial_chunk" never does. A trial chunk is a

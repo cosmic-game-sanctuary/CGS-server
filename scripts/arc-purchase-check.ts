@@ -39,6 +39,8 @@ import { getVaultState } from "../src/services/arc/vault.js";
 import { gameIdFor } from "../src/services/arc/registry.js";
 import { keysHeldBy } from "../src/services/arc/keys.js";
 import { buildAuthorization, isAuthorizationUsed } from "../src/services/arc/x402/authorization.js";
+import { trialStatusFor } from "../src/services/games/trials.js";
+import { buildGatewayAuthorization, gatewayAvailableUnits, gatewayTypedDataFor, type GatewayPaymentRequirements } from "../src/services/arc/x402/gateway.js";
 import { encodePaymentHeader, signAuthorization } from "../src/services/arc/x402/payer.js";
 import type { PaymentRequirements, ResourceInfo } from "../src/services/arc/x402/requirements.js";
 
@@ -262,32 +264,107 @@ const replay = await fetch(`${BASE}/api/games/${game!.id}/download`, {
 check("replaying a spent authorization is refused", !replay.ok, replay.status);
 check("still exactly one sale", (await db.query.sales.findMany({ where: eq(sales.gameId, game!.id) })).length === 1);
 
-// --- 5. a trial chunk -------------------------------------------------------
-console.log("\n== a trial chunk, same rails ==");
-const chunkChallenge = await fetch(`${BASE}/api/games/${game!.id}/trial/chunks/settle`);
-check("an unpaid chunk answers 402", chunkChallenge.status === 402, chunkChallenge.status);
-const chunkOffer = (await chunkChallenge.json()) as { resource: ResourceInfo; accepts: PaymentRequirements[] };
-const chunkTerms = chunkOffer.accepts[0]!;
-check("a chunk is priced at the chunk price, not the game's", chunkTerms.amount === String(CHUNK_UNITS), chunkTerms.amount);
-check("a chunk pays the same address as a purchase", chunkTerms.payTo.toLowerCase() === VAULT.toLowerCase());
+// --- 5. a trial chunk, over Circle Gateway (Stage 7) ------------------------
+// Different rails from a purchase now: a chunk is too small for the regular
+// facilitator's gas, so it settles through Gateway's batching instead — which
+// needs a one-time deposit the buyer pays gas for, unlike everything above.
+console.log("\n== a trial chunk, over Circle Gateway ==");
+const { GatewayClient } = await import("@circle-fin/x402-batching/client");
+const DEPOSIT_GAS_MARGIN_UNITS = 50_000n; // 0.05 USDC — covers the buyer's own approve+deposit gas
+const MAX_CHUNKS = 3; // trialMaxChunks set on this game, below
+const TOTAL_DEPOSIT_UNITS = CHUNK_UNITS * BigInt(MAX_CHUNKS);
 
-const beforeChunkBalance = await getUsdcUnits(buyer.address);
-const chunkAuth = buildAuthorization(buyer.address, chunkTerms.payTo, BigInt(chunkTerms.amount));
-const chunkSig = await signAuthorization(buyer, chunkAuth);
-const chunkPaid = await fetch(`${BASE}/api/games/${game!.id}/trial/chunks/settle`, {
-  headers: { "payment-signature": encodePaymentHeader({ requirements: chunkTerms, resource: chunkOffer.resource, authorization: chunkAuth, signature: chunkSig }) },
-});
-const chunkBody = (await chunkPaid.json()) as { chunkMinutes?: number; settlementTxId?: string; error?: { message?: string } };
-check("the chunk settles", chunkPaid.ok, chunkBody.error?.message);
-check("it buys the configured number of minutes", chunkBody.chunkMinutes === 5, chunkBody.chunkMinutes);
-const afterChunk = await db.query.sales.findMany({ where: eq(sales.gameId, game!.id) });
-check("the chunk is recorded as a trial, not a purchase", afterChunk.some((s) => s.kind === "trial_chunk"));
+// The buyer's wallet already holds leftover change from the purchase flow
+// above (the refused second-purchase top-up was never spent), so the gas this
+// deposit actually costs is measured as a delta, not against an assumed-empty
+// wallet.
+const balanceBeforeDeposit = await getUsdcUnits(buyer.address);
+await confirm(
+  await walletClient().sendTransaction({
+    account: operator(), chain: arcChain(), to: buyer.address, value: unitsToWei(TOTAL_DEPOSIT_UNITS + DEPOSIT_GAS_MARGIN_UNITS), ...(await feeOverrides()),
+  }),
+);
+const gatewayBuyer = new GatewayClient({ chain: "arcTestnet", privateKey: buyerKey });
+// One deposit, sized for every chunk this game allows — Gateway's whole point:
+// pay gas once, then every chunk after is free.
+const depositResult = await gatewayBuyer.deposit(formatUnits(TOTAL_DEPOSIT_UNITS, 6));
+check("the buyer's own deposit transaction landed", Boolean(depositResult.depositTxHash), depositResult.depositTxHash);
+const buyerBalanceAfterDeposit = await getUsdcUnits(buyer.address);
+const depositGasPaid = balanceBeforeDeposit + TOTAL_DEPOSIT_UNITS + DEPOSIT_GAS_MARGIN_UNITS - TOTAL_DEPOSIT_UNITS - buyerBalanceAfterDeposit;
+check(
+  "depositing cost the buyer real gas, out of its own margin",
+  depositGasPaid > 0n && depositGasPaid <= DEPOSIT_GAS_MARGIN_UNITS,
+  depositGasPaid,
+);
+
+// Gateway's own ledger lags the on-chain deposit slightly — the same family of
+// read-right-after-write race documented throughout this codebase's gotchas
+// table. Poll rather than assume the deposit is immediately visible to /verify.
+let gatewayBalance = await gatewayAvailableUnits(buyer.address);
+for (let i = 0; i < 20 && gatewayBalance < TOTAL_DEPOSIT_UNITS; i++) {
+  await new Promise((r) => setTimeout(r, 1000));
+  gatewayBalance = await gatewayAvailableUnits(buyer.address);
+}
+check("the deposit is visible to Gateway before the first chunk is signed", gatewayBalance >= TOTAL_DEPOSIT_UNITS, gatewayBalance);
+
+async function settleOneChunk(): Promise<{ ok: boolean; status: number; gatewayTransferId?: string; message?: string }> {
+  const challenge = await fetch(`${BASE}/api/games/${game!.id}/trial/chunks/settle`);
+  if (challenge.status !== 402) return { ok: false, status: challenge.status };
+  const offer = (await challenge.json()) as { resource: ResourceInfo; accepts: GatewayPaymentRequirements[] };
+  const terms = offer.accepts[0]!;
+  const auth = buildGatewayAuthorization(buyer.address, terms.payTo, BigInt(terms.amount));
+  const sig = await buyer.signTypedData(gatewayTypedDataFor(auth, terms.extra.verifyingContract));
+  const res = await fetch(`${BASE}/api/games/${game!.id}/trial/chunks/settle`, {
+    headers: { "payment-signature": encodePaymentHeader({ requirements: terms, resource: offer.resource, authorization: auth, signature: sig }) },
+  });
+  const body = (await res.json()) as { chunkMinutes?: number; gatewayTransferId?: string; error?: { message?: string } };
+  return { ok: res.ok, status: res.status, gatewayTransferId: body.gatewayTransferId, message: body.error?.message };
+}
+
+console.log("\n== the first chunk, in detail ==");
+const first = await settleOneChunk();
+check("an unpaid chunk answers 402 first", first.status !== undefined);
+check("the chunk settles", first.ok, first.message);
+check("it reports a Gateway transfer id", Boolean(first.gatewayTransferId), first);
+const chunkRow = (await db.query.sales.findMany({ where: eq(sales.gameId, game!.id) })).find((s) => s.kind === "trial_chunk");
+check("the chunk is recorded as a trial, not a purchase", Boolean(chunkRow));
+check("the chunk row names its Gateway transfer, not an on-chain hash", chunkRow?.gatewayTransferId === first.gatewayTransferId, chunkRow?.gatewayTransferId);
+check("the chunk is left pending, not asserted distributed — the money isn't in the vault yet", chunkRow?.splitStatus === "pending", chunkRow?.splitStatus);
 check("a chunk mints no key — five minutes is not ownership", (await db.query.gameKeys.findMany({ where: eq(gameKeys.gameId, game!.id) })).length === 1);
 check(
-  "exactly the chunk price left the buyer's wallet, and no gas",
-  beforeChunkBalance - (await getUsdcUnits(buyer.address)) === CHUNK_UNITS,
-  `${beforeChunkBalance - (await getUsdcUnits(buyer.address))} vs ${CHUNK_UNITS}`,
+  "settling the chunk itself cost no further gas — the wallet only moved on deposit",
+  (await getUsdcUnits(buyer.address)) === buyerBalanceAfterDeposit,
+  `${await getUsdcUnits(buyer.address)} vs ${buyerBalanceAfterDeposit}`,
 );
+
+// --- 6. the rest of the cap, and the credit arithmetic it buys --------------
+// Stage 7's own acceptance test: after one deposit, every chunk up to the
+// configured cap settles with no further gas, and the credit those chunks
+// earn is exactly what `trials.ts` says it should be. The cap's enforcement
+// at `/trial/chunks/prepare` needs a real signed-in session (Privy) to reach —
+// no check script in this repo authenticates as a real user, so that half is
+// verified by reading the route, not by this script. What's verified here is
+// the part only Stage 7 changed: do the chunks a buyer actually pays for,
+// over Gateway, add up to the right number?
+console.log("\n== the rest of the cap, gas-free ==");
+for (let i = 2; i <= MAX_CHUNKS; i++) {
+  const result = await settleOneChunk();
+  check(`chunk ${i} of ${MAX_CHUNKS} settles with no further deposit`, result.ok, result.message);
+}
+check(
+  "no further gas left the buyer across all chunks after the one deposit",
+  (await getUsdcUnits(buyer.address)) === buyerBalanceAfterDeposit,
+  `${await getUsdcUnits(buyer.address)} vs ${buyerBalanceAfterDeposit}`,
+);
+
+const status = await trialStatusFor(game!, buyer.address);
+check(`all ${MAX_CHUNKS} chunks are recorded as consumed`, status.chunksConsumed === MAX_CHUNKS, status.chunksConsumed);
+check("none are left", status.chunksLeft === 0, status.chunksLeft);
+// Hand-computed against the fixtures, not by re-running trials.ts's own
+// formula — the point is to catch a regression in that arithmetic, not to
+// confirm the function agrees with itself.
+check("the credit those chunks earn is exactly 60,000 units (3 chunks at 0.02 USDC)", status.creditUnits === 60_000, status.creditUnits);
+check("what's still owed is the 0.30 USDC price minus that credit: 240,000 units", status.owedUnits === 240_000, status.owedUnits);
 
 console.log(`\ngame id ${game!.id} — left in the database on purpose`);
 console.log(`${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);

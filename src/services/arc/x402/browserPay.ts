@@ -8,6 +8,7 @@ import {
   typedDataFor,
   type Authorization,
 } from "./authorization.js";
+import { buildGatewayAuthorization, gatewayTypedDataFor, type GatewayPaymentRequirements } from "./gateway.js";
 import { encodePaymentHeader } from "./payer.js";
 import type { PaymentRequirements, ResourceInfo } from "./requirements.js";
 
@@ -45,12 +46,17 @@ type Intent = {
   kind: "purchase" | "trial_chunk";
   settleUrl: string;
   authorization: Authorization;
-  requirements: PaymentRequirements;
+  /** A trial chunk's requirements are Gateway-shaped — see gate.ts vs gateway.ts. */
+  requirements: PaymentRequirements | GatewayPaymentRequirements;
   resource: ResourceInfo;
   /** The buyer's bearer token, so the loopback call is made as them. */
   bearer?: string;
   expiresAt: number;
 };
+
+function isGatewayRequirements(r: Intent["requirements"]): r is GatewayPaymentRequirements {
+  return r.extra.name === "GatewayWalletBatched";
+}
 
 const intents = new Map<string, Intent>();
 
@@ -103,7 +109,9 @@ function consume(id: string, userId: string): Intent | undefined {
 
 /** What the client needs in order to sign. JSON-safe: bigints as strings. */
 function preparedShape(intent: Intent) {
-  const typed = typedDataFor(intent.authorization);
+  const typed = isGatewayRequirements(intent.requirements)
+    ? gatewayTypedDataFor(intent.authorization, intent.requirements.extra.verifyingContract)
+    : typedDataFor(intent.authorization);
   return {
     intentId: intent.id,
     expiresAt: new Date(intent.expiresAt).toISOString(),
@@ -137,7 +145,7 @@ export type PrepareInput = {
   gameId: string;
   evmAddress: string;
   /** Terms the route already computed, so the quoted price is the signed price. */
-  requirements: PaymentRequirements;
+  requirements: PaymentRequirements | GatewayPaymentRequirements;
   resource: ResourceInfo;
   bearer?: string;
   kind?: "purchase" | "trial_chunk";
@@ -148,16 +156,19 @@ export function prepare(input: PrepareInput) {
   const existing = liveIntent(input.userId, input.gameId, kind);
   if (existing) return preparedShape(existing);
 
+  const gateway = isGatewayRequirements(input.requirements);
   const intent = remember({
     userId: input.userId,
     gameId: input.gameId,
     kind,
     settleUrl: kind === "purchase" ? downloadUrl(input.gameId) : trialChunkUrl(input.gameId),
-    authorization: buildAuthorization(
-      input.evmAddress as Address,
-      input.requirements.payTo,
-      BigInt(input.requirements.amount),
-    ),
+    authorization: gateway
+      ? buildGatewayAuthorization(input.evmAddress as Address, input.requirements.payTo, BigInt(input.requirements.amount))
+      : buildAuthorization(
+          input.evmAddress as Address,
+          input.requirements.payTo,
+          BigInt(input.requirements.amount),
+        ),
     requirements: input.requirements,
     resource: input.resource,
     bearer: input.bearer,

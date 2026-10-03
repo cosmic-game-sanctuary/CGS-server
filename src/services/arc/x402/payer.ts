@@ -9,6 +9,7 @@ import {
   type Authorization,
 } from "./authorization.js";
 import type { PaymentRequirements, ResourceInfo } from "./requirements.js";
+import type { GatewayPaymentRequirements } from "./gateway.js";
 
 /**
  * Paying for an x402 resource, as a client.
@@ -58,7 +59,7 @@ export async function signAuthorization(
 
 /** The `payment-signature` header value: base64 JSON, per x402. */
 export function encodePaymentHeader(input: {
-  requirements: PaymentRequirements;
+  requirements: PaymentRequirements | GatewayPaymentRequirements;
   resource: ResourceInfo;
   authorization: Authorization;
   signature: Hex;

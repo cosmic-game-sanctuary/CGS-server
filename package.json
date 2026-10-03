@@ -34,7 +34,8 @@
     "arc:check:listener": "tsx scripts/arc-agent-listener-check.ts",
     "arc:check:identity": "tsx scripts/arc-agent-identity-check.ts",
     "arc:check:agent": "tsx scripts/arc-agent-buy-check.ts",
-    "arc:check:contested": "tsx scripts/arc-agent-contested-check.ts"
+    "arc:check:contested": "tsx scripts/arc-agent-contested-check.ts",
+    "arc:check:gateway": "tsx scripts/arc-gateway-check.ts"
   },
   "repository": {
     "type": "git",
@@ -47,9 +48,11 @@
   },
   "homepage": "https://github.com/cosmic-game-sanctuary/CGS-server#readme",
   "dependencies": {
+    "@circle-fin/x402-batching": "^3.5.0",
     "@noble/curves": "^2.4.0",
     "@noble/hashes": "^2.4.0",
     "@privy-io/node": "^0.34.0",
+    "@x402/evm": "^2.28.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.45.2",

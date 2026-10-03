@@ -1,0 +1,1 @@
+ALTER TABLE "sales" ADD COLUMN "gateway_transfer_id" text;

@@ -1,5 +1,5 @@
 import { eq } from "drizzle-orm";
-import type { Address, Hex } from "viem";
+import { getAddress, type Address } from "viem";
 import { db } from "../../db/client.js";
 import { games, gameKeys, sales } from "../../db/schema.js";
 import { keyAddress } from "../arc/client.js";
@@ -39,13 +39,33 @@ export async function fulfilArcPurchase(input: {
   ownerAddress: Address;
   /** The address the money actually left — the agent's, when one paid. */
   payerAddress: Address;
-  settlementTx: Hex;
+  /**
+   * An on-chain transaction hash for a normal settlement. A trial chunk
+   * settled through Circle Gateway (Stage 7) has no transaction yet at this
+   * point — pass its transfer id via `gatewayTransferId` instead and this
+   * field is used only as the (temporary) human-readable record.
+   */
+  settlementTx: string;
   /** Atomic USDC units actually settled, never the listing price read again. */
   amountUnits: number;
   kind: "purchase" | "trial_chunk";
   creditAppliedUnits?: number;
+  /**
+   * Set only when `settlementTx` is a Circle Gateway transfer id, not a
+   * transaction hash — see services/arc/x402/gateway.ts. The money for this
+   * sale is not yet in the vault; it lands whenever Gateway's next batch runs.
+   */
+  gatewayTransferId?: string;
 }): Promise<void> {
-  const { game, ownerAddress, payerAddress, settlementTx, amountUnits, kind } = input;
+  const { game, payerAddress, settlementTx, amountUnits, kind, gatewayTransferId } = input;
+  // Canonical EIP-55 case, regardless of what case the settlement path handed
+  // back — Circle Gateway's own `/settle` response echoes the payer address
+  // lowercased (measured directly, Stage 7), and nothing downstream should
+  // have to know that. `trialChunksFor` matches `buyerAccountId` by exact
+  // string equality against a signed-in user's (checksummed) `evmAddress`, so
+  // a lowercase row here would silently never be found as that buyer's own
+  // trial credit.
+  const ownerAddress = getAddress(input.ownerAddress);
 
   // The sale row, and for a real purchase a key row, before anything chain-side
   // is attempted. They are what says this person paid: the download route hands
@@ -62,13 +82,16 @@ export async function fulfilArcPurchase(input: {
       priceUnits: amountUnits,
       priceAsset: game.priceAsset,
       settlementTxId: settlementTx,
+      gatewayTransferId: gatewayTransferId ?? null,
       kind,
       creditAppliedUnits: kind === "purchase" ? (input.creditAppliedUnits ?? 0) : 0,
       // Settled by the vault at the moment of payment, which is strictly
-      // stronger than us having sent the transfers ourselves — there was never a
-      // window in which the money sat somewhere we controlled. Nothing retries
-      // this and nothing can fail it.
-      splitStatus: "distributed",
+      // stronger than us having sent the transfers ourselves — there was never
+      // a window in which the money sat somewhere we controlled. Not true for
+      // a Gateway chunk: Circle credits it immediately but the vault only sees
+      // it once a batch lands, so that one case is left at the column's own
+      // "pending" default instead of being asserted settled.
+      splitStatus: gatewayTransferId ? "pending" : "distributed",
     })
     .returning();
 

@@ -65,6 +65,13 @@ import {
   settleFromHeader,
   termsFor,
 } from "../services/arc/x402/gate.js";
+import {
+  gatewayAvailableUnits,
+  gatewayChallengeBody,
+  gatewayTermsFor,
+  gatewayWalletAddress,
+  settleGatewayFromHeader,
+} from "../services/arc/x402/gateway.js";
 import { fulfilArcPurchase } from "../services/games/fulfilArc.js";
 import { publishLimiter } from "../middleware/ratelimit.middleware.js";
 import { publishAgentMandate } from "../services/agent/mandate.js";
@@ -77,7 +84,7 @@ import {
 import { emailStudioInvite } from "../services/email/messages.js";
 import { addressForEmail } from "../services/privy/wallets.js";
 import { publishOnChain } from "../services/games/publishArc.js";
-import { explorerAddressUrl, keyAddress, registryAddress } from "../services/arc/client.js";
+import { arcChain, explorerAddressUrl, keyAddress, registryAddress, USDC_ADDRESS } from "../services/arc/client.js";
 import {
   trialEnabled,
   trialStatusFor,
@@ -1208,6 +1215,33 @@ gameRouter.get(
 
     const status = await trialStatusFor(game, req.auth?.evmAddress ?? null);
 
+    // Chunks settle through Circle Gateway (Stage 7), which needs a one-time
+    // deposit before any chunk can be signed. Surfaced here, not as a
+    // confusing failure on the first chunk, so the trial panel can show "add
+    // funds" deliberately when it's actually needed.
+    let gatewayDeposit: null | {
+      walletAddress: Address;
+      usdcAddress: Address;
+      chainId: number;
+      availableUnits: string;
+      availableUsd: number;
+      needsDeposit: boolean;
+    } = null;
+    if (status.enabled && req.auth?.evmAddress && status.chunksLeft > 0) {
+      const [walletAddress, availableUnits] = await Promise.all([
+        gatewayWalletAddress(),
+        gatewayAvailableUnits(req.auth.evmAddress as Address),
+      ]);
+      gatewayDeposit = {
+        walletAddress,
+        usdcAddress: USDC_ADDRESS,
+        chainId: arcChain().id,
+        availableUnits: availableUnits.toString(),
+        availableUsd: toDisplayAmount(Number(availableUnits), game.priceAsset),
+        needsDeposit: availableUnits < BigInt(status.chunkPriceUnits ?? 0),
+      };
+    }
+
     res.json({
       ...status,
       chunkPriceUsd: toTrialUsd(status.chunkPriceUnits, game),
@@ -1217,6 +1251,7 @@ gameRouter.get(
       owedUsd: toDisplayAmount(status.owedUnits, game.priceAsset),
       asset: game.priceAsset,
       assetDecimals: assetDecimals(game.priceAsset),
+      gatewayDeposit,
     });
   }),
 );
@@ -1237,7 +1272,7 @@ gameRouter.get(
       throw new AppError(422, "TRIAL_NOT_ENABLED", "This game doesn't offer a trial.");
     }
 
-    const terms = termsFor(
+    const terms = await gatewayTermsFor(
       req,
       game,
       game.trialChunkPriceUnits!,
@@ -1246,12 +1281,12 @@ gameRouter.get(
 
     const header = readPaymentHeader(req.headers);
     if (!header) {
-      res.status(402).json(challengeBody(terms));
+      res.status(402).json(gatewayChallengeBody(terms));
       return;
     }
 
     const payment = decodePaymentHeader(header);
-    const settled = await settleFromHeader(terms, payment, paymentIdFor(game.id, payment));
+    const settled = await settleGatewayFromHeader(terms, payment, terms.resource);
 
     // A chunk goes to whoever signed for it. There is no bearer token on this
     // request at all — the payment is the identification, exactly as it is for
@@ -1261,19 +1296,25 @@ gameRouter.get(
     // past `trialMaxChunks`. By here the money has already moved, so a chunk
     // bought past the cap is still recorded — the record has to be honest about
     // what was paid — and this is the backstop, not the gate.
+    //
+    // Settled through Circle Gateway, not the regular facilitator — the chunk
+    // is served now, as Gateway's own docs say to, but the money reaches the
+    // vault only once Circle's next batch lands. `gatewayTransferId` is what
+    // marks the sale row as not-yet-distributed rather than claiming it is.
     await fulfilArcPurchase({
       game,
       ownerAddress: settled.payer,
       payerAddress: settled.payer,
-      settlementTx: settled.transaction,
+      settlementTx: settled.transferId,
       amountUnits: settled.amountUnits,
       kind: "trial_chunk",
+      gatewayTransferId: settled.transferId,
     });
 
     res.setHeader("payment-verified", "true");
     res.json({
       chunkMinutes: game.trialChunkMinutes,
-      settlementTxId: settled.transaction,
+      gatewayTransferId: settled.transferId,
     });
   }),
 );
@@ -1298,7 +1339,7 @@ gameRouter.post(
       throw new AppError(409, "TRIAL_CHUNKS_EXHAUSTED", "No trial chunks left for this game.");
     }
 
-    const terms = termsFor(
+    const terms = await gatewayTermsFor(
       req,
       game,
       game.trialChunkPriceUnits!,
