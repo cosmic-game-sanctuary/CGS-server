@@ -168,7 +168,7 @@ process.on("uncaughtException", (err) => {
   process.exit(1);
 });
 
-app.listen(env.PORT, () => {
+const server = app.listen(env.PORT, () => {
   console.log(`cgs-server listening on :${env.PORT} (arc-${env.ARC_NETWORK})`);
 
   // The agent's whole trigger mechanism: one subscription to the public
@@ -246,3 +246,28 @@ app.listen(env.PORT, () => {
     }, everyMs);
   }
 });
+
+/**
+ * **A build upload is allowed to take longer than five minutes.**
+ *
+ * Node caps how long a request may take to be *fully received* at
+ * `requestTimeout`, 300s by default since Node 18, and `app.listen` had left
+ * that default in place. For every JSON route here that is irrelevant. For
+ * `POST /api/games` and `POST /api/games/:id/builds` it is a hard ceiling on
+ * how slow a developer's upstream is allowed to be, and it is lower than the
+ * real world: 22.5MB inside 300s needs about 0.6 Mbps sustained, and a
+ * domestic connection below that is ordinary rather than broken. Over it, Node
+ * closes the socket itself — before Express, before multer, before any code
+ * here runs — so nothing in the application can log it or explain it. From the
+ * browser it is indistinguishable from the server crashing mid-upload.
+ *
+ * Twenty minutes covers the 80MB multer ceiling at a genuinely bad uplink and
+ * is still a bound rather than `0`, which disables the protection entirely and
+ * invites a slowloris. `headersTimeout` stays at its 60s default: headers are
+ * small, and that is the limit actually worth keeping tight.
+ *
+ * The client half of the same bug is in CGS-client's `requestUpload`, which
+ * used to give up at 90s. Both had to change: a browser that waits patiently
+ * for a server that has already hung up still fails.
+ */
+server.requestTimeout = 20 * 60_000;
