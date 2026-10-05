@@ -11,6 +11,8 @@ import { getUsdcUnits } from "../services/arc/reads.js";
 import { keysHeldBy } from "../services/arc/keys.js";
 import { uuidFromGameId } from "../services/arc/registry.js";
 import { explorerTxUrl } from "../services/arc/client.js";
+import { gatewayAvailableUnits } from "../services/arc/x402/gateway.js";
+import type { Address } from "viem";
 import { assetDecimals, ensFullName, toDisplayAmount } from "../lib/display.js";
 import { validate } from "../middleware/validate.middleware.js";
 import { Errors } from "../lib/errors.js";
@@ -257,6 +259,42 @@ meRouter.get(
       // are cheaper" banner needs, and counting client-side means every client
       // reimplements the same comparison.
       onSale: items.filter((i) => i.percentOff > 0).length,
+    });
+  }),
+);
+
+// What this person has set aside in Circle Gateway for paid trials.
+//
+// It is their money and it is not in their wallet. A trial chunk is too small
+// to settle on chain, so the first trial asks for a one-time deposit into
+// Gateway and every minute after that is paid from it. Whatever was not played
+// stays there, and before this route nothing anywhere showed it: a buyer who
+// spent $3 out of $5 found $1.76 in their wallet and no account of the rest.
+//
+// Its own route rather than a field on `/api/me`, on purpose. Reading it is a
+// call to Circle, and `/api/me` runs on every page load and decides whether
+// sign-in worked. Coupling that to a third party's latency would make every
+// page as slow as Circle's slowest answer, for a number one page shows.
+//
+// Bounded, and a failure says so as a 503 with its own code rather than a
+// zero: "we could not ask" and "there is nothing there" are different answers,
+// and the second one would be a lie about somebody's money.
+meRouter.get(
+  "/gateway",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    let units: bigint;
+    try {
+      units = await gatewayAvailableUnits(req.auth!.evmAddress as Address, AbortSignal.timeout(8_000));
+    } catch (err) {
+      logger.warn({ err: String(err) }, "gateway balance lookup failed");
+      throw new AppError(503, "GATEWAY_UNAVAILABLE", "Could not read what is set aside for trials right now.");
+    }
+    res.json({
+      availableUnits: units.toString(),
+      availableUsd: toDisplayAmount(Number(units), USDC_ADDRESS),
+      asset: USDC_ADDRESS,
+      assetDecimals: assetDecimals(USDC_ADDRESS),
     });
   }),
 );

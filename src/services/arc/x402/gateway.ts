@@ -103,11 +103,14 @@ const GATEWAY_ARC_DOMAIN = 26;
  * rather than the full `GatewayClient` — that class needs a private key to
  * construct, which this server has no business holding for a buyer's wallet.
  */
-export async function gatewayAvailableUnits(address: Address): Promise<bigint> {
+export async function gatewayAvailableUnits(address: Address, signal?: AbortSignal): Promise<bigint> {
   const res = await fetch(`${GATEWAY_URL}/v1/balances`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ token: "USDC", sources: [{ depositor: address, domain: GATEWAY_ARC_DOMAIN }] }),
+    // Optional, so the trial route keeps exactly the behaviour it had. A
+    // caller that would rather fail than wait on Circle passes one.
+    signal,
   });
   if (!res.ok) throw new Error(`Gateway balances lookup failed (${res.status}): ${await res.text()}`);
   const data = (await res.json()) as { balances?: { balance: string }[] };
