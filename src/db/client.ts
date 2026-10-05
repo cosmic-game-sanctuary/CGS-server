@@ -1,8 +1,44 @@
+import net from "node:net";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import * as schema from "./schema.js";
 import { env } from "../config/env.js";
 import logger from "../utils/logger.utils.js";
+
+/**
+ * **Connect to one address family at a time, not both at once.**
+ *
+ * Node 18.13+ turns on `autoSelectFamily` by default: every outbound TCP
+ * connection races the host's IPv6 and IPv4 addresses ("Happy Eyeballs") and
+ * keeps whichever answers first. It is a good default on a working network and
+ * actively harmful on a half-working one.
+ *
+ * Neon publishes **three A and three AAAA records** for a pooled endpoint. On a
+ * machine whose IPv6 is dead — not refused, which would fail fast and fall
+ * through, but silently blackholed — the race walks into timeouts it cannot
+ * distinguish from a slow server, and the whole connection attempt dies. There
+ * is no retry that helps, because every attempt does the same thing.
+ *
+ * Measured from here, repeatedly and in the same process:
+ *
+ *   default (racing)            FAILED after 20s
+ *   autoSelectFamily off        OK in 2546ms
+ *   forcing an IPv4 lookup      OK in 1930ms
+ *
+ * while a raw IPv4 socket to the same host connected in ~270ms every time and a
+ * raw IPv6 socket timed out at 20s every time. **This is what every
+ * `Connection terminated unexpectedly` and `dbReachable: false` was** — it
+ * presents as Neon being down, slow or asleep, and none of those were true.
+ *
+ * Turning the race off makes Node use the resolver's order and stop, which on
+ * this host reaches a working address. It is set here rather than in a start
+ * script so the check scripts in `scripts/` get it too: they each open their
+ * own pool in their own process, and they are where this was costing the most.
+ *
+ * Harmless where IPv6 works: it only stops the *racing*, so a host that
+ * resolves to a reachable IPv6 address still connects over it.
+ */
+net.setDefaultAutoSelectFamily(false);
 
 // the pooled Neon connection string. migrations use DATABASE_URL (direct)
 // instead — see drizzle.config.ts and docs/SETUP.md for why they differ.
@@ -46,6 +82,11 @@ const pool = new Pool({
   // dead with no error and no log line — indistinguishable from a hang, and the
   // hardest possible thing to diagnose from outside. Fifteen seconds is far
   // longer than any healthy checkout here and still fails loudly.
+  //
+  // This was briefly raised to sixty on the theory that a cold Neon compute
+  // could not wake inside fifteen. That theory was wrong and the real cause is
+  // the `autoSelectFamily` note above: a connection that never completes is not
+  // a connection that needs longer. Left at fifteen deliberately.
   connectionTimeoutMillis: 15_000,
 });
 
