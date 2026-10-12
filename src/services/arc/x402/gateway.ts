@@ -1,5 +1,14 @@
 import type { Request } from "express";
-import { recoverTypedDataAddress, type Address, type Hex, type TypedDataDomain } from "viem";
+import {
+  encodeFunctionData,
+  maxUint256,
+  pad,
+  recoverTypedDataAddress,
+  zeroAddress,
+  type Address,
+  type Hex,
+  type TypedDataDomain,
+} from "viem";
 import { BatchFacilitatorClient } from "@circle-fin/x402-batching/server";
 import { GATEWAY_AUTH_VALIDITY_WINDOW_SECONDS } from "@circle-fin/x402-batching/client";
 import { AppError } from "../../../lib/errors.js";
@@ -334,4 +343,187 @@ function gatewayMessage(reason?: string): string {
     default:
       return `This payment could not be settled${reason ? ` (${reason})` : ""}.`;
   }
+}
+
+// --- withdrawing a Gateway deposit back out ---------------------------------
+//
+// Gateway's balance is its own ledger, not a vault we hold a key to, so
+// getting money back out is a different protocol from a deposit: a signed
+// "burn intent" that Circle attests, which a mint call on Arc's own
+// `GatewayMinter` then redeems. Same-chain only here (Arc back to Arc) —
+// that's Circle's documented *instant* path, no 7-day trustless delay —
+// which is also why `sourceDomain` and `destinationDomain` below are always
+// the same value.
+//
+// `@circle-fin/x402-batching`'s own `GatewayClient.withdraw` does exactly
+// this, but it requires a raw private key to construct (it signs and submits
+// for you). A buyer's wallet here is Privy-held and signs in the browser —
+// see CGS-server/CLAUDE.md, "the buyer signs in their browser, not here" —
+// so this hand-builds the identical wire format (confirmed against that
+// SDK's compiled source) instead of using the class.
+
+/**
+ * Circle's Gateway contracts — same address on every chain they support.
+ * Confirmed against `@circle-fin/x402-batching`'s own `CHAIN_CONFIGS`, not
+ * re-derived. `gatewayWalletAddress()` above fetches the *wallet* address
+ * dynamically from Circle's `/v1/x402/supported`; the *minter* has no
+ * equivalent discovery endpoint, so it's a constant here for the same reason
+ * `USDC_ADDRESS` is a constant in services/arc/client.ts — a fixed predeploy,
+ * not configuration.
+ */
+const GATEWAY_MINTER: Record<"testnet" | "mainnet", Address> = {
+  testnet: "0x0022222ABE238Cc2C7Bb1f21003F0a260052475B",
+  mainnet: "0x2222222d7164433c4C09B0b0D809a9b52C04C205",
+};
+
+function gatewayMinterAddress(): Address {
+  return GATEWAY_MINTER[env.ARC_NETWORK];
+}
+
+const addressToBytes32 = (addr: Address): Hex => pad(addr.toLowerCase() as Hex, { size: 32 });
+
+export type BurnIntent = {
+  maxBlockHeight: bigint;
+  maxFee: bigint;
+  spec: {
+    version: number;
+    sourceDomain: number;
+    destinationDomain: number;
+    sourceContract: Hex;
+    destinationContract: Hex;
+    sourceToken: Hex;
+    destinationToken: Hex;
+    sourceDepositor: Hex;
+    destinationRecipient: Hex;
+    sourceSigner: Hex;
+    destinationCaller: Hex;
+    value: bigint;
+    salt: Hex;
+    hookData: Hex;
+  };
+};
+
+/** The exact thing a buyer signs to pull `units` of their own Gateway deposit back out, to `recipient` (almost always their own address). */
+export async function buildGatewayBurnIntent(from: Address, recipient: Address, units: bigint, maxFeeUnits: bigint): Promise<BurnIntent> {
+  const gatewayWallet = await gatewayWalletAddress();
+  const domain = GATEWAY_ARC_DOMAIN;
+  const saltBytes = crypto.getRandomValues(new Uint8Array(32));
+  return {
+    maxBlockHeight: maxUint256,
+    maxFee: maxFeeUnits,
+    spec: {
+      version: 1,
+      sourceDomain: domain,
+      destinationDomain: domain,
+      sourceContract: addressToBytes32(gatewayWallet),
+      destinationContract: addressToBytes32(gatewayMinterAddress()),
+      sourceToken: addressToBytes32(USDC_ADDRESS),
+      destinationToken: addressToBytes32(USDC_ADDRESS),
+      sourceDepositor: addressToBytes32(from),
+      destinationRecipient: addressToBytes32(recipient),
+      sourceSigner: addressToBytes32(from),
+      destinationCaller: addressToBytes32(zeroAddress),
+      value: units,
+      salt: `0x${Buffer.from(saltBytes).toString("hex")}` as Hex,
+      hookData: "0x",
+    },
+  };
+}
+
+/**
+ * What a browser signs for a withdrawal. Deliberately no `chainId` or
+ * `verifyingContract` in the domain — confirmed against the SDK's own
+ * compiled source, not guessed: unlike a trial chunk's domain (gatewayDomain,
+ * above), Circle's burn-intent domain is just `{ name, version }`. The spec
+ * being cross-chain-shaped (source/destination pairs throughout) is what
+ * carries the actual chain information instead.
+ */
+export function gatewayBurnIntentTypedData(intent: BurnIntent) {
+  return {
+    domain: { name: "GatewayWallet", version: "1" } as const,
+    types: {
+      TransferSpec: [
+        { name: "version", type: "uint32" },
+        { name: "sourceDomain", type: "uint32" },
+        { name: "destinationDomain", type: "uint32" },
+        { name: "sourceContract", type: "bytes32" },
+        { name: "destinationContract", type: "bytes32" },
+        { name: "sourceToken", type: "bytes32" },
+        { name: "destinationToken", type: "bytes32" },
+        { name: "sourceDepositor", type: "bytes32" },
+        { name: "destinationRecipient", type: "bytes32" },
+        { name: "sourceSigner", type: "bytes32" },
+        { name: "destinationCaller", type: "bytes32" },
+        { name: "value", type: "uint256" },
+        { name: "salt", type: "bytes32" },
+        { name: "hookData", type: "bytes" },
+      ],
+      BurnIntent: [
+        { name: "maxBlockHeight", type: "uint256" },
+        { name: "maxFee", type: "uint256" },
+        { name: "spec", type: "TransferSpec" },
+      ],
+    } as const,
+    primaryType: "BurnIntent" as const,
+    message: intent,
+  };
+}
+
+export const recoverGatewayBurnSigner = (intent: BurnIntent, signature: Hex): Promise<Address> =>
+  recoverTypedDataAddress({ ...gatewayBurnIntentTypedData(intent), signature });
+
+export type GatewayWithdrawOutcome = { status: "attested"; attestation: Hex; signature: Hex } | { status: "failed"; message: string };
+
+/**
+ * Hands Circle the signed burn intent and gets back an attestation to mint
+ * with. No API key, same as every other Gateway endpoint this app calls —
+ * `/v1/transfer` is public.
+ */
+export async function submitGatewayBurnIntent(intent: BurnIntent, signature: Hex): Promise<GatewayWithdrawOutcome> {
+  const res = await fetch(`${GATEWAY_URL}/v1/transfer`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify([{ burnIntent: intent, signature }], (_, v) => (typeof v === "bigint" ? v.toString() : v)),
+  });
+  const result = (await res.json().catch(() => ({}))) as {
+    success?: boolean;
+    error?: string;
+    message?: string;
+    attestation?: Hex;
+    signature?: Hex;
+  };
+  if (!res.ok || result.success === false || result.error || !result.attestation || !result.signature) {
+    return { status: "failed", message: result.message ?? result.error ?? `Gateway refused the withdrawal (${res.status}).` };
+  }
+  return { status: "attested", attestation: result.attestation, signature: result.signature };
+}
+
+const GATEWAY_MINTER_ABI = [
+  {
+    name: "gatewayMint",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "attestationPayload", type: "bytes" },
+      { name: "signature", type: "bytes" },
+    ],
+    outputs: [],
+  },
+] as const;
+
+/**
+ * The transaction that actually redeems the attestation for USDC. The
+ * browser sends this with its own wallet, paying its own gas — same division
+ * of labour as every other on-chain write a buyer makes in this app. Callable
+ * by anyone (the ABI takes no `to` — the attestation itself names the
+ * recipient), but there is no reason for this app to pay gas on a buyer's
+ * behalf here the way `claimFor` does for a payee with nothing: a wallet
+ * asking Gateway for money back is, by definition, not a wallet with none.
+ */
+export function gatewayMintTransaction(attestation: Hex, signature: Hex) {
+  return {
+    to: gatewayMinterAddress(),
+    data: encodeFunctionData({ abi: GATEWAY_MINTER_ABI, functionName: "gatewayMint", args: [attestation, signature] }),
+    chainId: arcChain().id,
+  };
 }

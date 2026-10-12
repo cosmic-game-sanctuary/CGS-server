@@ -12,6 +12,7 @@ import { keysHeldBy } from "../services/arc/keys.js";
 import { uuidFromGameId } from "../services/arc/registry.js";
 import { explorerTxUrl } from "../services/arc/client.js";
 import { gatewayAvailableUnits } from "../services/arc/x402/gateway.js";
+import { completeGatewayWithdraw, prepareGatewayWithdraw } from "../services/arc/x402/gatewayWithdraw.js";
 import type { Address } from "viem";
 import { assetDecimals, ensFullName, toDisplayAmount } from "../lib/display.js";
 import { validate } from "../middleware/validate.middleware.js";
@@ -295,6 +296,58 @@ meRouter.get(
       availableUsd: toDisplayAmount(Number(units), USDC_ADDRESS),
       asset: USDC_ADDRESS,
       assetDecimals: assetDecimals(USDC_ADDRESS),
+    });
+  }),
+);
+
+// Pulling an unused Gateway deposit back out. Two steps because Circle has
+// to attest the burn before anyone can mint it back — see
+// services/arc/x402/gatewayWithdraw.ts. The browser signs `typedData` with
+// the buyer's own wallet (never this server) and, after `complete`, sends
+// `mintTransaction` itself too, paying its own gas — same division of labour
+// as POST /withdraw/prepare below.
+const gatewayWithdrawPrepareSchema = z.object({
+  // Omit to withdraw everything currently available.
+  amountUnits: z.string().regex(/^\d+$/).optional(),
+});
+
+meRouter.post(
+  "/gateway/withdraw/prepare",
+  requireAuth,
+  validate(gatewayWithdrawPrepareSchema),
+  asyncHandler(async (req, res) => {
+    const { amountUnits } = req.body as z.infer<typeof gatewayWithdrawPrepareSchema>;
+    const prepared = await prepareGatewayWithdraw(
+      req.auth!.id,
+      req.auth!.evmAddress as Address,
+      amountUnits === undefined ? undefined : BigInt(amountUnits),
+    );
+    res.json({
+      withdrawId: prepared.withdrawId,
+      typedData: prepared.typedData,
+      amountUnits: prepared.amountUnits.toString(),
+      amountUsd: toDisplayAmount(Number(prepared.amountUnits), USDC_ADDRESS),
+      expiresAt: new Date(prepared.expiresAt).toISOString(),
+    });
+  }),
+);
+
+const gatewayWithdrawCompleteSchema = z.object({
+  withdrawId: z.string().uuid(),
+  signature: z.string().regex(/^0x[0-9a-fA-F]+$/, "must be a signature"),
+});
+
+meRouter.post(
+  "/gateway/withdraw/complete",
+  requireAuth,
+  validate(gatewayWithdrawCompleteSchema),
+  asyncHandler(async (req, res) => {
+    const { withdrawId, signature } = req.body as z.infer<typeof gatewayWithdrawCompleteSchema>;
+    const result = await completeGatewayWithdraw(req.auth!.id, withdrawId, signature as `0x${string}`);
+    res.json({
+      amountUnits: result.amountUnits.toString(),
+      amountUsd: toDisplayAmount(Number(result.amountUnits), USDC_ADDRESS),
+      mintTransaction: result.mintTransaction,
     });
   }),
 );

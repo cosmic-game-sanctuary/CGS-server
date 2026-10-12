@@ -35,7 +35,9 @@
     "arc:check:identity": "tsx scripts/arc-agent-identity-check.ts",
     "arc:check:agent": "tsx scripts/arc-agent-buy-check.ts",
     "arc:check:contested": "tsx scripts/arc-agent-contested-check.ts",
-    "arc:check:gateway": "tsx scripts/arc-gateway-check.ts"
+    "arc:check:gateway": "tsx scripts/arc-gateway-check.ts",
+    "arc:check:gateway:withdraw": "tsx scripts/arc-gateway-withdraw-check.ts",
+    "arc:check:withdraw": "tsx scripts/arc-withdraw-check.ts"
   },
   "repository": {
     "type": "git",
