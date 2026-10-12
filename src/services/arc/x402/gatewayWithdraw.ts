@@ -50,7 +50,29 @@ function sweep(): void {
  * it's ever not enough, Circle's own error names the reason rather than
  * failing silently.
  */
-const MAX_FEE_UNITS = 10_000n;
+export const MAX_FEE_UNITS = 10_000n;
+
+/**
+ * **What can actually come out: the balance minus the fee ceiling, never the
+ * balance itself.** Circle takes its fee *on top of* the amount signed for,
+ * from the same Gateway balance, and refuses an intent that does not leave
+ * room for it. Measured on Arc testnet from a fresh wallet holding 0.05:
+ *
+ *   amount 0.05 (all of it)   refused  "available 0.050000, required 0.0535"
+ *   amount 0.04 (all − 0.01)  settled  Gateway −0.0435, wallet +0.04 less gas
+ *
+ * and the same 0.0035 on a 0.393 balance earlier, so the fee looks flat. It is
+ * not hard-coded here, because nothing promises it stays 0.0035. The ceiling
+ * is what the intent itself caps Circle at, so subtracting *that* can never be
+ * refused for fees, whatever the real fee turns out to be.
+ *
+ * The cost is a little dust left behind: up to the ceiling minus the real fee,
+ * 0.0065 today. It is still the depositor's and still spendable on a trial.
+ */
+export function withdrawableUnits(available: bigint): bigint {
+  const units = available - MAX_FEE_UNITS;
+  return units > 0n ? units : 0n;
+}
 
 export async function prepareGatewayWithdraw(
   userId: string,
@@ -60,12 +82,20 @@ export async function prepareGatewayWithdraw(
   sweep();
 
   const available = await gatewayAvailableUnits(address);
-  const units = amountUnits ?? available;
+  const ceiling = withdrawableUnits(available);
+  // "Everything" used to mean `available`, which Circle refuses every time: see
+  // `withdrawableUnits`. It means everything that can actually come out.
+  const units = amountUnits ?? ceiling;
   if (units <= 0n) {
     throw Errors.validationFailed({ amountUnits: "There's nothing in Gateway to withdraw." });
   }
-  if (units > available) {
-    throw Errors.validationFailed({ amountUnits: `Only ${available} units are available in Gateway right now.` });
+  // Checked against what can come out, not what is there. The old check passed
+  // an amount equal to the balance, which then failed at Circle in `complete`,
+  // after the person had already signed for it.
+  if (units > ceiling) {
+    throw Errors.validationFailed({
+      amountUnits: `Only ${ceiling} units can come out of Gateway right now, after room for Circle's fee.`,
+    });
   }
 
   const burnIntent = await buildGatewayBurnIntent(address, address, units, MAX_FEE_UNITS);

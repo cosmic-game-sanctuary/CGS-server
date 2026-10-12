@@ -12,7 +12,7 @@ import { keysHeldBy } from "../services/arc/keys.js";
 import { uuidFromGameId } from "../services/arc/registry.js";
 import { explorerTxUrl } from "../services/arc/client.js";
 import { gatewayAvailableUnits } from "../services/arc/x402/gateway.js";
-import { completeGatewayWithdraw, prepareGatewayWithdraw } from "../services/arc/x402/gatewayWithdraw.js";
+import { completeGatewayWithdraw, prepareGatewayWithdraw, withdrawableUnits } from "../services/arc/x402/gatewayWithdraw.js";
 import type { Address } from "viem";
 import { assetDecimals, ensFullName, toDisplayAmount } from "../lib/display.js";
 import { validate } from "../middleware/validate.middleware.js";
@@ -291,9 +291,16 @@ meRouter.get(
       logger.warn({ err: String(err) }, "gateway balance lookup failed");
       throw new AppError(503, "GATEWAY_UNAVAILABLE", "Could not read what is set aside for trials right now.");
     }
+    // `withdrawable` beside `available`, because they are not the same number:
+    // Circle's fee comes out on top of a withdrawal, so the whole balance can
+    // never come out. Sent from here so the client never carries a copy of
+    // Circle's fee that could fall out of date.
+    const withdrawable = withdrawableUnits(units);
     res.json({
       availableUnits: units.toString(),
       availableUsd: toDisplayAmount(Number(units), USDC_ADDRESS),
+      withdrawableUnits: withdrawable.toString(),
+      withdrawableUsd: toDisplayAmount(Number(withdrawable), USDC_ADDRESS),
       asset: USDC_ADDRESS,
       assetDecimals: assetDecimals(USDC_ADDRESS),
     });
