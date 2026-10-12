@@ -74,6 +74,33 @@ export function withdrawableUnits(available: bigint): bigint {
   return units > 0n ? units : 0n;
 }
 
+/**
+ * The burn intent as it can cross the wire: bigints as decimal strings.
+ *
+ * `prepareGatewayWithdraw` hands back viem's own shape, with `maxBlockHeight`,
+ * `maxFee` and `spec.value` as bigints, which is what signing and recovery on
+ * this side need. `res.json` cannot serialise a bigint at all — it throws
+ * "Do not know how to serialize a BigInt" — so the prepare route returned a
+ * 500 on its first call from a browser. The check script never noticed because
+ * it calls the service directly and signs the bigint version.
+ *
+ * Same treatment `browserPay.ts#preparedShape` already gives a purchase, and
+ * for the same reason the result is passed to `eth_signTypedData_v4` whole: a
+ * wallet reads a uint256 from a decimal string to the same number, so the
+ * signature recovers against the bigint original in `complete`.
+ */
+export function burnIntentForWire(typed: ReturnType<typeof gatewayBurnIntentTypedData>) {
+  const { message } = typed;
+  return {
+    ...typed,
+    message: {
+      maxBlockHeight: message.maxBlockHeight.toString(),
+      maxFee: message.maxFee.toString(),
+      spec: { ...message.spec, value: message.spec.value.toString() },
+    },
+  };
+}
+
 export async function prepareGatewayWithdraw(
   userId: string,
   address: Address,

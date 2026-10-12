@@ -12,7 +12,12 @@ import { keysHeldBy } from "../services/arc/keys.js";
 import { uuidFromGameId } from "../services/arc/registry.js";
 import { explorerTxUrl } from "../services/arc/client.js";
 import { gatewayAvailableUnits } from "../services/arc/x402/gateway.js";
-import { completeGatewayWithdraw, prepareGatewayWithdraw, withdrawableUnits } from "../services/arc/x402/gatewayWithdraw.js";
+import {
+  burnIntentForWire,
+  completeGatewayWithdraw,
+  prepareGatewayWithdraw,
+  withdrawableUnits,
+} from "../services/arc/x402/gatewayWithdraw.js";
 import type { Address } from "viem";
 import { assetDecimals, ensFullName, toDisplayAmount } from "../lib/display.js";
 import { validate } from "../middleware/validate.middleware.js";
@@ -331,7 +336,7 @@ meRouter.post(
     );
     res.json({
       withdrawId: prepared.withdrawId,
-      typedData: prepared.typedData,
+      typedData: burnIntentForWire(prepared.typedData),
       amountUnits: prepared.amountUnits.toString(),
       amountUsd: toDisplayAmount(Number(prepared.amountUnits), USDC_ADDRESS),
       expiresAt: new Date(prepared.expiresAt).toISOString(),
