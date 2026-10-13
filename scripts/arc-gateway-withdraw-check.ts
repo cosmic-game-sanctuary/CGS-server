@@ -24,7 +24,13 @@ import { env } from "../src/config/env.js";
 import { arcChain, confirm, feeOverrides, operator, unitsToWei, walletClient } from "../src/services/arc/client.js";
 import { getUsdcUnits } from "../src/services/arc/reads.js";
 import { gatewayAvailableUnits } from "../src/services/arc/x402/gateway.js";
-import { completeGatewayWithdraw, prepareGatewayWithdraw } from "../src/services/arc/x402/gatewayWithdraw.js";
+import {
+  burnIntentForWire,
+  completeGatewayWithdraw,
+  MAX_FEE_UNITS,
+  prepareGatewayWithdraw,
+  withdrawableUnits,
+} from "../src/services/arc/x402/gatewayWithdraw.js";
 import { AppError } from "../src/lib/errors.js";
 
 // `Errors.validationFailed`'s own `.message` is the same generic sentence for
@@ -85,11 +91,19 @@ const available = await until(
 check("Gateway shows the deposit as available", available >= DEPOSIT_UNITS, available);
 
 console.log("\n== validation before touching the chain ==");
-try {
-  await prepareGatewayWithdraw(userId, buyer.address, available + 1_000_000n);
-  check("withdrawing more than available is refused", false);
-} catch (err) {
-  check("withdrawing more than available is refused", /only .* units are available/i.test(reason(err)), reason(err));
+// Circle takes its fee on top of the amount signed for, so the whole balance
+// can never come out; asking for exactly all of it must be refused here, before
+// anyone signs, not at Circle afterwards.
+for (const [label, ask] of [
+  ["more than the balance", available + 1_000_000n],
+  ["exactly the whole balance", available],
+] as const) {
+  try {
+    await prepareGatewayWithdraw(userId, buyer.address, ask);
+    check(`withdrawing ${label} is refused at prepare`, false);
+  } catch (err) {
+    check(`withdrawing ${label} is refused at prepare`, /can come out of Gateway/i.test(reason(err)), reason(err));
+  }
 }
 
 console.log("\n== prepare, sign, complete — exactly what a browser does ==");
@@ -150,6 +164,41 @@ try {
 } catch (err) {
   check("a consumed withdrawId is refused on reuse", /expired or was already used/i.test(reason(err)), reason(err));
 }
+
+console.log("\n== 'withdraw everything', over a real JSON round trip (what the browser actually does) ==");
+// Both of these shipped broken because the first half of this script never
+// exercised them: the default amount was never run, and the service was called
+// directly so nothing ever tried to serialise a bigint over HTTP.
+const remaining = await until(
+  "the first withdrawal to settle in Gateway's balance",
+  () => gatewayAvailableUnits(buyer.address),
+  (u) => u <= available - WITHDRAW_UNITS + 1_000n,
+);
+const everything = await prepareGatewayWithdraw(userId, buyer.address);
+check("omitting the amount asks for balance minus the fee ceiling", everything.amountUnits === withdrawableUnits(remaining), `${everything.amountUnits} vs ${withdrawableUnits(remaining)}`);
+
+let wire: typeof everything.typedData | undefined;
+try {
+  wire = JSON.parse(JSON.stringify(burnIntentForWire(everything.typedData)));
+  check("the prepare payload survives JSON serialisation", true);
+} catch (err) {
+  check("the prepare payload survives JSON serialisation", false, err);
+}
+const wireSignature = (await buyer.signTypedData(wire as unknown as Parameters<typeof buyer.signTypedData>[0])) as Hex;
+const everythingDone = await completeGatewayWithdraw(userId, everything.withdrawId, wireSignature);
+check("a signature made over the parsed JSON strings is accepted", everythingDone.amountUnits === everything.amountUnits);
+
+const walletBeforeAll = await getUsdcUnits(buyer.address);
+const mintAll = await walletClient().sendTransaction({
+  account: buyer, chain: arcChain(), to: everythingDone.mintTransaction.to, data: everythingDone.mintTransaction.data, ...(await feeOverrides()),
+});
+check("the full-withdrawal mint succeeded", (await confirm(mintAll)).status === "success");
+check("only dust of at most the fee ceiling is left in Gateway", (await until(
+  "Gateway's balance to reflect the full withdrawal",
+  () => gatewayAvailableUnits(buyer.address),
+  (u) => u <= MAX_FEE_UNITS,
+)) <= MAX_FEE_UNITS);
+check("the wallet received it", (await getUsdcUnits(buyer.address)) > walletBeforeAll);
 
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);
 process.exit(failures === 0 ? 0 : 1);
