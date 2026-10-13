@@ -13,7 +13,7 @@ import { BatchFacilitatorClient } from "@circle-fin/x402-batching/server";
 import { GATEWAY_AUTH_VALIDITY_WINDOW_SECONDS } from "@circle-fin/x402-batching/client";
 import { AppError } from "../../../lib/errors.js";
 import { env } from "../../../config/env.js";
-import { arcChain, USDC_ADDRESS } from "../client.js";
+import { arcChain, confirm, feeOverrides, operator, publicClient, USDC_ADDRESS, walletClient, withGasHeadroom } from "../client.js";
 import type { Authorization } from "./authorization.js";
 import { payToFor, resourceInfoFor, type DecodedPayment } from "./gate.js";
 import type { ResourceInfo } from "./requirements.js";
@@ -512,13 +512,11 @@ const GATEWAY_MINTER_ABI = [
 ] as const;
 
 /**
- * The transaction that actually redeems the attestation for USDC. The
- * browser sends this with its own wallet, paying its own gas — same division
- * of labour as every other on-chain write a buyer makes in this app. Callable
- * by anyone (the ABI takes no `to` — the attestation itself names the
- * recipient), but there is no reason for this app to pay gas on a buyer's
- * behalf here the way `claimFor` does for a payee with nothing: a wallet
- * asking Gateway for money back is, by definition, not a wallet with none.
+ * The transaction that redeems the attestation for USDC. Callable by anyone —
+ * the attestation itself names the recipient and `destinationCaller` is the
+ * zero address — which is what lets the server send it (`submitGatewayMint`)
+ * and the browser send it as a fallback if that fails. Sending it twice is
+ * harmless: the second reverts because the attestation is spent.
  */
 export function gatewayMintTransaction(attestation: Hex, signature: Hex) {
   return {
@@ -526,4 +524,26 @@ export function gatewayMintTransaction(attestation: Hex, signature: Hex) {
     data: encodeFunctionData({ abi: GATEWAY_MINTER_ABI, functionName: "gatewayMint", args: [attestation, signature] }),
     chainId: arcChain().id,
   };
+}
+
+/**
+ * Redeem the attestation from the operator's wallet, paying the gas (~$0.003,
+ * the same arrangement as `SplitVault.claimFor`). This closes the one gap in
+ * the withdraw flow: once Circle has released the money, nothing but this
+ * attestation can collect it, and leaving the send to a browser tab meant a
+ * closed tab stranded it. The money still goes only to the recipient the
+ * depositor signed for — paying the gas gives the operator no say over it.
+ */
+export async function submitGatewayMint(attestation: Hex, signature: Hex): Promise<Hex> {
+  const { request } = await publicClient().simulateContract({
+    account: operator(),
+    address: gatewayMinterAddress(),
+    abi: GATEWAY_MINTER_ABI,
+    functionName: "gatewayMint",
+    args: [attestation, signature],
+    ...(await feeOverrides()),
+  });
+  const hash = await walletClient().writeContract(await withGasHeadroom(request));
+  await confirm(hash);
+  return hash;
 }

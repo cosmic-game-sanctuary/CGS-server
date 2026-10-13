@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
 import type { Address, Hex } from "viem";
 import { AppError, Errors } from "../../../lib/errors.js";
+import logger from "../../../utils/logger.utils.js";
 import {
   buildGatewayBurnIntent,
   gatewayAvailableUnits,
   gatewayBurnIntentTypedData,
   gatewayMintTransaction,
+  submitGatewayMint,
   recoverGatewayBurnSigner,
   submitGatewayBurnIntent,
   type BurnIntent,
@@ -137,7 +139,15 @@ export async function completeGatewayWithdraw(
   userId: string,
   withdrawId: string,
   signature: Hex,
-): Promise<{ amountUnits: bigint; mintTransaction: ReturnType<typeof gatewayMintTransaction> }> {
+  // Injectable only so a check can prove the fallback with a redeemer that
+  // genuinely fails; every real caller uses the default.
+  redeem: typeof submitGatewayMint = submitGatewayMint,
+): Promise<{
+  amountUnits: bigint;
+  /** Set when the server redeemed the attestation. Null means it did not, and the caller must send `mintTransaction`. */
+  mintTxHash: Hex | null;
+  mintTransaction: ReturnType<typeof gatewayMintTransaction>;
+}> {
   const intent = intents.get(withdrawId);
   const expired = () => Errors.validationFailed({ withdrawId: "That withdrawal expired or was already used. Start it again." });
   if (!intent) throw expired();
@@ -154,5 +164,18 @@ export async function completeGatewayWithdraw(
     throw new AppError(502, "GATEWAY_WITHDRAW_FAILED", outcome.message);
   }
 
-  return { amountUnits: intent.burnIntent.spec.value, mintTransaction: gatewayMintTransaction(outcome.attestation, outcome.signature) };
+  // Circle has released the money by now, so the attestation is the only thing
+  // that can collect it. Redeem it here so a closed tab cannot strand it. If
+  // that fails for any reason — operator out of gas, an RPC hiccup — the
+  // transaction goes back to the caller as a fallback rather than an error:
+  // throwing would discard the one copy of an attestation that is already paid for.
+  const mintTransaction = gatewayMintTransaction(outcome.attestation, outcome.signature);
+  let mintTxHash: Hex | null = null;
+  try {
+    mintTxHash = await redeem(outcome.attestation, outcome.signature);
+  } catch (err) {
+    logger.error({ err: String(err), address: intent.address }, "server-side gateway mint failed; returning it for the client to send");
+  }
+
+  return { amountUnits: intent.burnIntent.spec.value, mintTxHash, mintTransaction };
 }

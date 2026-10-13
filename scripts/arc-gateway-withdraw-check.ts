@@ -21,7 +21,7 @@ import { randomUUID } from "node:crypto";
 import { formatUnits, type Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { env } from "../src/config/env.js";
-import { arcChain, confirm, feeOverrides, operator, unitsToWei, walletClient } from "../src/services/arc/client.js";
+import { arcChain, confirm, feeOverrides, operator, publicClient, unitsToWei, walletClient } from "../src/services/arc/client.js";
 import { getUsdcUnits } from "../src/services/arc/reads.js";
 import { gatewayAvailableUnits } from "../src/services/arc/x402/gateway.js";
 import {
@@ -61,8 +61,8 @@ const until = async <T>(label: string, read: () => Promise<T>, done: (v: T) => b
 const buyerKey = generatePrivateKey();
 const buyer = privateKeyToAccount(buyerKey);
 const userId = randomUUID();
-const DEPOSIT_UNITS = 50_000n; // 0.05 USDC
-const FUND_UNITS = 100_000n; // deposit + gas for the deposit's two txs and the final mint
+const DEPOSIT_UNITS = 80_000n; // 0.08 USDC — room for three withdrawals plus Circle's fee on each
+const FUND_UNITS = 150_000n; // deposit + gas for the deposit's two txs; the buyer never pays mint gas
 
 console.log(`buyer (fresh, raw key — standing in for a Privy wallet): ${buyer.address}\n`);
 
@@ -132,22 +132,17 @@ const completed = await completeGatewayWithdraw(userId, prepared.withdrawId, sig
 check("complete reports the requested amount", completed.amountUnits === WITHDRAW_UNITS, completed.amountUnits);
 check("complete hands back a mint transaction", Boolean(completed.mintTransaction?.data), completed.mintTransaction);
 
-console.log("\n== redeeming the attestation on-chain, buyer pays its own gas ==");
-const mintHash = await walletClient().sendTransaction({
-  account: buyer,
-  chain: arcChain(),
-  to: completed.mintTransaction.to,
-  data: completed.mintTransaction.data,
-  ...(await feeOverrides()),
-});
-const receipt = await confirm(mintHash);
-check("the mint transaction succeeded", receipt.status === "success", receipt.status);
+console.log("\n== the server redeems the attestation, and the buyer pays no gas ==");
+check("complete reports the mint the server sent", Boolean(completed.mintTxHash), completed.mintTxHash);
+const receipt = await publicClient().getTransactionReceipt({ hash: completed.mintTxHash! });
+check("the server's mint transaction succeeded", receipt.status === "success", receipt.status);
+check("it was sent by the operator, not the buyer", receipt.from.toLowerCase() === operator().address.toLowerCase(), receipt.from);
 
 const walletAfter = await getUsdcUnits(buyer.address);
 check(
-  "the withdrawn amount reached the buyer's own wallet",
-  walletAfter >= walletBefore + WITHDRAW_UNITS - 10_000n, // allows for Circle's real fee and this tx's own gas
-  `before ${fmt(walletBefore)}, after ${fmt(walletAfter)}, expected roughly +${fmt(WITHDRAW_UNITS)}`,
+  "the buyer's wallet gained exactly the withdrawn amount — no gas taken from it",
+  walletAfter === walletBefore + WITHDRAW_UNITS,
+  `before ${fmt(walletBefore)}, after ${fmt(walletAfter)}, expected +${fmt(WITHDRAW_UNITS)}`,
 );
 
 const availableAfter = await until(
@@ -164,6 +159,31 @@ try {
 } catch (err) {
   check("a consumed withdrawId is refused on reuse", /expired or was already used/i.test(reason(err)), reason(err));
 }
+
+console.log("\n== if the server's redeem fails, the client gets the mint to send itself ==");
+await until("the first withdrawal to settle", () => gatewayAvailableUnits(buyer.address), (u) => u <= available - WITHDRAW_UNITS + 1_000n);
+const FALLBACK_UNITS = 10_000n;
+const fb = await prepareGatewayWithdraw(userId, buyer.address, FALLBACK_UNITS);
+const fbSig = (await buyer.signTypedData(fb.typedData as unknown as Parameters<typeof buyer.signTypedData>[0])) as Hex;
+const fbWalletBefore = await getUsdcUnits(buyer.address);
+const fbDone = await completeGatewayWithdraw(userId, fb.withdrawId, fbSig, async () => {
+  throw new Error("simulated operator failure");
+});
+check("a failed server redeem does not fail the request", fbDone.amountUnits === FALLBACK_UNITS);
+check("it reports no server mint and still returns the transaction", fbDone.mintTxHash === null && Boolean(fbDone.mintTransaction.data));
+check("nothing reached the wallet yet — the money is released but uncollected", (await getUsdcUnits(buyer.address)) === fbWalletBefore);
+const fbHash = await walletClient().sendTransaction({
+  account: buyer, chain: arcChain(), to: fbDone.mintTransaction.to, data: fbDone.mintTransaction.data, ...(await feeOverrides()),
+});
+check("the client sending the fallback mint succeeds", (await confirm(fbHash)).status === "success");
+check("and the money arrives, less only the buyer's own gas", (await getUsdcUnits(buyer.address)) > fbWalletBefore);
+let doubleSpend = false;
+try {
+  await publicClient().call({ account: buyer.address, to: fbDone.mintTransaction.to, data: fbDone.mintTransaction.data });
+} catch {
+  doubleSpend = true;
+}
+check("sending a spent mint again reverts rather than paying twice", doubleSpend);
 
 console.log("\n== 'withdraw everything', over a real JSON round trip (what the browser actually does) ==");
 // Both of these shipped broken because the first half of this script never
@@ -185,20 +205,17 @@ try {
   check("the prepare payload survives JSON serialisation", false, err);
 }
 const wireSignature = (await buyer.signTypedData(wire as unknown as Parameters<typeof buyer.signTypedData>[0])) as Hex;
+const allWalletBefore = await getUsdcUnits(buyer.address);
 const everythingDone = await completeGatewayWithdraw(userId, everything.withdrawId, wireSignature);
 check("a signature made over the parsed JSON strings is accepted", everythingDone.amountUnits === everything.amountUnits);
 
-const walletBeforeAll = await getUsdcUnits(buyer.address);
-const mintAll = await walletClient().sendTransaction({
-  account: buyer, chain: arcChain(), to: everythingDone.mintTransaction.to, data: everythingDone.mintTransaction.data, ...(await feeOverrides()),
-});
-check("the full-withdrawal mint succeeded", (await confirm(mintAll)).status === "success");
+check("the full withdrawal was redeemed by the server too", Boolean(everythingDone.mintTxHash), everythingDone.mintTxHash);
+check("the wallet received exactly the amount, with no gas taken", (await getUsdcUnits(buyer.address)) === allWalletBefore + everything.amountUnits);
 check("only dust of at most the fee ceiling is left in Gateway", (await until(
   "Gateway's balance to reflect the full withdrawal",
   () => gatewayAvailableUnits(buyer.address),
   (u) => u <= MAX_FEE_UNITS,
 )) <= MAX_FEE_UNITS);
-check("the wallet received it", (await getUsdcUnits(buyer.address)) > walletBeforeAll);
 
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);
 process.exit(failures === 0 ? 0 : 1);

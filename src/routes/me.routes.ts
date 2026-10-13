@@ -359,6 +359,11 @@ meRouter.post(
     res.json({
       amountUnits: result.amountUnits.toString(),
       amountUsd: toDisplayAmount(Number(result.amountUnits), USDC_ADDRESS),
+      // Set when the server redeemed it (the normal case): the money is in the
+      // wallet and there is nothing left to send. Null means the client must
+      // send `mintTransaction` itself — see completeGatewayWithdraw.
+      mintTxHash: result.mintTxHash,
+      explorerUrl: result.mintTxHash ? explorerTxUrl(result.mintTxHash) : null,
       mintTransaction: result.mintTransaction,
     });
   }),
