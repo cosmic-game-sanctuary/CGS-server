@@ -29,7 +29,9 @@ import { games, gameKeys, sales, splits, studios, users, wishlistAgents, wishlis
 import {
   arcChain,
   confirm,
+  explorerUrl,
   feeOverrides,
+  identityRegistryAddress,
   operator,
   publicClient,
   unitsToWei,
@@ -305,6 +307,6 @@ check(
 );
 
 console.log(`\nagent ${agent.id}, ERC-8004 token ${funded?.erc8004AgentId}`);
-console.log(`explorer: https://explorer.testnet.arc.io/token/${env.ARC_IDENTITY_REGISTRY}/instance/${funded?.erc8004AgentId}`);
+console.log(`explorer: ${explorerUrl()}/token/${identityRegistryAddress()}/instance/${funded?.erc8004AgentId}`);
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);
 process.exit(failures === 0 ? 0 : 1);

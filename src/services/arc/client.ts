@@ -139,8 +139,21 @@ export function explorerUrl(): string {
 export const explorerTxUrl = (hash: string) => `${explorerUrl()}/tx/${hash}`;
 export const explorerAddressUrl = (address: string) => `${explorerUrl()}/address/${address}`;
 
+/**
+ * ERC-8004's reference IdentityRegistry: one address on every testnet, another
+ * on every mainnet. Checked on Arc on 14 Oct 2026: each is a proxy over the
+ * same implementation (`0x7274…9c02`, version 2.0.0) and has no code at all on
+ * the other network. This used to be a single default, documented as the same
+ * on both, which would have pointed every mainnet agent registration at an
+ * empty address.
+ */
+const IDENTITY_REGISTRY: Record<"testnet" | "mainnet", Address> = {
+  testnet: "0x8004A818BFB912233c491871b3d84c89A494BD9e",
+  mainnet: "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432",
+};
+
 export function identityRegistryAddress(): Address {
-  return env.ARC_IDENTITY_REGISTRY as Address;
+  return (env.ARC_IDENTITY_REGISTRY as Address | undefined) ?? IDENTITY_REGISTRY[env.ARC_NETWORK];
 }
 
 /**

@@ -125,11 +125,11 @@ const envSchema = z.object({
   ARC_GAME_REGISTRY: evmAddress.optional(),
   ARC_GAME_KEY: evmAddress.optional(),
   ARC_VAULT_FACTORY: evmAddress.optional(),
-  // ERC-8004's IdentityRegistry, a per-chain singleton we do not deploy.
-  // Defaulted rather than left blank because the address is the same on Arc
-  // testnet and mainnet and is not ours to choose; override only if that
-  // stops being true.
-  ARC_IDENTITY_REGISTRY: evmAddress.default("0x8004A818BFB912233c491871b3d84c89A494BD9e"),
+  // ERC-8004's IdentityRegistry, a per-chain singleton we do not deploy. Leave
+  // unset: services/arc/client.ts#identityRegistryAddress picks the reference
+  // deployment for ARC_NETWORK, which is a *different* address on testnet and
+  // mainnet. Set it only to point at a registry of your own.
+  ARC_IDENTITY_REGISTRY: evmAddress.optional(),
   // Where the platform's cut lands. Defaults to the operator — see
   // services/arc/client.ts#platformPayoutAddress for why that is a stopgap.
   ARC_PLATFORM_PAYOUT: evmAddress.optional(),
