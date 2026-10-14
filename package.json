@@ -41,7 +41,8 @@
     "arc:check:gateway:withdraw": "tsx scripts/arc-gateway-withdraw-check.ts",
     "arc:check:trial-relay": "tsx scripts/arc-trial-relay-check.ts",
     "arc:check:faucet": "TESTNET_FAUCET=on DEV_FAUCET=off TESTNET_FAUCET_CAP=0.5 tsx scripts/arc-faucet-check.ts",
-    "arc:check:withdraw": "tsx scripts/arc-withdraw-check.ts"
+    "arc:check:withdraw": "tsx scripts/arc-withdraw-check.ts",
+    "arc:check:hardening": "tsx scripts/arc-hardening-check.ts"
   },
   "repository": {
     "type": "git",

@@ -1037,7 +1037,15 @@ export async function runAgentSweep(): Promise<{
     ),
   });
   for (const agent of due) {
-    const { refundedUnits } = await retireAgent(agent, "expired");
+    // One agent whose refund fails must not stop the others being retired.
+    // retireAgent puts a failed one back to its active status, so the next
+    // sweep finds it again.
+    const retired = await retireAgent(agent, "expired").catch((err) => {
+      logger.error({ err, agentId: agent.id }, "expiring an agent failed; it will be retried on the next sweep");
+      return null;
+    });
+    if (!retired) continue;
+    const { refundedUnits } = retired;
     const buyer = await db.query.users.findFirst({ where: eq(users.id, agent.buyerUserId) });
     await db.insert(notifications).values({
       userId: agent.buyerUserId,

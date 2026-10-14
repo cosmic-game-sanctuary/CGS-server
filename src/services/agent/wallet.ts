@@ -196,21 +196,41 @@ export async function retireAgent(
     .returning();
   if (!claimed) return { agent, refundTxId: null, refundedUnits: 0n };
 
-  const balance = await agentBalance(claimed);
-  if (balance <= 0n) return { agent: claimed, refundTxId: null, refundedUnits: 0n };
+  // The row is claimed before the refund so two callers cannot refund the same
+  // wallet twice. But that claim must not outlive a refund that did not happen:
+  // a transient RPC or Privy failure after the status flipped would leave the
+  // money in a wallet whose agent is already "ended", with no route (the DELETE
+  // answers 409, the sweep only looks at active agents) that ever tries again.
+  // So a failure puts the status back and rethrows, and the refund is retried
+  // by whoever asks next.
+  try {
+    const balance = await agentBalance(claimed);
+    if (balance <= 0n) return { agent: claimed, refundTxId: null, refundedUnits: 0n };
 
-  const buyer = await db.query.users.findFirst({ where: eq(users.id, claimed.buyerUserId) });
-  if (!buyer) return { agent: claimed, refundTxId: null, refundedUnits: 0n };
+    const buyer = await db.query.users.findFirst({ where: eq(users.id, claimed.buyerUserId) });
+    if (!buyer) return { agent: claimed, refundTxId: null, refundedUnits: 0n };
 
-  // No "has the buyer got an account yet" check any more: on Arc their address
-  // is always a valid destination, so the one case that used to strand a refund
-  // cannot happen.
-  const refundTxId = await refundAgentBalance({
-    agentWalletId: claimed.agentWalletId,
-    agentAddress: claimed.agentEvmAddress as `0x${string}`,
-    to: buyer.evmAddress as `0x${string}`,
-    amountUnits: balance,
-  });
+    // No "has the buyer got an account yet" check any more: on Arc their address
+    // is always a valid destination, so the one case that used to strand a refund
+    // cannot happen.
+    const refundTxId = await refundAgentBalance({
+      agentWalletId: claimed.agentWalletId,
+      agentAddress: claimed.agentEvmAddress as `0x${string}`,
+      to: buyer.evmAddress as `0x${string}`,
+      amountUnits: balance,
+    });
 
-  return { agent: claimed, refundTxId, refundedUnits: balance };
+    return { agent: claimed, refundTxId, refundedUnits: balance };
+  } catch (err) {
+    const active = ["draft", "funded", "watching", "buying"] as const;
+    const restoreTo = (active as readonly string[]).includes(agent.status) ? agent.status : "watching";
+    await db
+      .update(wishlistAgents)
+      .set({ status: restoreTo })
+      .where(and(eq(wishlistAgents.id, claimed.id), eq(wishlistAgents.status, reason)))
+      .catch((restoreErr) =>
+        logger.error({ err: restoreErr, agentId: claimed.id }, "could not restore an agent after a failed refund; refund it by hand"),
+      );
+    throw err;
+  }
 }

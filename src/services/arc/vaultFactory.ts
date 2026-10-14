@@ -11,6 +11,7 @@ import {
   withGasHeadroom,
 } from "./client.js";
 import { env } from "../../config/env.js";
+import { getVaultState } from "./vault.js";
 
 const ZERO: Address = "0x0000000000000000000000000000000000000000";
 
@@ -66,6 +67,23 @@ export function toBasisPoints(
   return out;
 }
 
+/**
+ * Throws unless `vault` pays exactly these payees these shares, in any order.
+ * Reads the contract, not our database, because the contract is what pays.
+ */
+export async function assertVaultPays(vault: Address, expected: VaultRecipient[]): Promise<void> {
+  const state = await getVaultState(vault);
+  const actual = new Map(state.payees.map((p) => [p.address.toLowerCase(), Number(p.bps)]));
+  const want = new Map(expected.map((r) => [r.address.toLowerCase(), r.bps]));
+  const same = actual.size === want.size && [...want].every(([address, bps]) => actual.get(address) === bps);
+  if (!same) {
+    throw new Error(
+      `vault ${vault} does not pay the split this game was given, so it will not be listed. ` +
+        `It has ${[...actual].map(([a, b]) => `${a}:${b}`).join(", ")}; expected ${[...want].map(([a, b]) => `${a}:${b}`).join(", ")}.`,
+    );
+  }
+}
+
 export type DeployedVault = { vault: Address; txHash: Hex | null; alreadyExisted: boolean };
 
 /**
@@ -77,11 +95,18 @@ export type DeployedVault = { vault: Address; txHash: Hex | null; alreadyExisted
  * decides that, not this function — see VaultFactory.sol.
  */
 export async function deployVault(gameId: Hex, recipients: VaultRecipient[]): Promise<DeployedVault> {
-  const existing = await existingVault(gameId);
-  if (existing) return { vault: existing, txHash: null, alreadyExisted: true };
-
   const platform = platformPayoutAddress();
   const platformBps = env.PLATFORM_FEE_BPS;
+
+  const existing = await existingVault(gameId);
+  if (existing) {
+    // Never list a vault just because the factory holds one for this id. The
+    // factory only lets the operator deploy now, but the vault is what buyers
+    // pay and it is immutable, so a publish retry confirms it really pays the
+    // split this game was given before it goes on the public registry.
+    await assertVaultPays(existing, [{ address: platform, bps: platformBps }, ...recipients]);
+    return { vault: existing, txHash: null, alreadyExisted: true };
+  }
 
   // Caught here rather than as a bare revert from the constructor, because at
   // this point the developer is waiting on a publish and "DuplicateRecipient"

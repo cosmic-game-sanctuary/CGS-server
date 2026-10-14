@@ -24,6 +24,7 @@ import meRouter from "./routes/me.routes.js";
 import devRouter from "./routes/dev.routes.js";
 import { startAgentListener, runAgentSweep } from "./agent/watcher.js";
 import { relayTrialRevenue } from "./services/arc/x402/trialRelay.js";
+import { retryStuckMints } from "./services/games/fulfilArc.js";
 import { runPromotionTick } from "./services/games/promotions.js";
 import logger from "./utils/logger.utils.js";
 
@@ -219,6 +220,12 @@ const server = app.listen(env.PORT, () => {
   // hammering Circle's status endpoint.
   setInterval(() => {
     void relayTrialRevenue();
+  }, 2 * 60_000);
+
+  // Mints that never finished (see fulfilArc.ts#retryStuckMints). Safe to repeat:
+  // it checks the chain before it mints.
+  setInterval(() => {
+    void retryStuckMints();
   }, 2 * 60_000);
 
   // Keepalive, and why a *server-side* one is the right shape here.

@@ -346,6 +346,16 @@ export const vaultFactoryAbi = [
     inputs: [{ name: "", type: "bytes32" }],
     outputs: [{ type: "address" }],
   },
+  // Only on factories deployed after the squatting fix; the first testnet
+  // factory has no `operator()` and its `deploy` is open to anyone.
+  {
+    type: "function",
+    name: "operator",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ type: "address" }],
+  },
+  { type: "error", name: "NotOperator", inputs: [] },
   {
     type: "event",
     name: "VaultDeployed",

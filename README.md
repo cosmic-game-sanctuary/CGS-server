@@ -1,58 +1,68 @@
 # CGS-server
 
 The API, the chain integration, and the buying agent for
-**[Cosmic Game Sanctuary](https://github.com/cosmic-game-sanctuary/CGS-docs)** — an indie game store where an autonomous agent buys on your behalf, revenue splits pay a whole team in one atomic transaction, and trials are metered by the minute over x402. Payment and ownership settle on Hedera, so no card network decides what's sellable and no company decides what a buyer keeps owning.
+**[Cosmic Game Sanctuary](https://github.com/cosmic-game-sanctuary/CGS-docs)**, an indie game store where an autonomous agent buys on your behalf, revenue splits are enforced by a contract that pays a whole team without the money ever touching us, and trials are metered by the minute over x402. It runs on [Arc](https://www.arc.io/), Circle's EVM L1 where USDC is the gas token, so no card network decides what's sellable and no company decides what a buyer keeps owning.
 
-📺 **[Four-minute demo](https://youtu.be/WyJehf7Vgb4)** · 📖 [How it all works](https://github.com/cosmic-game-sanctuary/CGS-docs/blob/main/ARCHITECTURE.md) · 🔌 [API contract](https://github.com/cosmic-game-sanctuary/CGS-docs/blob/main/INTEGRATION.md)
+🟢 **Live on Arc mainnet:** [cgs.blackslate.me](https://cgs.blackslate.me) · 🧪 **Testnet:** [testnet.cgs.blackslate.me](https://testnet.cgs.blackslate.me)
 
-Built for ETHOnline 2026. The storefront itself is [CGS-client](https://github.com/cosmic-game-sanctuary/CGS-client).
+📺 **[Demo](VIDEO_LINK)** · 📖 [How it all works](https://github.com/cosmic-game-sanctuary/CGS-docs/blob/main/ARCHITECTURE.md) · 🔌 [API contract](https://github.com/cosmic-game-sanctuary/CGS-docs/blob/main/INTEGRATION.md)
 
-## Three claims a judge can check directly, not just read
+Built for the Arc Microgrants program. The storefront is [CGS-client](https://github.com/cosmic-game-sanctuary/CGS-client) and the contracts are in [CGS-contracts](https://github.com/cosmic-game-sanctuary/CGS-contracts).
 
-**GameKey tokens carry no wipe, freeze, or pause key.** See `createGameToken` in [`src/services/hedera/hts.ts`](src/services/hedera/hts.ts). We're structurally unable to take a purchase back — check any minted token on [HashScan](https://hashscan.io/testnet) rather than take our word for it.
+## Claims a judge can check directly, not just read
 
-**Delisting doesn't revoke access.** A delisted game leaves the catalog but stays playable for anyone already holding a key — see the state machine in [`src/db/schema.ts`](src/db/schema.ts) and the download branch in [`src/routes/game.routes.ts`](src/routes/game.routes.ts). Only `removed` (genuinely illegal content, resolved by a human, never an endpoint a studio can hit itself) unpins from storage.
+**Splits cannot change after publish.** Each game gets its own `SplitVault`, deployed through `VaultFactory` at publish with every payee's share and the platform's 5% fixed in its constructor. The vault has no owner and no setter. See [`src/services/arc/vault.ts`](src/services/arc/vault.ts) and the contract source on the explorer.
 
-**The wishlist agent reads the public HCS topic, not our database.** See [`src/agent/watcher.ts`](src/agent/watcher.ts) — it polls the Mirror Node the same way any outside program could, because that's the point. It has its own wallet, its own on-chain identity (HCS-14), and its balance is its entire spending cap. Nothing else limits it, because nothing else needs to.
+**GameKey has no admin.** Ownership is an ERC-721 with no pause, burn or freeze function, so delisting a game cannot take a key back and neither can we. A delisted game leaves the catalog but stays playable for anyone holding a key; see the download branch in [`src/routes/game.routes.ts`](src/routes/game.routes.ts).
 
-**Every price change, and how many people wishlisted a game, are public HCS messages, not rows only we can read.** See `changePrice` and `announceDemandIfMilestone` in [`src/services/games/listing.ts`](src/services/games/listing.ts) and [`src/services/games/wishlist.ts`](src/services/games/wishlist.ts) — each one writes to `HCS_LISTINGS_TOPIC` and records the transaction id it got back. Query the topic on the Mirror Node directly and the numbers have to match what the API says, because they're computed from the same messages.
+**The agent reads the public chain, not our database.** [`src/agent/watcher.ts`](src/agent/watcher.ts) polls `GameRegistry` events with `eth_getLogs`, the same way any outside program could. It has its own wallet and ERC-8004 identity, and its per-purchase ceiling is published on chain and enforced where the authorization is signed.
+
+**A purchase never passes through us.** The 402 challenge names the game's vault as `payTo`. The buyer signs an EIP-3009 authorization in their own browser wallet, and Circle's facilitator settles it and pays the gas. Trial chunks are the one exception, held briefly by the operator before a relay forwards them to the vault; see [`src/services/arc/x402/trialRelay.ts`](src/services/arc/x402/trialRelay.ts).
 
 ## Stack
 
-Node + TypeScript (ESM) · Express · Postgres via [Drizzle](https://orm.drizzle.team/) · [`@hiero-ledger/sdk`](https://github.com/hiero-ledger/hiero-sdk-js) for Hedera · [x402](https://x402.org) (`@x402/core` + `@x402/express` + `@x402/hedera`) through the Blocky402 facilitator for payment · [`@privy-io/node`](https://docs.privy.io/) for wallets, auth, and agent signing · [ENSv2](https://docs.ens.domains/) on Sepolia via [viem](https://viem.sh/) for studio names · [Pinata](https://docs.pinata.cloud/) for IPFS.
+Node + TypeScript (ESM) · Express · Postgres via [Drizzle](https://orm.drizzle.team/) · [viem](https://viem.sh/) for Arc · Circle's Facilitator and [Gateway nanopayments](https://developers.circle.com/gateway-nanopayments) over [x402](https://x402.org) · [`@privy-io/node`](https://docs.privy.io/) for wallets, auth, and agent signing · [ENSv2](https://docs.ens.domains/) on Sepolia for studio and agent names · [Pinata](https://docs.pinata.cloud/) for IPFS · Groq for the agent's contested decisions.
 
-Almost none of this is Hedera-specific once you're past the surface. Routing, validation, auth, uploads, invites, and notifications are a normal Express + Drizzle app that happens to call into five files — `services/hedera/{client,mirror,hcs,hts}.ts` and `services/x402/server.ts` — at specific points. The rest reads like any other REST backend.
+The chain layer lives in `src/services/arc/` (client, registry, vault, factory, keys, x402). Routing, validation, auth, uploads, invites, and notifications are an ordinary Express + Drizzle app that calls into it at specific points.
 
 ## Running it locally
 
 ```bash
 npm install
-cp .env.example .env   # fill in the real values — see below
+cp .env.example .env   # fill in the real values, see below
 npm run db:migrate      # applies drizzle/ against DATABASE_URL
 npm run dev             # tsx watch src/index.ts, on :3000
 curl localhost:3000/health
 ```
 
-`.env.example` documents every variable inline, grouped by what it's for: server config, Neon Postgres (two connection strings — direct for migrations, pooled for the running app, because PgBouncer's transaction mode doesn't support the `SET` statements a migration issues), Hedera (a funded testnet operator account from [portal.hedera.com](https://portal.hedera.com)), x402/Blocky402, HCS topic IDs, Privy, ENSv2/Sepolia, Pinata, and the CSAM moderation gate.
+`.env.example` documents every variable inline: server config, Neon Postgres (two connection strings, direct for migrations and pooled for the running app, because PgBouncer's transaction mode doesn't support the `SET` statements a migration issues), Arc (network, RPC, operator key, the deployed contract addresses, platform payout), Circle's API key, Privy, ENSv2/Sepolia, Pinata, and the CSAM moderation gate.
 
-**Every upload fails closed with `MODERATION_BLOCKED` until a CSAM-scanning provider is chosen.** That's deliberate, not a bug — see `CSAM_MODE` in `.env.example` and `checkImages()` in [`src/services/moderation/csam.ts`](src/services/moderation/csam.ts). The rest of the pipeline (unzip, splits validation, IPFS pinning) is real and testable with `CSAM_MODE=skip` locally; it stays `block` everywhere else.
+**Testnet vs mainnet is one switch, `ARC_NETWORK`.** Use a separate database and a separate operator for each. To run against mainnet locally without touching your testnet `.env`, keep the values in `.env.mainnet` and start with `DOTENV_CONFIG_PATH=.env.mainnet`.
+
+The testnet deployment can also run a public, capped faucet (`TESTNET_FAUCET=on`) so anyone can try the app with free test USDC. The server refuses to boot with it on mainnet.
+
+**Uploads follow `CSAM_MODE`.** With no scanning provider wired, `block` fails every upload closed with `MODERATION_BLOCKED`, which is deliberate; see `checkImages()` in [`src/services/moderation/csam.ts`](src/services/moderation/csam.ts), the single seam a provider drops into.
+
+## Tests
+
+Acceptance scripts run against a real chain and a real database, not mocks, e.g. `npm run arc:check:publish`, `arc:check:agent`, `arc:check:contested`, `arc:check:trial-relay`, `arc:check:gateway:withdraw`. They are listed in `package.json` and need a funded testnet operator.
 
 ## API
 
-Full endpoint list and request/response shapes, written for whoever's wiring a client against this: [`CGS-docs/INTEGRATION.md`](https://github.com/cosmic-game-sanctuary/CGS-docs/blob/main/INTEGRATION.md). Short version — everything is ordinary REST with one exception:
+Full endpoint list and request/response shapes: [`CGS-docs/INTEGRATION.md`](https://github.com/cosmic-game-sanctuary/CGS-docs/blob/main/INTEGRATION.md). Everything is ordinary REST with one exception:
 
 ```http
 GET /api/games/:id/download
 ```
 
-Returns `200` immediately for a free game or one this wallet already owns. Otherwise it's the [x402](https://x402.org) flow: a `402` with payment terms, a signed payment on retry, verify and settle through Blocky402, then `200` with a playable URL. `POST /api/games/:id/pay/prepare` + `POST /api/games/:id/pay/complete` is the same settlement, split in two because the browser holds the signing key and the server holds the Hedera client: the server builds and freezes the transfer, the browser signs it, the server submits.
+Returns `200` immediately for a free game or one this wallet already owns. Otherwise it's the [x402](https://x402.org) flow: a `402` with payment terms (`payTo` is the game's vault), a signed authorization on retry, settlement through Circle's facilitator, then `200` with a playable URL. `POST /api/games/:id/pay/prepare` + `POST /api/games/:id/pay/complete` is the same settlement split in two for clients that sign separately.
 
-Auth is a Privy access token as `Authorization: Bearer <token>` — no cookies, no sessions, no CSRF surface. Browsing (catalog, listings, reviews, studio pages) never requires one.
+Auth is a Privy access token as `Authorization: Bearer <token>`, with no cookies, sessions or CSRF surface. Browsing (catalog, listings, reviews, studio pages) never requires one.
 
 ## What's deliberately not here
 
-No resale or secondary market, no refunds, no editing revenue splits after a game publishes, no biometric or identity verification on upload, no admin override on anything moderation touches. Each of these was cut on purpose — see [`CGS-docs/README.md`](https://github.com/cosmic-game-sanctuary/CGS-docs) for why. A stale comment or an old doc that still gestures at one of these is a bug to flag, not a feature to finish.
+No resale or secondary market, no refunds, no editing revenue splits after a game publishes, no biometric or identity verification on upload, no admin override on anything moderation touches. Each of these was cut on purpose, see [`CGS-docs/README.md`](https://github.com/cosmic-game-sanctuary/CGS-docs) for why.
 
 ## Status
 
-Every numbered build stage is done and was tested against real infrastructure at each step — live Neon, live Hedera testnet, the live Blocky402 facilitator, live Sepolia, live Pinata — not mocks. Full history, one entry per session, is in [`CGS-docs/PROGRESS-LOG.md`](https://github.com/cosmic-game-sanctuary/CGS-docs/blob/main/PROGRESS-LOG.md).
+Tested against Arc testnet and, from submission, running on Arc mainnet. Full history, one entry per session, is in [`CGS-docs/PROGRESS-LOG.md`](https://github.com/cosmic-game-sanctuary/CGS-docs/blob/main/PROGRESS-LOG.md).

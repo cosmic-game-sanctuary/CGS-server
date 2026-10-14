@@ -1,5 +1,5 @@
 import { inArray } from "drizzle-orm";
-import { getAddress, type Address } from "viem";
+import { getAddress, type Address, type Hex } from "viem";
 import { db } from "../../db/client.js";
 import { games } from "../../db/schema.js";
 import { explorerAddressUrl, explorerTxUrl, weiToUnits } from "../arc/client.js";
@@ -99,6 +99,28 @@ export class NothingToClaim extends Error {
   }
 }
 
+export class ClaimTooSoon extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ClaimTooSoon";
+  }
+}
+
+/**
+ * The least a claim must be worth before we pay the gas to release it. Gas on
+ * Arc is USDC and a release costs us roughly $0.003, so below this a claim costs
+ * more than it moves. It is also what stops "send a wei to your own vault, then
+ * claim" being a way to spend our gas: that claimable is far below it. A payee
+ * who wants less out can still call `claim()` themselves, and the money keeps
+ * accumulating in the meantime.
+ */
+export const MIN_CLAIM_UNITS = 5_000n; // $0.005
+
+/** One claim per address at a time, and not again within this window. */
+const CLAIM_COOLDOWN_MS = 30_000;
+const lastClaimAt = new Map<string, number>();
+const claiming = new Set<string>();
+
 /**
  * Take a payee's share out of one game's vault, with the platform paying the gas.
  *
@@ -123,8 +145,27 @@ export async function claimFromVault(address: string, gameId: string) {
   const mine = state.payees.find((p) => getAddress(p.address) === me);
   if (!mine) throw new NothingToClaim("You are not a payee on that game.");
   if (mine.claimableWei === 0n) throw new NothingToClaim("You have nothing to claim from that game right now.");
+  if (weiToUnits(mine.claimableWei) < MIN_CLAIM_UNITS) {
+    throw new NothingToClaim(
+      `Your share here is below the minimum we pay the gas to release ($${Number(MIN_CLAIM_UNITS) / 1e6}). ` +
+        `It keeps accumulating, and you can always claim any amount yourself from your own wallet.`,
+    );
+  }
 
-  const { txHash, amountWei } = await claimFor(state.vault, me);
+  const key = me.toLowerCase();
+  const last = lastClaimAt.get(key);
+  if (claiming.has(key) || (last !== undefined && Date.now() - last < CLAIM_COOLDOWN_MS)) {
+    throw new ClaimTooSoon("A claim for your wallet was just made. Wait a few seconds and check your balance.");
+  }
+  claiming.add(key);
+  let txHash: Hex;
+  let amountWei: bigint;
+  try {
+    ({ txHash, amountWei } = await claimFor(state.vault, me));
+    lastClaimAt.set(key, Date.now());
+  } finally {
+    claiming.delete(key);
+  }
   const units = Number(weiToUnits(amountWei));
   logger.info({ gameId, payee: me, units, txHash }, "claimed a payee's share from the vault");
 

@@ -971,6 +971,19 @@ gameRouter.get(
 
     const payment = decodePaymentHeader(header);
 
+    // Trial credit belongs to the account that earned it. It was worked out for
+    // the bearer token's wallet, but the payment is signed by whoever the header
+    // names, and the key goes to that signer. Without this, one person's trial
+    // credit could discount any number of other wallets' purchases while never
+    // being spent, since it is only consumed by the bearer's own purchase row.
+    if (creditUnits > 0 && payment.authorization.from.toLowerCase() !== creditAccountId?.toLowerCase()) {
+      throw new AppError(
+        409,
+        "CREDIT_WALLET_MISMATCH",
+        "Trial credit applies only to the wallet that earned it. Sign this payment with the same wallet you are signed in with.",
+      );
+    }
+
     // An agent pays with its own wallet on behalf of whoever funded it — the
     // GameKey belongs to that person, not to the agent's wallet, which nobody
     // ever logs into. Only honoured when the address that actually signed the

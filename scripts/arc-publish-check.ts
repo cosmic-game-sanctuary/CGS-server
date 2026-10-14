@@ -34,9 +34,11 @@ import {
   publicClient,
   unitsToWei,
   USDC_ADDRESS,
+  vaultFactoryAddress,
   walletClient,
   weiToUnits,
 } from "../src/services/arc/client.js";
+import { vaultFactoryAbi } from "../src/services/arc/abis.js";
 import { gameIdFor, getListing } from "../src/services/arc/registry.js";
 import { getVaultState } from "../src/services/arc/vault.js";
 import { deployVault, existingVault, toBasisPoints } from "../src/services/arc/vaultFactory.js";
@@ -231,8 +233,14 @@ check("and re-listed nothing", retry.listingTxHash === null);
 // ── the split cannot be changed ────────────────────────────────────────────
 console.log("\n== the split cannot be altered by anyone, us included ==");
 const greedy = toBasisPoints([{ wallet: operator().address, pct: 100 }]);
-const hostile = await deployVault(gameId, greedy);
-check("deploying again with a different split returns the original vault", hostile.vault === published.vault);
+// A retry with a different split must not be listed against the vault that
+// exists: the server compares what the vault pays with what this game was given,
+// and refuses rather than listing whatever the factory holds for the id.
+const hostile = await deployVault(gameId, greedy).then(
+  (r) => ({ ok: true as const, vault: r.vault }),
+  (err: unknown) => ({ ok: false as const, error: String(err) }),
+);
+check("a retry with a different split is refused, not listed", !hostile.ok && /does not pay the split/.test(hostile.error), JSON.stringify(hostile));
 const after = await getVaultState(published.vault);
 check(
   "and the original split is untouched",
@@ -242,6 +250,26 @@ check(
   "the operator did not acquire a share",
   !after.payees.some((p) => getAddress(p.address) === getAddress(operator().address) && getAddress(operator().address) !== getAddress(platform)),
 );
+
+// ── nobody else can deploy a vault ─────────────────────────────────────────
+console.log("\n== a stranger cannot pre-deploy a vault for a game that has not published ==");
+{
+  const stranger = privateKeyToAccount(generatePrivateKey());
+  const fresh = gameIdFor(randomUUID());
+  const squat = await client
+    .simulateContract({
+      account: stranger.address,
+      address: vaultFactoryAddress(),
+      abi: vaultFactoryAbi,
+      functionName: "deploy",
+      args: [fresh, [stranger.address], [9500], stranger.address, 500],
+    })
+    .then(
+      () => "accepted",
+      (err: unknown) => String(err),
+    );
+  check("the factory refuses a stranger's deploy", /NotOperator/.test(squat), squat.slice(0, 120));
+}
 
 // ── someone buys it ────────────────────────────────────────────────────────
 console.log("\n== a sale, paid straight into the vault ==");

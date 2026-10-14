@@ -30,7 +30,7 @@ import {
   USDC_ADDRESS,
 } from "../services/wallet/withdraw.js";
 import { personalEarnings } from "../services/earnings/report.js";
-import { claimFromVault, NothingToClaim } from "../services/earnings/claims.js";
+import { claimFromVault, ClaimTooSoon, NothingToClaim } from "../services/earnings/claims.js";
 import { wishlistFor } from "../services/games/wishlist.js";
 import logger from "../utils/logger.utils.js";
 import { fallbackHandle, isReservedHandle, normaliseHandle } from "../lib/handle.js";
@@ -611,6 +611,7 @@ meRouter.post(
       res.json(await claimFromVault(req.auth!.evmAddress, param(req, "gameId")));
     } catch (err) {
       if (err instanceof NothingToClaim) throw new AppError(409, "NOTHING_TO_CLAIM", err.message);
+      if (err instanceof ClaimTooSoon) throw new AppError(429, "CLAIM_TOO_SOON", err.message);
       throw err;
     }
   }),

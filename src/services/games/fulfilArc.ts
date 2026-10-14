@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { getAddress, type Address } from "viem";
 import { db } from "../../db/client.js";
 import { games, gameKeys, sales } from "../../db/schema.js";
@@ -128,7 +128,19 @@ export async function fulfilArcPurchase(input: {
   }
 }
 
+/** Key rows whose mint is running in this process right now. */
+const minting = new Set<string>();
+
 async function mintGameKey(game: Game, owner: Address, keyRowId: string): Promise<void> {
+  minting.add(keyRowId);
+  try {
+    await mintGameKeyOnce(game, owner, keyRowId);
+  } finally {
+    minting.delete(keyRowId);
+  }
+}
+
+async function mintGameKeyOnce(game: Game, owner: Address, keyRowId: string): Promise<void> {
   const gameId = gameIdFor(game.id);
   try {
     // A retry must never issue a second key for the same game. Asked of the
@@ -153,4 +165,50 @@ async function mintGameKey(game: Game, owner: Address, keyRowId: string): Promis
     logger.error({ err, gameId: game.id, owner }, "Arc GameKey mint failed");
     await db.update(gameKeys).set({ mintStatus: "failed" }).where(eq(gameKeys.id, keyRowId));
   }
+}
+
+/**
+ * Re-run mints that never finished. A mint runs off the critical path, so a
+ * restart mid-mint or an operator that briefly had no gas leaves a row `pending`
+ * or `failed` while the buyer has paid and can play, but holds no key on chain.
+ * `mintGameKey` asks the chain whether the key already exists before it mints,
+ * so running it again can never issue a second one.
+ *
+ * A row is only retried once it has been seen stuck on two passes in a row, so a
+ * mint that is merely in flight, or whose row was written a moment ago, is never
+ * raced. Rows are retried one at a time because they share the operator's nonce,
+ * and a few times per process so a mint that can never succeed does not burn gas
+ * forever.
+ */
+const MAX_MINT_RETRIES = 5;
+const seenStuck = new Set<string>();
+const mintRetries = new Map<string, number>();
+let retryingMints = false;
+
+export async function retryStuckMints(): Promise<number> {
+  if (retryingMints) return 0;
+  retryingMints = true;
+  let retried = 0;
+  try {
+    const rows = await db.select().from(gameKeys).where(inArray(gameKeys.mintStatus, ["pending", "failed"])).limit(25);
+    const stuckNow = new Set(rows.map((r) => r.id));
+    for (const row of rows) {
+      if (minting.has(row.id) || !seenStuck.has(row.id)) continue;
+      const tries = mintRetries.get(row.id) ?? 0;
+      if (tries >= MAX_MINT_RETRIES) continue;
+      const game = await db.query.games.findFirst({ where: eq(games.id, row.gameId) });
+      if (!game) continue;
+      mintRetries.set(row.id, tries + 1);
+      logger.info({ keyRowId: row.id, gameId: row.gameId, attempt: tries + 1 }, "retrying a GameKey mint that never finished");
+      await mintGameKey(game, getAddress(row.ownerAccountId), row.id);
+      retried += 1;
+    }
+    seenStuck.clear();
+    for (const id of stuckNow) seenStuck.add(id);
+  } catch (err) {
+    logger.error({ err }, "retrying stuck GameKey mints failed");
+  } finally {
+    retryingMints = false;
+  }
+  return retried;
 }

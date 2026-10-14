@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { createPublicKey } from "node:crypto";
+import { privateKeyToAccount } from "viem/accounts";
 import { z } from "zod";
 
 const evmAddress = z.string().regex(/^0x[a-fA-F0-9]{40}$/, "must be a real 0x address");
@@ -302,6 +303,40 @@ const envSchema = z.object({
   .refine((e) => !(e.DEV_FAUCET === "on" && e.NODE_ENV === "production"), {
     message: "DEV_FAUCET cannot be 'on' when NODE_ENV is 'production'",
     path: ["DEV_FAUCET"],
+  })
+  // Mainnet bakes things in permanently: a vault's platform address and every
+  // deployed contract address cannot be corrected afterwards. So the values that
+  // would otherwise fall back to a default (the platform payout defaults to the
+  // hot operator key) or fail on the first purchase (a missing Circle key) are
+  // boot failures here rather than surprises later.
+  .superRefine((e, ctx) => {
+    if (e.ARC_NETWORK !== "mainnet") return;
+    const need = (key: keyof typeof e, ok: boolean, message: string) => {
+      if (!ok) ctx.addIssue({ code: z.ZodIssueCode.custom, path: [key], message });
+    };
+    need("ARC_RPC_URL", !!e.ARC_RPC_URL, "required on mainnet: there is no built-in public RPC for it");
+    need("ARC_OPERATOR_KEY", !!e.ARC_OPERATOR_KEY, "required on mainnet");
+    need("ARC_GAME_REGISTRY", !!e.ARC_GAME_REGISTRY, "required on mainnet");
+    need("ARC_GAME_KEY", !!e.ARC_GAME_KEY, "required on mainnet");
+    need("ARC_VAULT_FACTORY", !!e.ARC_VAULT_FACTORY, "required on mainnet");
+    need(
+      "ARC_PLATFORM_PAYOUT",
+      !!e.ARC_PLATFORM_PAYOUT,
+      "required on mainnet: unset, the platform's cut would be baked into every vault as the hot operator address",
+    );
+    need(
+      "CIRCLE_API_KEY",
+      !!e.CIRCLE_API_KEY?.startsWith("LIVE_API_KEY:"),
+      "required on mainnet and must be a LIVE_API_KEY (a TEST key is for testnet only)",
+    );
+    if (e.ARC_OPERATOR_KEY && e.ARC_PLATFORM_PAYOUT) {
+      const operatorAddress = privateKeyToAccount(e.ARC_OPERATOR_KEY as `0x${string}`).address;
+      need(
+        "ARC_PLATFORM_PAYOUT",
+        operatorAddress.toLowerCase() !== e.ARC_PLATFORM_PAYOUT.toLowerCase(),
+        "must differ from the operator's own address on mainnet",
+      );
+    }
   });
 
 const parsed = envSchema.safeParse(process.env);
