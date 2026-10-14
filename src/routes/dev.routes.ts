@@ -22,8 +22,8 @@ import { getUsdcUnits } from "../services/arc/reads.js";
 import { toDisplayAmount } from "../lib/display.js";
 import logger from "../utils/logger.utils.js";
 
-// Development only. Mounted by index.ts solely when DEV_FAUCET=on, and the env
-// schema refuses to let that be `on` in production.
+// Mounted by index.ts when DEV_FAUCET=on (local development, refused in
+// production) or TESTNET_FAUCET=on (a capped public faucet, refused on mainnet).
 //
 // Why it still has to exist: Circle's faucet hands out testnet USDC to an
 // address you control, not to an arbitrary test buyer's, and the browser cannot
@@ -35,6 +35,12 @@ import logger from "../utils/logger.utils.js";
 // from the moment it exists, and the USDC it receives is also what pays for its
 // own transactions. One transfer, and the wallet is ready to buy something.
 const devRouter = Router({ caseSensitive: true, strict: true });
+
+const PUBLIC_COOLDOWN_MS = 15_000;
+// Never lets the public faucet take the operator below what it needs to pay
+// gas for publishing, minting and claiming.
+const PUBLIC_OPERATOR_RESERVE_UNITS = 5_000_000n;
+const lastClaim = new Map<string, number>();
 
 const faucetSchema = z.object({
   /** Top up the caller's own wallet, or an agent's. */
@@ -60,7 +66,34 @@ devRouter.post(
       recipient = agent.agentEvmAddress as Address;
     }
 
-    const units = BigInt(Math.round((amount ?? env.DEV_FAUCET_AMOUNT) * 1_000_000));
+    let units = BigInt(Math.round((amount ?? env.DEV_FAUCET_AMOUNT) * 1_000_000));
+
+    // The public testnet faucet (TESTNET_FAUCET) is reachable by anyone who can
+    // sign in, so it is limited in ways the local dev faucet is not: it only
+    // tops a wallet up *to* a ceiling and never adds beyond it, it keeps a
+    // reserve in the operator for gas, and one person cannot hammer it.
+    if (env.DEV_FAUCET !== "on") {
+      const last = lastClaim.get(req.auth!.id) ?? 0;
+      if (Date.now() - last < PUBLIC_COOLDOWN_MS) {
+        throw new AppError(429, "FAUCET_COOLDOWN", "Give it a few seconds before asking again.");
+      }
+      const cap = BigInt(Math.round(env.TESTNET_FAUCET_CAP * 1_000_000));
+      const held = await getUsdcUnits(recipient);
+      const room = cap - held;
+      if (room <= 0n) {
+        throw new AppError(
+          409,
+          "FAUCET_FULL",
+          `That wallet already holds ${toDisplayAmount(Number(held), USDC_ADDRESS)}. The test faucet tops wallets up to ${toDisplayAmount(Number(cap), USDC_ADDRESS)}.`,
+        );
+      }
+      units = amount === undefined || units > room ? room : units;
+      const operatorHolds = await getUsdcUnits(operator().address);
+      if (operatorHolds < units + PUBLIC_OPERATOR_RESERVE_UNITS) {
+        throw new AppError(409, "FAUCET_EMPTY", "The test faucet is empty right now. Circle's faucet at faucet.circle.com works too.");
+      }
+      lastClaim.set(req.auth!.id, Date.now());
+    }
 
     // Checked before anything moves, so an empty operator says so in units
     // rather than failing mid-transfer.

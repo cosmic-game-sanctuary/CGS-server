@@ -15,7 +15,7 @@ import { AppError } from "../../../lib/errors.js";
 import { env } from "../../../config/env.js";
 import { arcChain, confirm, feeOverrides, operator, publicClient, USDC_ADDRESS, walletClient, withGasHeadroom } from "../client.js";
 import type { Authorization } from "./authorization.js";
-import { payToFor, resourceInfoFor, type DecodedPayment } from "./gate.js";
+import { operatorAddress, resourceInfoFor, type DecodedPayment } from "./gate.js";
 import type { ResourceInfo } from "./requirements.js";
 
 /**
@@ -133,14 +133,34 @@ type Game = { id: string; vaultAddress: string | null; title: string };
 
 export type GatewayGateTerms = { requirements: GatewayPaymentRequirements; resource: ResourceInfo; payTo: Address };
 
-/** The Gateway-shaped equivalent of gate.ts#termsFor, for the trial-chunk routes only. */
+/**
+ * The Gateway-shaped equivalent of gate.ts#termsFor, for the trial-chunk routes only.
+ *
+ * **`payTo` is the operator, not the game's vault, and that is deliberate.**
+ * Gateway pays a seller by crediting a balance *inside Gateway*, and only that
+ * address's own key can withdraw it. A `SplitVault` has no key, so chunks paid
+ * to a vault credited a balance nobody could ever spend: measured on testnet,
+ * 3.01 USDC of completed trial transfers with the vault's balance at 0 and the
+ * same 3.01 sitting in Gateway under the vault's address. The operator can sign
+ * a withdrawal, so chunks land here and `trialRelay.ts` forwards each game's
+ * completed chunks into its vault. Purchases are unaffected and still pay the
+ * vault directly through the regular facilitator.
+ */
 export async function gatewayTermsFor(req: Request, game: Game, owedUnits: number, description: string): Promise<GatewayGateTerms> {
-  const payTo = payToFor(game);
+  const payTo = operatorAddress();
   return {
     requirements: await gatewayRequirements(payTo, BigInt(owedUnits)),
     resource: resourceInfoFor(req, description),
     payTo,
   };
+}
+
+/** Circle's record of one Gateway transfer: where it is going and whether the batch has landed. */
+export async function gatewayTransfer(id: string): Promise<{ status: string; toAddress: string } | null> {
+  const res = await fetch(`${GATEWAY_URL}/v1/x402/transfers/${encodeURIComponent(id)}`, { signal: AbortSignal.timeout(10_000) });
+  if (!res.ok) return null;
+  const j = (await res.json()) as { status?: string; toAddress?: string };
+  return j.status && j.toAddress ? { status: j.status, toAddress: j.toAddress } : null;
 }
 
 export const gatewayChallengeBody = (terms: GatewayGateTerms) => ({

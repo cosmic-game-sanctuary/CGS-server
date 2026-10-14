@@ -23,6 +23,7 @@ import reportRouter from "./routes/report.routes.js";
 import meRouter from "./routes/me.routes.js";
 import devRouter from "./routes/dev.routes.js";
 import { startAgentListener, runAgentSweep } from "./agent/watcher.js";
+import { relayTrialRevenue } from "./services/arc/x402/trialRelay.js";
 import { runPromotionTick } from "./services/games/promotions.js";
 import logger from "./utils/logger.utils.js";
 
@@ -103,9 +104,13 @@ app.use("/api/users", userRouter);
 
 // Not mounted at all unless asked for, so in any other configuration the path
 // 404s like anything else that doesn't exist. See routes/dev.routes.ts.
-if (env.DEV_FAUCET === "on") {
+if (env.DEV_FAUCET === "on" || env.TESTNET_FAUCET === "on") {
   app.use("/api/dev", devRouter);
-  logger.warn("DEV_FAUCET is on — /api/dev/faucet will move funds out of the operator account");
+  logger.warn(
+    env.DEV_FAUCET === "on"
+      ? "DEV_FAUCET is on — /api/dev/faucet will move funds out of the operator account"
+      : `TESTNET_FAUCET is on — /api/dev/faucet tops wallets up to ${env.TESTNET_FAUCET_CAP} USDC from the operator`,
+  );
 }
 
 // Sales start and end on their own. Both halves claim their rows with a
@@ -203,6 +208,18 @@ const server = app.listen(env.PORT, () => {
         sweeping = false;
       });
   }, env.AGENT_SWEEP_INTERVAL_MS);
+
+  // Forwarding trial revenue into the games' vaults. Trial chunks are paid to
+  // the operator because Gateway credits a balance only a key can withdraw (see
+  // services/arc/x402/trialRelay.ts), so without this loop a developer's trial
+  // earnings would sit in Gateway forever. Every pass is a cheap read when
+  // nothing is waiting; `relayTrialRevenue` never throws and skips itself if
+  // the previous pass is still running. Circle's batches land in minutes, so a
+  // pass every two minutes keeps the delay a developer sees short without
+  // hammering Circle's status endpoint.
+  setInterval(() => {
+    void relayTrialRevenue();
+  }, 2 * 60_000);
 
   // Keepalive, and why a *server-side* one is the right shape here.
   //

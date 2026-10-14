@@ -255,6 +255,7 @@ export async function evaluateAgent(agent: Agent): Promise<void> {
  * decide.ts#roundIsDue.
  */
 async function runRound(agent: Agent): Promise<void> {
+  failedBuys.delete(agent.id); // only failures from *this* round may set a retry alarm
   // Both halves. `pending` is never bought from — it is what tells the agent
   // that its money is spoken for, which is the difference between an
   // allocation and a reflex. See decide.ts#needsJudgement.
@@ -342,7 +343,8 @@ async function runRound(agent: Agent): Promise<void> {
 
   // What it bought is off the list; what is left may still have a wire ahead
   // of it, and something has to be holding that alarm clock.
-  await scheduleNextRound(agent, eligible.filter((w) => !bought.has(w.gameId)));
+  const remaining = eligible.filter((w) => !bought.has(w.gameId));
+  await scheduleNextRound(agent, remaining, retryAlarmFor(agent.id, remaining, takeFailedBuys(agent.id)));
 }
 
 /**
@@ -358,8 +360,9 @@ async function runRound(agent: Agent): Promise<void> {
  * Left untouched when nothing about it changed, so the countdown on screen does
  * not restart every time an unrelated price moves.
  */
-async function scheduleNextRound(agent: Agent, remaining: EligibleWant[]): Promise<void> {
-  const next = nextWire(remaining);
+async function scheduleNextRound(agent: Agent, remaining: EligibleWant[], retryAt: Date | null = null): Promise<void> {
+  const wire = nextWire(remaining);
+  const next = retryAt && (!wire || retryAt.getTime() < wire.getTime()) ? retryAt : wire;
   const live = await db.query.agentDecisions.findFirst({
     where: and(
       eq(agentDecisions.agentId, agent.id),
@@ -455,6 +458,7 @@ async function actOnVerdict(
   verdict: Verdict,
 ): Promise<Set<string>> {
   const consideredIds = eligible.map((w) => w.gameId);
+  const declined = withImplicitDeclines(eligible, verdict);
   // The model call this round cost at most one charge — attributed to
   // whichever row is written first, never repeated across several rows from
   // the same round. `null` throughout means no model was called at all.
@@ -490,7 +494,7 @@ async function actOnVerdict(
       await notifyAsked(agent, row!, verdict.buyNow, decideBy);
       // Declines are a separate decision from the same round — they proceed
       // regardless of whether buyNow got escalated to a question.
-      await recordDeclines(agent, consideredIds, verdict.decline, verdict.reasoning, takeCharge);
+      await recordDeclines(agent, consideredIds, declined, verdict.reasoning, takeCharge);
       return new Set();
     }
     // "If it doesn't fit, don't ask — decide." Falls through to buy now. At a
@@ -504,8 +508,28 @@ async function actOnVerdict(
     verdict.buyNow.length > 0
       ? await executeBuys(agent, buyerAddress, consideredIds, verdict.buyNow, verdict.reasoning, takeCharge())
       : new Set<string>();
-  await recordDeclines(agent, consideredIds, verdict.decline, verdict.reasoning, takeCharge);
+  await recordDeclines(agent, consideredIds, declined, verdict.reasoning, takeCharge);
   return bought;
+}
+
+/**
+ * What the model passed on, including what it did not say.
+ *
+ * A game at its wire that was neither bought nor named as declined has been
+ * passed on all the same: its sale price will not be offered again, and the
+ * model's `hold` no longer exists to mean anything else. Without this, a model
+ * that bought one of two contested games and simply omitted the other left no
+ * record of the loser at all, so the buyer saw a purchase and no explanation
+ * for the game they also wanted. Seen on a real run where the same scenario had
+ * passed hours earlier because the model happened to list it.
+ *
+ * Games not yet at their wire are left alone: those are deferred, not declined.
+ * A game the agent decided to buy and failed to is in `buyNow`, so it is not
+ * here either; it is retried instead.
+ */
+function withImplicitDeclines(eligible: EligibleWant[], verdict: Verdict): EligibleWant[] {
+  const named = new Set([...verdict.buyNow, ...verdict.decline].map((w) => w.gameId));
+  return [...verdict.decline, ...atWire(eligible).filter((w) => !named.has(w.gameId))];
 }
 
 async function recordDeclines(
@@ -559,6 +583,54 @@ async function notifyAsked(
 }
 
 /**
+ * Purchases an agent decided on and could not complete this round, so that
+ * `runRound` can set a short retry alarm instead of going silent. A failed
+ * purchase wrote no decision row and, once its wire had passed, no schedule
+ * either: nothing would ever look at that game again before its sale ended.
+ *
+ * In memory on purpose. It only has to survive from the failure to the end of
+ * the same round, and the attempt counter is a ceiling on repeated retries
+ * (each contested retry can pay for a model call), not a record: losing it in
+ * a restart costs at most three more tries.
+ */
+const failedBuys = new Map<string, Set<string>>();
+const retryAttempts = new Map<string, number>();
+const RETRY_DELAY_MS = 20_000;
+const MAX_RETRIES = 3;
+
+function noteFailedBuy(agentId: string, gameId: string): void {
+  const set = failedBuys.get(agentId) ?? new Set<string>();
+  set.add(gameId);
+  failedBuys.set(agentId, set);
+}
+
+function takeFailedBuys(agentId: string): string[] {
+  const set = failedBuys.get(agentId);
+  failedBuys.delete(agentId);
+  return set ? [...set] : [];
+}
+
+/** When to look again at purchases that failed, or null if none should be retried. */
+function retryAlarmFor(agentId: string, remaining: EligibleWant[], failedIds: string[]): Date | null {
+  const retryAt = new Date(Date.now() + RETRY_DELAY_MS);
+  const retryable = failedIds.filter((id) => {
+    const want = remaining.find((w) => w.gameId === id);
+    if (!want) return false;
+    // No point retrying into a sale that will have ended by then.
+    if (want.promotionEndsAt && want.promotionEndsAt.getTime() <= retryAt.getTime()) return false;
+    const key = `${agentId}:${id}`;
+    const attempts = retryAttempts.get(key) ?? 0;
+    if (attempts >= MAX_RETRIES) {
+      logger.error({ agentId, gameId: id, attempts }, "giving up on a purchase after repeated failures");
+      return false;
+    }
+    retryAttempts.set(key, attempts + 1);
+    return true;
+  });
+  return retryable.length > 0 ? retryAt : null;
+}
+
+/**
  * Executes a set of buys and — only if at least one actually settled — writes
  * the audit row and notifies once for the whole round, never once per game
  * (an agent clearing six wants at once is one email, not six).
@@ -585,39 +657,49 @@ async function executeBuys(
   // was. It is read from the agent's ERC-8004 token on Arc, the same chain the
   // money moves on, so there is no longer a second chain whose outage could
   // interfere with a purchase the buyer already authorised.
-  const ceiling = await ceilingFromChain(agent);
+  let ceiling = await ceilingFromChain(agent);
 
   const bought: EligibleWant[] = [];
   for (const want of buyNow) {
     if (ceiling !== null && want.currentPriceUnits > ceiling) {
       // **A published ceiling can be stale, and a stale low one is the
       // dangerous direction** — it silently refuses purchases the buyer did
-      // authorise. Seen for real twice: an agent registered in the instant
-      // before its first want existed published a zero, and an agent whose
-      // buyer raised a maximum kept the old number on chain because the write
-      // that republishes it is fire-and-forget.
+      // authorise. Seen for real: an agent whose buyer raised a maximum kept
+      // the old number on chain, and on Render (13 Oct) an agent held 9 USDC
+      // against two live sales and bought neither.
       //
       // So before refusing, check whether our own rule would have allowed it.
-      // If it would, the published number is behind rather than binding:
-      // republish and let the next round act on the fresh one. This cannot be
-      // used to lift a real cap, because the republished value is recomputed
-      // from the buyer's own wants — if they really did set a low maximum, the
-      // same number goes back on chain and the refusal stands.
+      // If it would, the published number is behind rather than binding. This
+      // cannot be used to lift a real cap: the republished value is recomputed
+      // from the buyer's own wants, so a genuinely low maximum goes back on
+      // chain unchanged and the refusal below stands.
       const allowedLocally = await ceilingUnitsFor(agent);
       if (allowedLocally >= want.currentPriceUnits) {
+        // **Wait for the write and buy now.** This used to fire the republish
+        // and `continue`, "deciding next round" — but a round only ever
+        // follows a price event or a scheduled wire, and a wire already passed
+        // is never scheduled again. With nothing else bought, the round also
+        // wrote no row, so the agent went quietly idle until the sale ended.
         logger.warn(
           { agentId: agent.id, gameId: want.gameId, publishedUnits: ceiling, allowedUnits: allowedLocally },
-          "the published ceiling is behind the buyer's own wants — republishing, and deciding next round",
+          "the published ceiling is behind the buyer's own wants — republishing and buying in this round",
         );
-        void publishAgentMandate(agent);
+        const published = await publishAgentMandate(agent);
+        if (!published) {
+          logger.error({ agentId: agent.id, gameId: want.gameId }, "could not republish the ceiling; not buying above the stale one");
+          noteFailedBuy(agent.id, want.gameId);
+          continue;
+        }
+        // The value just written, not a read-back: independent RPC providers
+        // need not agree on the newest block straight after a write.
+        ceiling = allowedLocally;
+      } else {
+        logger.warn(
+          { agentId: agent.id, gameId: want.gameId, priceUnits: want.currentPriceUnits, ceilingUnits: ceiling },
+          "refusing a purchase above the ceiling published on this agent's ERC-8004 token",
+        );
         continue;
       }
-
-      logger.warn(
-        { agentId: agent.id, gameId: want.gameId, priceUnits: want.currentPriceUnits, ceilingUnits: ceiling },
-        "refusing a purchase above the ceiling published on this agent's ERC-8004 token",
-      );
-      continue;
     }
     try {
       // The ceiling is handed down as well as checked above, so the agent
@@ -629,6 +711,7 @@ async function executeBuys(
       // One failed purchase does not stop the others — each was planned
       // against a balance that did not move, so they are still real.
       logger.error({ err, agentId: agent.id, gameId: want.gameId }, "agent purchase failed");
+      noteFailedBuy(agent.id, want.gameId);
     }
   }
   if (bought.length === 0) return new Set();

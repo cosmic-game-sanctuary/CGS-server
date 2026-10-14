@@ -53,50 +53,63 @@ export async function ceilingUnitsFor(agent: Agent): Promise<number> {
 }
 
 /**
- * One publish at a time per agent.
+ * One publish at a time per agent, and none lost.
  *
  * Several chain writes from one key each time, so two overlapping runs would
- * race for the same nonce and one would be thrown away. Callers fire this and
- * forget, and a buyer adjusting two wants in quick succession is completely
- * ordinary, so the overlap is expected rather than exotic. The later call is
- * dropped rather than queued: it is about to be made redundant by a newer one
- * anyway, and `ceilingUnitsFor` always reads current state when it does run.
+ * race for the same nonce. This used to drop the later call, on the theory that
+ * `ceilingUnitsFor` always reads current state when a run does start. But the
+ * dropped call is the one that carried the newer state: save two wants a moment
+ * apart (the ordinary case) and the first run had already read the ceiling, the
+ * second was thrown away, and the chain kept the first want's number while the
+ * buyer's wants said something higher. The agent then refused to buy the second
+ * game against its own stale ceiling.
+ *
+ * So a call that arrives while one is running marks it dirty and waits for it,
+ * and the running publish goes round once more, reading the state as it is then.
  */
-const publishing = new Set<string>();
+const publishing = new Map<string, Promise<boolean>>();
+const dirty = new Set<string>();
 
 /**
- * Write the mandate to chain. Fire-and-forget: **never throws, never blocks a
- * request.**
+ * Write the mandate to chain. **Never throws, never blocks a request unless the
+ * caller awaits it.** Resolves true once the enforced ceiling is on chain
+ * (or the agent has no token yet and so nothing to write), false if the write
+ * failed and the on-chain number is therefore stale.
  *
- * Several chain writes take real time, which has no business inside an HTTP
- * handler, and a chain hiccup must never be the reason a buyer cannot change
- * their own wishlist. A failure here leaves the previous value in place —
- * stale, and logged as such, rather than wrong in a direction that lets the
- * agent spend more.
+ * A failure leaves the previous value in place, logged as stale, rather than
+ * wrong in a direction that lets the agent spend more.
  */
-export async function publishAgentMandate(agent: Agent): Promise<void> {
-  // Deliberately *not* gated on having an ENS name any more. It used to return
-  // here, which was right when the mandate lived entirely on ENS and is wrong
-  // now: the enforced ceiling is on the agent's ERC-8004 token, and an agent
-  // that never asked for a name still needs one published.
-  if (publishing.has(agent.id)) {
-    logger.info({ agentId: agent.id }, "mandate publish already running, skipping the duplicate");
-    return;
+export function publishAgentMandate(agent: Agent): Promise<boolean> {
+  const running = publishing.get(agent.id);
+  if (running) {
+    dirty.add(agent.id);
+    return running;
   }
+  const run = (async () => {
+    let ok = true;
+    do {
+      dirty.delete(agent.id);
+      ok = await publishOnce(agent);
+    } while (dirty.has(agent.id));
+    return ok;
+  })().finally(() => publishing.delete(agent.id));
+  publishing.set(agent.id, run);
+  return run;
+}
 
-  publishing.add(agent.id);
+async function publishOnce(agent: Agent): Promise<boolean> {
+  // Deliberately *not* gated on having an ENS name. The enforced ceiling is on
+  // the agent's ERC-8004 token, and an agent that never asked for a name still
+  // needs one published.
   try {
     const ceiling = await ceilingUnitsFor(agent);
 
     // **The enforced number goes on chain first, and on its own.** It is what
     // `ceilingFromChain` reads before every purchase, so it must not be held
-    // up by — or fail alongside — four Sepolia writes that only affect how the
-    // agent is displayed. Integer units, not display dollars: this is read by
-    // code, and the float round-trip through "0.5" was a needless place to
-    // lose a unit.
+    // up by, or fail alongside, Sepolia writes that only affect how the agent
+    // is displayed. Integer units, not display dollars: this is read by code.
     if (agent.erc8004AgentId) {
-      // A 32-byte big-endian word, the natural encoding for a uint — see the
-      // note on the metadata keys in identity.ts.
+      // A 32-byte big-endian word, the natural encoding for a uint.
       const txHash = await writeMetadata(
         agent,
         BigInt(agent.erc8004AgentId),
@@ -109,10 +122,10 @@ export async function publishAgentMandate(agent: Agent): Promise<void> {
       );
     }
 
-    // The name, which is presentation. Deliberately after the ceiling and in
-    // its own try: an agent with no ENS name is completely normal, and a
-    // Sepolia hiccup must never be why a mandate did not reach Arc.
-    if (!agent.ensLabel) return;
+    // The name, which is presentation. After the ceiling and in its own try: an
+    // agent with no ENS name is normal, and a Sepolia hiccup must never be why a
+    // mandate did not reach Arc.
+    if (!agent.ensLabel) return true;
     try {
       const resolver = env.ENS_RESOLVER as `0x${string}`;
       const label = agent.ensLabel;
@@ -124,10 +137,10 @@ export async function publishAgentMandate(agent: Agent): Promise<void> {
     } catch (err) {
       logger.error({ err, agentId: agent.id }, "publishing the agent's ENS records failed — the name is stale, the ceiling is not");
     }
+    return true;
   } catch (err) {
     logger.error({ err, agentId: agent.id }, "publishing the agent mandate failed — the on-chain ceiling is now stale");
-  } finally {
-    publishing.delete(agent.id);
+    return false;
   }
 }
 

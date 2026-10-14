@@ -250,6 +250,14 @@ const envSchema = z.object({
   // refill it — a generous default drains the treasury in four clicks. Games
   // cost a few dollars, so this covers a purchase either way.
   DEV_FAUCET_AMOUNT: z.coerce.number().positive().default(5),
+  // A *public* testnet faucet, so anyone who opens a deployed testnet site can
+  // try it without finding Circle's faucet first. Unlike DEV_FAUCET it is allowed
+  // in production, and is safe there because it only ever tops a wallet up to
+  // TESTNET_FAUCET_CAP (never adds to it), keeps an operator reserve, and is
+  // refused at boot on mainnet, where the operator's USDC is real money.
+  TESTNET_FAUCET: z.enum(["on", "off"]).default("off"),
+  // Whole USDC. A wallet at or above this gets nothing.
+  TESTNET_FAUCET_CAP: z.coerce.number().positive().default(10),
   DEV_FAUCET_HBAR: z.coerce.number().positive().default(2),
 
   // ENSv2 beta, Sepolia-only. Every address here was checked against a
@@ -287,6 +295,10 @@ const envSchema = z.object({
   // a valid login has no business existing in production. Making it a boot
   // failure rather than a runtime check means it cannot be turned on by
   // accident and noticed later.
+  .refine((e) => !(e.TESTNET_FAUCET === "on" && e.ARC_NETWORK === "mainnet"), {
+    message: "TESTNET_FAUCET cannot be 'on' when ARC_NETWORK is 'mainnet'",
+    path: ["TESTNET_FAUCET"],
+  })
   .refine((e) => !(e.DEV_FAUCET === "on" && e.NODE_ENV === "production"), {
     message: "DEV_FAUCET cannot be 'on' when NODE_ENV is 'production'",
     path: ["DEV_FAUCET"],

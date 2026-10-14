@@ -66,7 +66,7 @@ export type GameEarnings = {
   sales: number;
   gross: ReturnType<typeof money>;
   /** Present only on the personal report: this person's cut of that gross. */
-  yours?: { pct: number; role: string; earned: ReturnType<typeof money> };
+  yours?: { pct: number; role: string; earned: ReturnType<typeof money>; pending?: ReturnType<typeof money> };
   plays: number;
   likes: number;
   reviews: number;
@@ -115,9 +115,12 @@ export async function personalEarnings(userId: string, evmAddress?: string) {
   const salesByGame = groupBy(saleRows, (s) => s.gameId);
 
   let earnedUnits = 0;
+  let pendingUnits = 0;
   let grossUnits = 0;
   let saleCount = 0;
   const asset = env.X402_ASSET;
+  const pendingByGame = new Map<string, number>();
+  const pendingPricesByGame = new Map<string, number[]>();
 
   const perGame: GameEarnings[] = gameRows.map((game) => {
     const mySplit = all.find((s) => s.gameId === game.id)!;
@@ -125,15 +128,22 @@ export async function personalEarnings(userId: string, evmAddress?: string) {
     const gameSales = salesByGame.get(game.id) ?? [];
 
     const gross = gameSales.reduce((sum, s) => sum + s.priceUnits, 0);
-    const yours = gameSales.reduce(
-      (sum, s) => sum + shareOfSale(s.priceUnits, gameSplits, mySplit.id),
-      0,
-    );
+    // A sale whose money never arrived (`failed`) was not earned, so it is left
+    // out. A `pending` one is earned and on its way: a trial chunk Circle has
+    // credited that has not been forwarded to the vault yet.
+    const counted = gameSales.filter((s) => s.splitStatus !== "failed");
+    const yours = counted.reduce((sum, s) => sum + shareOfSale(s.priceUnits, gameSplits, mySplit.id), 0);
+    const pending = counted
+      .filter((s) => s.splitStatus === "pending")
+      .reduce((sum, s) => sum + shareOfSale(s.priceUnits, gameSplits, mySplit.id), 0);
+    pendingUnits += pending;
 
     earnedUnits += yours;
     grossUnits += gross;
     saleCount += gameSales.length;
 
+    pendingByGame.set(game.id, pending);
+    pendingPricesByGame.set(game.id, counted.filter((s) => s.splitStatus === "pending").map((s) => s.priceUnits));
     const st = stats.get(game.id);
     return {
       gameId: game.id,
@@ -144,7 +154,7 @@ export async function personalEarnings(userId: string, evmAddress?: string) {
       studio: { id: game.studio.id, name: game.studio.name, slug: game.studio.slug },
       sales: gameSales.length,
       gross: money(gross, game.priceAsset),
-      yours: { pct: mySplit.pct, role: mySplit.role, earned: money(yours, game.priceAsset) },
+      yours: { pct: mySplit.pct, role: mySplit.role, earned: money(yours, game.priceAsset), pending: money(pending, game.priceAsset) },
       ...(st ?? { plays: 0, likes: 0, reviews: 0, rating: 0 }),
     };
   });
@@ -157,8 +167,31 @@ export async function personalEarnings(userId: string, evmAddress?: string) {
   const claimByGame = new Map(claims.map((c) => [c.gameId, c]));
   for (const game of perGame) {
     const claim = claimByGame.get(game.gameId);
-    if (claim && game.yours) game.yours.earned = claim.earned;
+    // The vault's own number is what has arrived; trial money still on its way
+    // is earned too and is added, so a developer is not shown 0 for money they
+    // have made. Once it is forwarded it moves from `pending` into the vault's
+    // figure, so nothing is counted twice.
+    if (claim && game.yours) {
+      // **Pending is worked out the way the vault will divide it.** The splits
+      // rows add up to 100 between the people, but the vault also takes the
+      // platform's cut, so this person's share of a sale is `claim.bps` of the
+      // whole, not their percentage of it. Using the percentage overstated what
+      // was on its way by the platform's 5%, and it only showed once the money
+      // landed and the vault paid less than the page had promised.
+      const exact = (pendingPricesByGame.get(game.gameId) ?? []).reduce(
+        (sum, price) => sum + Math.floor((price * claim.bps) / 10_000),
+        0,
+      );
+      pendingUnits += exact - (pendingByGame.get(game.gameId) ?? 0);
+      pendingByGame.set(game.gameId, exact);
+      game.yours.pending = money(exact, asset);
+      game.yours.earned = money(claim.earned.units + exact, asset);
+    }
   }
+  // The headline total is the sum of the rows beneath it, so the two can never
+  // disagree. It used to come from our own sales rows while each row came from
+  // the vault, which differ by the platform's cut.
+  earnedUnits = perGame.reduce((sum, g) => sum + (g.yours?.earned.units ?? 0), 0);
 
   return {
     totals: {
@@ -170,6 +203,7 @@ export async function personalEarnings(userId: string, evmAddress?: string) {
       // taken out. There is no "held" or "failed" any more: money never passes
       // through us, so there is no state where we owe someone a transfer we
       // could not make.
+      pending: money(pendingUnits, asset),
       claimable: money(claims.reduce((sum, c) => sum + c.claimable.units, 0), asset),
       claimed: money(claims.reduce((sum, c) => sum + c.claimed.units, 0), asset),
       asset,
@@ -294,7 +328,7 @@ function emptyTotals() {
   const asset = env.X402_ASSET;
   return {
     earned: money(0, asset), gross: money(0, asset), sales: 0, games: 0,
-    claimable: money(0, asset), claimed: money(0, asset), asset,
+    claimable: money(0, asset), claimed: money(0, asset), pending: money(0, asset), asset,
   };
 }
 
