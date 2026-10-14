@@ -1,7 +1,7 @@
 import { keccak256, toBytes, type Address, type Hex } from "viem";
 import { env } from "../../../config/env.js";
-import { arcChain, operator } from "../client.js";
-import type { Authorization } from "./authorization.js";
+import { arcChain, confirm, feeOverrides, operator, publicClient, USDC_ADDRESS, walletClient, withGasHeadroom } from "../client.js";
+import { isAuthorizationUsed, type Authorization } from "./authorization.js";
 import type { PaymentRequirements, ResourceInfo } from "./requirements.js";
 import logger from "../../../utils/logger.utils.js";
 
@@ -194,6 +194,16 @@ export async function settlePayment(input: SettleInput): Promise<SettlementOutco
   // A rejected request (4xx/5xx) carries no settlement outcome at all.
   if (!res.ok) {
     const reason = parsed.errors?.[0]?.reason ?? `http_${res.status}`;
+    // Circle declining *us* (401/403: a key the Facilitator Service has not
+    // enabled, or an exhausted keyless allowance) says nothing about the
+    // buyer's payment, which is a valid signed authorization. Submitting it
+    // ourselves settles the same transfer, buyer to vault, with us paying the
+    // gas Circle would have. Seen on mainnet, 2026-10-15: a live key that
+    // authenticates but is `403 forbidden` on /settle.
+    if (res.status === 401 || res.status === 403) {
+      logger.warn({ status: res.status, reason, paymentId: input.paymentId }, "Circle's facilitator refused our credentials; settling the authorization directly");
+      return settleDirect(input);
+    }
     logger.error({ status: res.status, reason, paymentId: input.paymentId }, "Circle facilitator rejected the settle request");
     return { status: "failed", reason, message: circleMessage(res.status, reason, parsed.message) };
   }
@@ -218,6 +228,63 @@ export async function settlePayment(input: SettleInput): Promise<SettlementOutco
     message: reasonMessage(parsed.errorReason),
     paymentId: ext?.paymentId,
   };
+}
+
+const transferWithAuthorizationAbi = [
+  {
+    type: "function",
+    name: "transferWithAuthorization",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "from", type: "address" },
+      { name: "to", type: "address" },
+      { name: "value", type: "uint256" },
+      { name: "validAfter", type: "uint256" },
+      { name: "validBefore", type: "uint256" },
+      { name: "nonce", type: "bytes32" },
+      { name: "signature", type: "bytes" },
+    ],
+    outputs: [],
+  },
+] as const;
+
+/**
+ * Settle a buyer's authorization without the facilitator: the operator submits
+ * USDC's own `transferWithAuthorization`, exactly as Circle's relayer does. The
+ * money moves from the buyer straight to `authorization.to` (the game's vault),
+ * so nothing about where it goes changes; what changes is that we pay the gas,
+ * about $0.003 a sale.
+ *
+ * Safe against a double charge by construction: the authorization's nonce is
+ * consumed by the token, so a second submission of the same one reverts and
+ * moves nothing.
+ */
+export async function settleDirect(input: SettleInput): Promise<SettlementOutcome> {
+  const a = input.authorization;
+  try {
+    const { request } = await publicClient().simulateContract({
+      account: operator(),
+      address: USDC_ADDRESS,
+      abi: transferWithAuthorizationAbi,
+      functionName: "transferWithAuthorization",
+      args: [a.from, a.to, a.value, a.validAfter, a.validBefore, a.nonce, input.signature],
+      ...(await feeOverrides()),
+    });
+    const hash = await walletClient().writeContract(await withGasHeadroom(request));
+    await confirm(hash);
+    logger.info({ paymentId: input.paymentId, transaction: hash, payer: a.from, to: a.to }, "settled an authorization directly on chain");
+    return { status: "settled", transaction: hash, payer: a.from, amount: a.value.toString() };
+  } catch (err) {
+    const used = await isAuthorizationUsed(a.from, a.nonce).catch(() => false);
+    logger.error({ err: String(err), paymentId: input.paymentId, used }, "direct settlement failed");
+    return {
+      status: "failed",
+      reason: used ? "authorization_already_used" : "direct_settlement_failed",
+      message: used
+        ? "That payment authorization was already used. If you were charged, refresh and the game will unlock."
+        : "The payment could not be completed on chain. Nothing was charged; please try again.",
+    };
+  }
 }
 
 export type StatusOutcome =
