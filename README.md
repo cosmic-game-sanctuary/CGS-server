@@ -5,7 +5,7 @@ The API, the chain integration, and the buying agent for
 
 🟢 **Live on Arc mainnet:** [cgs.blackslate.me](https://cgs.blackslate.me) · 🧪 **Testnet:** [testnet.cgs.blackslate.me](https://testnet.cgs.blackslate.me)
 
-📺 **[Demo](VIDEO_LINK)** · 📖 [How it all works](https://github.com/cosmic-game-sanctuary/CGS-docs/blob/main/ARCHITECTURE.md) · 🔌 [API contract](https://github.com/cosmic-game-sanctuary/CGS-docs/blob/main/INTEGRATION.md)
+🕹️ **[Try it](https://cgs.blackslate.me)** · 📖 [How it all works](https://github.com/cosmic-game-sanctuary/CGS-docs/blob/main/ARCHITECTURE.md) · 🔌 [API contract](https://github.com/cosmic-game-sanctuary/CGS-docs/blob/main/INTEGRATION.md)
 
 Built for the Arc Microgrants program. The storefront is [CGS-client](https://github.com/cosmic-game-sanctuary/CGS-client) and the contracts are in [CGS-contracts](https://github.com/cosmic-game-sanctuary/CGS-contracts).
 
